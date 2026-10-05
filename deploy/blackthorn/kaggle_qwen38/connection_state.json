@@ -1,0 +1,7 @@
+{
+  "tunnel_url": "",
+  "api_key": "${MODEL_API_KEY}",
+  "status": "READY_FOR_BOOT",
+  "gpu": "2x Tesla T4 (idle until start)",
+  "model": "Qwen3.8-27B-Uncensored"
+}
