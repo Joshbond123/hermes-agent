@@ -817,26 +817,51 @@ async def agent_stream(payload: AgentChatRequest, request: Request):
                             continue
                         # The tunnel may have been replaced by a kernel restart while
                         # Render still held the old route: refresh it and retry once.
-                        if not retried_route and resp.status_code in (404, 410, 502, 503):
+                        # 530 = Cloudflare Tunnel error 1033 (cloudflared down / stale quick tunnel)
+                        if not retried_route and resp.status_code in (404, 410, 502, 503, 521, 522, 523, 524, 530):
                             retried_route = True
                             studio.invalidate_route_cache()
+                            yield _sse({"type": "activity", "id": "route-refresh", "kind": "status",
+                                        "title": "GPU tunnel unreachable — probing for a live endpoint",
+                                        "status": "warn",
+                                        "detail": f"HTTP {resp.status_code} from previous tunnel"})
+                            # Force a live status refresh (may clear a dead tunnel from D1)
+                            try:
+                                import cloudflare_d1_client as _d1
+                                await asyncio.to_thread(_d1.get_kaggle_gpu_status, True)
+                            except Exception as _pe:
+                                log.debug("agent: forced status refresh note: %s", _pe)
                             fresh = await studio._cached_route()
-                            if fresh.get("url") and fresh.get("url") != route.get("url"):
+                            fresh_url = (fresh.get("url") or "").rstrip("/")
+                            old_url = (route.get("url") or "").rstrip("/")
+                            if fresh_url and fresh_url != old_url:
                                 log.info("agent: tunnel moved %s → %s — retrying",
-                                         (route.get("url") or "")[:40], fresh["url"][:40])
+                                         old_url[:40], fresh_url[:40])
                                 route = fresh
                                 url = f"{route['url']}/v1/chat/completions"
                                 messages = [{"role": "system", "content": system_prompt}] + base_messages[1:]
                                 route_retry_signal = True
-                                # continue (not break!) so the `for` loop re-runs this
-                                # step against the refreshed tunnel
                                 continue
-                            yield _sse({"type": "activity", "id": "route-refresh", "kind": "status",
-                                        "title": "GPU endpoint moved — reconnecting", "status": "warn",
-                                        "detail": detail[:200]})
-                            continue
-                        yield _sse({"type": "error",
-                                    "message": f"The GPU endpoint returned HTTP {resp.status_code}: {detail}"})
+                            # Same dead URL or no URL — do not dump Cloudflare HTML at the user
+                            clean = (
+                                "The Kaggle GPU tunnel is down (Cloudflare HTTP "
+                                f"{resp.status_code}). The GPU session may have stopped or the "
+                                "quick tunnel expired. Turn the GPU ON from the header, wait until "
+                                "status is Ready, then retry."
+                            )
+                            yield _sse({"type": "error", "message": clean})
+                            finish_reason = "error"
+                            break
+                        # Non-retriable upstream error — strip HTML bodies
+                        clean_detail = detail
+                        if "<" in detail and "html" in detail.lower():
+                            clean_detail = (
+                                f"GPU endpoint returned HTTP {resp.status_code} "
+                                "(non-JSON / tunnel error page). The endpoint is not healthy."
+                            )
+                        else:
+                            clean_detail = f"The GPU endpoint returned HTTP {resp.status_code}: {detail[:240]}"
+                        yield _sse({"type": "error", "message": clean_detail})
                         finish_reason = "error"
                         break
 
