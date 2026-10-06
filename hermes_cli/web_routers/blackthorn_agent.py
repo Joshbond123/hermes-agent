@@ -50,30 +50,53 @@ TOOL_SYSTEM_PROMPT = (
     "Your EXCLUSIVE workspace is the Kaggle Computer (/kaggle/working/blackthorn_workspace). "
     "ALL terminal, file, package, build, browser, and code execution happens on Kaggle Computer — never on Render. "
     "The dual T4 GPUs are available for CUDA/ML workloads on that same Kaggle machine. Cloudflare D1 holds durable memory.\n"
-    "CRITICAL TOOL PROTOCOL — read carefully:\n"
-    "When you need real data (web search, files, terminal, computer info), you MUST emit a tool call. "
-    "Do NOT describe the tool, do NOT say you will search, do NOT narrate intent. "
-    "Emit EXACTLY one of these blocks and then STOP (no other text after the block):\n"
+    "\n"
+    "TOOL SELECTION — CRITICAL:\n"
+    "Tools are AVAILABLE but must NOT be used automatically. Most messages need NO tool.\n"
+    "Answer directly in markdown whenever the request does not genuinely require external data or execution.\n"
+    "\n"
+    "NEVER call any tool for:\n"
+    "- greetings: hi, hello, hey, good morning, good evening\n"
+    "- courtesy: thanks, thank you, ok, okay, bye, goodbye\n"
+    "- casual chat or small talk\n"
+    "- explaining your own capabilities (what can you do?)\n"
+    "- rewriting, summarizing, or answering from known general knowledge\n"
+    "- normal coding questions that do not require running code or reading files\n"
+    "\n"
+    "ONLY call a tool when the user's request clearly requires it:\n"
+    "- web_search / tavily_search / fetch_url / browser: current events, latest news, live web research, or explicit browse/search\n"
+    "- terminal / run_command: user asks to run, install, diagnose, or execute something on the computer\n"
+    "- read_file / write_file / list_files: user asks about workspace files or uploads\n"
+    "- computer_info: user asks about the machine/GPU/workspace\n"
+    "- remember: user explicitly asks to remember a fact\n"
+    "\n"
+    "TOOL PROTOCOL (only when a tool is required):\n"
+    "Emit EXACTLY one block and STOP (no other text after it):\n"
     '<tool_call>{"name": "TOOL_NAME", "arguments": {...}}</tool_call>\n'
     "Available tools:\n"
-    '- web_search(query: str) — live web search via Tavily (USE THIS for any "latest news", current events, or research)\n'
+    "- web_search(query: str) — live web search via Tavily\n"
     "- tavily_search(query: str) — alias of web_search\n"
-    "- terminal(command: str, timeout_seconds: int=60) — run a real shell command and return stdout/stderr\n"
+    "- terminal(command: str, timeout_seconds: int=60) — run a shell command\n"
     "- run_command(command: str, timeout_seconds: int=60) — alias of terminal\n"
-    "- read_file(path: str) — read a text file from the workspace\n"
-    "- write_file(path: str, content: str) — create or overwrite a file\n"
+    "- read_file(path: str) — read a workspace file\n"
+    "- write_file(path: str, content: str) — write a workspace file\n"
     '- list_files(path: str=".") — list a directory\n'
-    "- fetch_url(url: str) — fetch a web page as plain text\n"
-    "- browser(url: str) — open a URL from inside Kaggle Computer and return text\n"
-    "- remember(note: str) — store a durable fact in long-term Cloudflare D1 memory\n"
-    "- computer_info() — show Kaggle Computer hostname, GPU, disk, workspace path\n"
+    "- fetch_url(url: str) — fetch a page as plain text\n"
+    "- browser(url: str) — open a URL from Kaggle Computer\n"
+    "- remember(note: str) — store a durable fact in D1\n"
+    "- computer_info() — hostname, GPU, disk, workspace path\n"
+    "\n"
     "RULES:\n"
-    "1. Never invent a tool result — the system runs the tool and sends you the real output, then you continue.\n"
-    "2. Use at most one tool per reply.\n"
-    "3. After a tool result arrives, either call another tool or give the final markdown answer.\n"
-    "4. Keep <think>...</think> blocks brief and private; put the user-visible answer outside them.\n"
-    "5. When no tool is needed, answer directly in markdown.\n"
-    "6. For web research requests you MUST call web_search — answering from memory alone is wrong."
+    "1. Never invent a tool result — the system runs the tool and returns real output.\n"
+    "2. At most one tool per reply.\n"
+    "3. After a tool result, answer in markdown or call another tool if still needed.\n"
+    "4. Keep <think>...</think> brief and private; put the user-visible answer outside it.\n"
+    "5. Prefer answering with zero tools. Do not search the web for greetings or capability questions."
+)
+
+NO_TOOL_SYSTEM_ADDON = (
+    "\n\nThis turn requires NO tools. Answer the user directly in markdown. "
+    "Do not emit <tool_call>, do not search the web, do not run commands, do not touch files."
 )
 
 
@@ -271,7 +294,24 @@ def _kaggle_tunnel() -> tuple:
     return "", ""
 
 
+def _mark_tunnel_dead(reason: str, http_code: int = 0) -> None:
+    """Clear a confirmed-dead Cloudflare tunnel from D1 so status/UI stop reporting ONLINE."""
+    try:
+        studio._d1q_sync(
+            "UPDATE kaggle_gpu_state SET status = ?, tunnel_url = '', updated_at = ? WHERE id = 'primary';",
+            ["TUNNEL_ERROR", time.time()],
+        )
+        log.warning("kaggle tunnel marked dead (HTTP %s): %s", http_code or "?", reason[:160])
+    except Exception as exc:
+        log.debug("mark tunnel dead note: %s", exc)
+    try:
+        studio.invalidate_route_cache()
+    except Exception:
+        pass
+
+
 def _computer_post(path: str, payload: dict, timeout: float = 90.0) -> dict:
+    """POST to Kaggle Computer API with dead-tunnel detection and one retry on fresh URL."""
     base, key = _kaggle_tunnel()
     if not base:
         return {
@@ -284,18 +324,82 @@ def _computer_post(path: str, payload: dict, timeout: float = 90.0) -> dict:
         "Content-Type": "application/json",
         "User-Agent": "BlackthornHermes/1.0",
     }
-    url = f"{base}{path}"
-    try:
+    dead_codes = {404, 410, 502, 503, 521, 522, 523, 524, 530}
+
+    def _once(url_base: str) -> dict:
+        url = f"{url_base}{path}"
         with _httpx.Client(timeout=timeout) as client:
             resp = client.post(url, json=payload, headers=headers)
-            if resp.status_code == 401:
+            code = resp.status_code
+            if code == 401:
                 return {"ok": False, "error": "Kaggle Computer auth failed", "host": "kaggle-computer"}
-            data = resp.json()
+            if code in dead_codes:
+                body_preview = (resp.text or "")[:120]
+                return {
+                    "ok": False,
+                    "error": f"tunnel_dead:{code}",
+                    "http_code": code,
+                    "detail": body_preview,
+                    "host": "kaggle-computer",
+                }
+            # Cloudflare error pages are HTML, not JSON
+            ctype = (resp.headers.get("content-type") or "").lower()
+            if "text/html" in ctype and ("cloudflare" in (resp.text or "").lower() or "530" in (resp.text or "")):
+                return {
+                    "ok": False,
+                    "error": f"tunnel_dead:{code or 530}",
+                    "http_code": code or 530,
+                    "detail": "Cloudflare tunnel error page",
+                    "host": "kaggle-computer",
+                }
+            try:
+                data = resp.json()
+            except Exception:
+                return {
+                    "ok": False,
+                    "error": f"non-JSON response HTTP {code}: {(resp.text or '')[:200]}",
+                    "host": "kaggle-computer",
+                }
             if not isinstance(data, dict):
                 return {"ok": False, "error": f"bad response: {resp.text[:200]}", "host": "kaggle-computer"}
             data.setdefault("host", "kaggle-computer")
             return data
+
+    try:
+        result = _once(base)
+        if result.get("error", "").startswith("tunnel_dead:"):
+            code = int(result.get("http_code") or 530)
+            _mark_tunnel_dead(result.get("detail") or result["error"], code)
+            # One recovery attempt: re-read D1 for a replacement tunnel
+            fresh_base, fresh_key = _kaggle_tunnel()
+            if fresh_base and fresh_base != base:
+                headers["Authorization"] = f"Bearer {fresh_key}"
+                result = _once(fresh_base)
+                if not result.get("error", "").startswith("tunnel_dead:"):
+                    return result
+            return {
+                "ok": False,
+                "error": (
+                    f"Kaggle Computer tunnel is down (HTTP {code}). "
+                    "The Cloudflare quick tunnel expired or the Kaggle session stopped. "
+                    "Turn the GPU ON from the header, wait until Ready, then retry."
+                ),
+                "host": "kaggle-computer",
+                "http_code": code,
+            }
+        return result
     except Exception as exc:
+        msg = str(exc)
+        if any(x in msg for x in ("530", "1033", "ConnectError", "ConnectTimeout", "Name or service not known")):
+            _mark_tunnel_dead(msg, 530)
+            return {
+                "ok": False,
+                "error": (
+                    "Kaggle Computer tunnel unreachable. "
+                    "Turn the GPU ON from the header and wait until Ready."
+                ),
+                "host": "kaggle-computer",
+            }
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "host": "kaggle-computer"}
 
 
@@ -439,8 +543,21 @@ def tool_tavily_search(root: Path, args: Dict[str, Any]) -> str:
         with urllib.request.urlopen(req, timeout=20) as resp:
             data = json.loads(resp.read().decode())
         results = data.get("results") or []
-        lines = [f"- {r.get('title','')}: {r.get('url','')}\n  {r.get('content','')[:300]}" for r in results[:5]]
-        return "\n".join(lines) if lines else "no results"
+        if not results:
+            return "no results"
+        blocks = []
+        sources = []
+        for i, r in enumerate(results[:5], 1):
+            title = (r.get("title") or "Untitled").strip()
+            url = (r.get("url") or "").strip()
+            snippet = (r.get("content") or "")[:400].strip()
+            blocks.append(f"[{i}] {title}\nURL: {url}\n{snippet}")
+            if url:
+                sources.append(f"- [{title}]({url})")
+        out = "Search results:\n\n" + "\n\n".join(blocks)
+        if sources:
+            out += "\n\nSources:\n" + "\n".join(sources)
+        return out
     except Exception as exc:
         return f"error: tavily {exc}"
 
@@ -576,6 +693,74 @@ OPENAI_TOOLS = [
 ]
 
 
+
+def _user_message_needs_tools(text: str, has_attachments: bool = False) -> bool:
+    """Backend tool-selection gate: True only when the user request likely needs a tool.
+
+    Separates TOOL AVAILABILITY from TOOL INVOCATION. Simple greetings and
+    conversational turns must not trigger web search, terminal, or file tools.
+    """
+    if has_attachments:
+        return True
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    # Pure greetings / courtesy — never tools
+    pure = re.sub(r"[^a-z0-9\s]", "", t).strip()
+    pure = re.sub(r"\s+", " ", pure)
+    greetings = {
+        "hi", "hello", "hey", "hiya", "yo", "sup", "howdy",
+        "good morning", "good afternoon", "good evening", "good night",
+        "thanks", "thank you", "thx", "ty", "ok", "okay", "k", "cool",
+        "bye", "goodbye", "see you", "cya", "cheers", "nice", "great",
+        "yes", "no", "yep", "nope", "sure",
+    }
+    if pure in greetings or pure in {g + " there" for g in ("hi", "hello", "hey")}:
+        return False
+    # Capability / identity questions — answer from prompt, no tools
+    capability = (
+        "what can you do", "who are you", "what are you", "your capabilities",
+        "what do you do", "help me", "how can you help", "introduce yourself",
+    )
+    if any(c in pure for c in capability) and len(pure) < 80:
+        return False
+    # Explicit tool triggers
+    web_triggers = (
+        "search the web", "search online", "google ", "look up", "latest news",
+        "current events", "what is the latest", "what happened", "browse ",
+        "fetch url", "open this url", "open the url", "web search", "tavily",
+        "from the internet", "online research", "research online",
+    )
+    terminal_triggers = (
+        "run this", "run the", "execute ", "install ", "pip install", "apt ",
+        "shell ", "terminal", "bash ", "command line", "ls ", "cd ",
+        "write a script and run", "run python", "run the code",
+    )
+    file_triggers = (
+        "read the file", "open the file", "list files", "list the files",
+        "read file", "write file", "create a file", "save to file",
+        "uploaded", "attachment", "summarize the pdf", "read the pdf",
+        "workspace", "list directory",
+    )
+    kaggle_triggers = (
+        "kaggle", "gpu status", "computer info", "what gpu", "disk space",
+        "hostname", "workspace path",
+    )
+    if any(x in t for x in web_triggers + terminal_triggers + file_triggers + kaggle_triggers):
+        return True
+    # Short conversational messages without action verbs → no tools
+    if len(pure.split()) <= 6 and not any(
+        w in pure for w in (
+            "search", "browse", "run", "install", "execute", "fetch", "download",
+            "write", "create", "delete", "list", "read", "open", "code", "script",
+            "news", "latest", "current", "online", "web", "url", "http",
+        )
+    ):
+        return False
+    # Default: allow tools (model still decides via tool_choice auto)
+    return True
+
+
 def _intent_looks_like_tool_need(text: str) -> bool:
     """True when the model narrated tool intent instead of emitting a tool_call."""
     t = (text or "").lower()
@@ -658,8 +843,13 @@ async def agent_stream(payload: AgentChatRequest, request: Request):
         )
 
     history.reverse()
+    needs_tools = _user_message_needs_tools(message, has_attachments=bool(attachments))
+    if not needs_tools:
+        max_steps = 1  # single direct answer — no tool loop
     system_prompt = studio._compose_system(memories, attachments) + "\n\n" + TOOL_SYSTEM_PROMPT
     system_prompt += f"\nWorkspace root: {root}"
+    if not needs_tools:
+        system_prompt += NO_TOOL_SYSTEM_ADDON
     user_note = ""
     if attachments:
         names = ", ".join(a.get("name") or a.get("path") or "file" for a in attachments)
@@ -761,8 +951,8 @@ async def agent_stream(payload: AgentChatRequest, request: Request):
             "endpoint": route["url"], "mode": "agent", "prework_ms": prework_ms,
             "attachments": [a.get("name") or a.get("path") for a in attachments],
         })
-        yield activity("status", "Reading your request", status="ok",
-                       detail=f'"{message[:160]}"' + (f" + {len(attachments)} attachment(s)" if attachments else ""))
+        # Do not emit mock status titles ("Reading your request", etc.).
+        # Only real tool / plan / thinking events are streamed below.
 
         messages = list(base_messages)
         answer_text = ""
@@ -795,9 +985,12 @@ async def agent_stream(payload: AgentChatRequest, request: Request):
                     "stream": True,
                     # Prefer visible tool calls over hidden reasoning when the backend supports it
                     "chat_template_kwargs": {"enable_thinking": False},
-                    "tools": OPENAI_TOOLS,
-                    "tool_choice": "auto",
                 }
+                # TOOL GATE: only expose tools when the user request actually needs them.
+                # Separates availability from invocation — greetings never get a tool schema.
+                if needs_tools:
+                    body["tools"] = OPENAI_TOOLS
+                    body["tool_choice"] = "auto"
                 if payload.temperature is not None:
                     body["temperature"] = payload.temperature
 
@@ -933,16 +1126,10 @@ async def agent_stream(payload: AgentChatRequest, request: Request):
                                     first_token_ms = int((time.perf_counter() - t_start_model) * 1000) + prework_ms
                                 yield _sse({"type": "delta", "delta": event["text"]})
                             elif event["kind"] == "think_start":
-                                chunk = activity("thinking", "Thinking", status="running",
-                                                 detail="Reasoning privately about the next step")
-                                think_step_id = json.loads(chunk[6:].decode("utf-8"))["id"]
-                                yield chunk
+                                # Keep reasoning private — do not stream thinking activity to the UI
+                                think_step_id = None
                             elif event["kind"] == "think_end":
-                                if think_step_id:
-                                    yield activity("thinking", "Thought for a moment", status="ok",
-                                                   step_id=think_step_id,
-                                                   duration_ms=int(event.get("seconds", 0) * 1000))
-                                    think_step_id = None
+                                think_step_id = None
                             elif event["kind"] == "tool":
                                 call = event["call"]
                                 yield activity("plan", f"Decided to use `{call['name']}`",
@@ -951,7 +1138,7 @@ async def agent_stream(payload: AgentChatRequest, request: Request):
                     if event["kind"] == "answer":
                         yield _sse({"type": "delta", "delta": event["text"]})
                     elif event["kind"] == "think_end" and think_step_id:
-                        yield activity("thinking", "Thought for a moment", status="ok",
+                        yield activity("thinking", "Reasoning", status="ok",
                                        step_id=think_step_id,
                                        duration_ms=int(event.get("seconds", 0) * 1000))
 
@@ -988,7 +1175,8 @@ async def agent_stream(payload: AgentChatRequest, request: Request):
 
                 if not calls:
                     # Model narrated tool intent without emitting a real tool_call — re-prompt
-                    if answer_text.strip() and _intent_looks_like_tool_need(answer_text) and step_no < max_steps:
+                    # Only when this turn was allowed to use tools (gate already decided).
+                    if needs_tools and answer_text.strip() and _intent_looks_like_tool_need(answer_text) and step_no < max_steps:
                         yield activity(
                             "plan",
                             "Model described a tool but did not call it — requesting a proper tool_call",
