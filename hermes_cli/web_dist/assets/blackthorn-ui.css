@@ -1,0 +1,152 @@
+/* Blackthorn UI — Groq-inspired clean chat + mobile */
+:root {
+  --bt-bg: #0b0d10;
+  --bt-panel: #12151a;
+  --bt-elevated: #1a1e26;
+  --bt-border: rgba(255,255,255,0.08);
+  --bt-text: #ececec;
+  --bt-muted: #8b929a;
+  --bt-accent: #f54e00;
+  --bt-accent-soft: rgba(245,78,0,0.12);
+  --bt-success: #10b981;
+  --bt-danger: #ef4444;
+  --bt-radius: 14px;
+  --bt-input-radius: 24px;
+  --bt-max-chat: 48rem;
+}
+
+/* Chat column */
+[class*="messageList"], [class*="MessageList"],
+.studio-chat-messages, main [class*="overflow-y"] {
+  max-width: var(--bt-max-chat);
+  margin-left: auto;
+  margin-right: auto;
+  padding-left: 1rem;
+  padding-right: 1rem;
+}
+
+/* Hide avatars */
+.avatar, [class*="Avatar"], [class*="avatar"],
+img[alt*="avatar" i], img[alt*="user" i], img[alt*="assistant" i] {
+  display: none !important;
+}
+
+/* User bubbles */
+[data-role="user"] .content, .message-user .content {
+  background: var(--bt-elevated) !important;
+  border-radius: var(--bt-radius) !important;
+  padding: 0.75rem 1rem !important;
+  border: 1px solid var(--bt-border);
+}
+
+/* Composer */
+textarea, [contenteditable="true"] {
+  border-radius: var(--bt-input-radius) !important;
+}
+
+/* GPU badge states */
+.bt-gpu-live {
+  background: rgba(16,185,129,0.15) !important;
+  border-color: rgba(16,185,129,0.55) !important;
+  color: #6ee7b7 !important;
+}
+.bt-gpu-off {
+  background: rgba(239,68,68,0.12) !important;
+  border-color: rgba(239,68,68,0.5) !important;
+  color: #fca5a5 !important;
+}
+
+/* Code blocks */
+pre, code {
+  max-width: 100%;
+  overflow-x: auto;
+  word-break: break-word;
+}
+pre {
+  border-radius: 10px;
+  padding: 0.85rem 1rem;
+}
+
+/* Tool activity indicators */
+[data-kind="tool"], .bt-tool-step {
+  border-left: 3px solid var(--bt-accent);
+  padding-left: 0.75rem;
+  margin: 0.5rem 0;
+  font-size: 0.875rem;
+  color: var(--bt-muted);
+}
+
+/* ---------- Mobile ---------- */
+@media (max-width: 768px) {
+  :root { --bt-max-chat: 100%; }
+
+  /* Sidebar: off-canvas on small screens */
+  aside, [class*="sidebar"], [class*="Sidebar"],
+  nav[class*="side"] {
+    position: fixed !important;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    z-index: 40;
+    width: min(86vw, 320px) !important;
+    max-width: 320px !important;
+    transform: translateX(-105%);
+    transition: transform 0.2s ease;
+    box-shadow: none;
+  }
+  body.bt-sidebar-open aside,
+  body.bt-sidebar-open [class*="sidebar"],
+  body.bt-sidebar-open [class*="Sidebar"] {
+    transform: translateX(0);
+    box-shadow: 8px 0 32px rgba(0,0,0,0.45);
+  }
+
+  /* Main chat fills width */
+  main, [class*="main-content"], [class*="chat-panel"] {
+    width: 100% !important;
+    max-width: 100% !important;
+    margin: 0 !important;
+    padding: 0.5rem !important;
+  }
+
+  [class*="messageList"], [class*="MessageList"],
+  .studio-chat-messages {
+    padding-left: 0.75rem;
+    padding-right: 0.75rem;
+  }
+
+  /* Input area safe above mobile keyboard */
+  form[class*="composer"], [class*="Composer"], [class*="chat-input"] {
+    position: sticky;
+    bottom: 0;
+    padding-bottom: env(safe-area-inset-bottom, 0.5rem);
+    background: var(--bt-bg);
+  }
+
+  textarea {
+    font-size: 16px !important; /* prevent iOS zoom */
+    min-height: 44px;
+  }
+
+  button, [role="button"] {
+    min-height: 44px;
+    min-width: 44px;
+  }
+
+  /* Long code doesn't break layout */
+  pre, code {
+    font-size: 0.8rem;
+    white-space: pre-wrap;
+  }
+
+  /* Header compact */
+  header, [class*="page-header"], [class*="PageHeader"] {
+    padding: 0.5rem 0.75rem !important;
+    gap: 0.5rem;
+  }
+}
+
+@media (max-width: 420px) {
+  body { font-size: 15px; }
+  [class*="messageList"] { padding-left: 0.5rem; padding-right: 0.5rem; }
+}
