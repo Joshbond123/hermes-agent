@@ -801,9 +801,20 @@ async def agent_stream(payload: AgentChatRequest, request: Request):
                 if payload.temperature is not None:
                     body["temperature"] = payload.temperature
 
+                # Some llama.cpp/ollama builds reject the OpenAI tools field — fall back once
+                if body.get("tools") and not getattr(splitter, "_tools_stripped", False):
+                    pass  # first attempt keeps tools
                 async with client.stream("POST", url, json=body, headers=headers) as resp:
                     if resp.status_code != 200:
                         detail = (await resp.aread()).decode("utf-8", "replace")[:300]
+                        # Backend does not support tools — strip and retry this step
+                        if resp.status_code in (400, 422) and body.get("tools") and not getattr(splitter, "_tools_stripped", False):
+                            body.pop("tools", None)
+                            body.pop("tool_choice", None)
+                            splitter._tools_stripped = True
+                            log.info("agent: backend rejected tools — retrying without function-calling schema")
+                            step_budget += 1
+                            continue
                         # The tunnel may have been replaced by a kernel restart while
                         # Render still held the old route: refresh it and retry once.
                         if not retried_route and resp.status_code in (404, 410, 502, 503):
@@ -1049,7 +1060,7 @@ class SystemPromptBody(BaseModel):
 
 def _d1_get(key: str) -> str:
     try:
-        rows = studio._d1_sql(
+        rows = studio._d1q_sync(
             "SELECT value FROM state_meta WHERE key = ? LIMIT 1;", [key]
         )
         if rows:
@@ -1061,8 +1072,8 @@ def _d1_get(key: str) -> str:
 
 def _d1_set(key: str, value: str) -> None:
     try:
-        studio._d1_sql("DELETE FROM state_meta WHERE key = ?;", [key])
-        studio._d1_sql(
+        studio._d1q_sync("DELETE FROM state_meta WHERE key = ?;", [key])
+        studio._d1q_sync(
             "INSERT INTO state_meta (key, value) VALUES (?, ?);", [key, value]
         )
     except Exception as exc:
