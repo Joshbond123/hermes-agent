@@ -1,5 +1,6 @@
 (function () {
   "use strict";
+  // blackthorn-ui v2026-10-07 activity+code redesign
 
   var TOKEN = (window.__HERMES_SESSION_TOKEN__ || "");
   var MOCK_TITLES = [
@@ -103,13 +104,49 @@
 
   /** Hide expanded thinking / mock activity rows that still slip through */
   function collapseThinking() {
-    // Hermes activity headers that say Reasoning / Thinking → keep collapsed look
-    var titles = document.querySelectorAll(".mb-2.min-w-0.overflow-hidden.rounded-xl.border button span");
-    for (var i = 0; i < titles.length; i++) {
-      var t = (titles[i].textContent || "").toLowerCase();
-      if (t.indexOf("reasoning") >= 0 || t.indexOf("thinking") >= 0) {
-        var panel = titles[i].closest(".mb-2.min-w-0.overflow-hidden.rounded-xl.border");
-        if (panel) panel.setAttribute("data-bt-activity", "thinking");
+    // Mark and collapse thinking/reasoning activity panels (Replit-style).
+    // Never leave private chain-of-thought expanded by default.
+    var panels = document.querySelectorAll(
+      ".mb-2.min-w-0.overflow-hidden.rounded-xl.border, [class*='activity'], details, [data-kind]"
+    );
+    for (var i = 0; i < panels.length; i++) {
+      var panel = panels[i];
+      var text = (panel.textContent || "").toLowerCase();
+      var titleEl = panel.querySelector("button span, summary, [data-title], .bt-activity-header");
+      var title = titleEl ? (titleEl.textContent || "").toLowerCase() : text.slice(0, 80);
+      var isThink = title.indexOf("reasoning") >= 0 || title.indexOf("thinking") >= 0
+        || title.indexOf("thought") >= 0 || title.indexOf("chain of thought") >= 0;
+      var isTool = panel.getAttribute("data-kind") === "tool"
+        || title.indexOf("running") >= 0 || title.indexOf("tool") >= 0
+        || title.indexOf("command") >= 0 || title.indexOf("search") >= 0;
+      if (isThink) {
+        panel.setAttribute("data-bt-activity", "thinking");
+        if (!panel.getAttribute("data-bt-open")) panel.setAttribute("data-bt-open", "0");
+        // Collapse <details>
+        if (panel.tagName === "DETAILS") panel.open = false;
+        // Click-to-expand header if expanded body visible
+        var btn = panel.querySelector("button");
+        var body = panel.querySelector("[class*='content'], [class*='body'], pre, code");
+        if (btn && body && !panel.__btWired) {
+          panel.__btWired = true;
+          btn.addEventListener("click", function (p) {
+            return function () {
+              var open = p.getAttribute("data-bt-open") === "1";
+              p.setAttribute("data-bt-open", open ? "0" : "1");
+            };
+          }(panel));
+        }
+        // Hide long monologue blocks that look like CoT dumps
+        var blocks = panel.querySelectorAll("p, div, pre");
+        for (var j = 0; j < blocks.length; j++) {
+          var bt = (blocks[j].textContent || "").trim();
+          if (bt.length > 400 && /i need to|let me think|my reasoning|chain-of-thought/i.test(bt)) {
+            blocks[j].classList.add("bt-cot-hidden");
+          }
+        }
+      } else if (isTool) {
+        panel.setAttribute("data-bt-activity", "tool");
+        if (!panel.getAttribute("data-bt-open")) panel.setAttribute("data-bt-open", "0");
       }
     }
   }
@@ -145,7 +182,8 @@
     var status = String(st.status || "").toUpperCase();
     var online = ["ONLINE", "MODEL_READY_AND_WARMED", "HEARTBEAT_ONLINE", "MODEL_READY", "MODEL_READY_COLD", "TUNNEL_ONLINE"];
     var active = !!(st.active || online.indexOf(status) >= 0);
-    var booting = !!st.booting;
+    var booting = !!st.booting || /BOOTING|STARTING|DOWNLOAD|WARMING|ALLOCAT/i.test(status);
+    if (/ERROR|TUNNEL_ERROR|FAILED|DEAD/i.test(status)) { active = false; booting = false; }
     var pct = st.progress_pct || 0;
     var label = active ? "GPU ON" : (booting ? ("GPU " + pct + "%") : "GPU OFF");
     document.documentElement.setAttribute("data-gpu", active ? "on" : (booting ? "boot" : "off"));
@@ -183,6 +221,75 @@
       .catch(function () {});
   }
 
+
+  var _gpuBusy = false;
+  var _gpuPollTimer = null;
+
+  function wireGpuButton() {
+    var btn = findGpuButton();
+    if (!btn || btn.dataset.btGpuWired === "1") return;
+    btn.dataset.btGpuWired = "1";
+    btn.style.cursor = "pointer";
+    btn.addEventListener("click", function (ev) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (_gpuBusy) return;
+      var label = (btn.textContent || "").toUpperCase();
+      var isOn = /GPU\s*ON/i.test(label) || btn.classList.contains("bt-gpu-live");
+      var endpoint = isOn ? "/api/kaggle-gpu/turn-off?reason=user" : "/api/kaggle-gpu/turn-on";
+      _gpuBusy = true;
+      btn.disabled = true;
+      btn.style.opacity = "0.7";
+      // optimistic UI
+      Array.from(btn.querySelectorAll("span")).forEach(function (s) {
+        if (/GPU/i.test(s.textContent || "")) s.textContent = isOn ? "GPU …" : "GPU starting…";
+      });
+      fetch(endpoint, {
+        method: "POST",
+        credentials: "include",
+        headers: authHeaders(),
+      })
+        .then(function (r) {
+          return r.json().then(function (j) {
+            return { ok: r.ok, status: r.status, body: j };
+          }).catch(function () {
+            return { ok: r.ok, status: r.status, body: null };
+          });
+        })
+        .then(function (res) {
+          if (res.body) paintGpu(res.body);
+          // Start fast polling while booting
+          if (!isOn) {
+            if (_gpuPollTimer) clearInterval(_gpuPollTimer);
+            var n = 0;
+            _gpuPollTimer = setInterval(function () {
+              n += 1;
+              pollGpu().then(function () {
+                var b2 = findGpuButton();
+                var t = (b2 && b2.textContent) || "";
+                if (/GPU\s*ON/i.test(t) || n > 90) {
+                  clearInterval(_gpuPollTimer);
+                  _gpuPollTimer = null;
+                }
+              });
+            }, 3000);
+          }
+        })
+        .catch(function (err) {
+          console.warn("gpu toggle failed", err);
+          Array.from(btn.querySelectorAll("span")).forEach(function (s) {
+            if (/GPU/i.test(s.textContent || "")) s.textContent = "GPU ERR";
+          });
+        })
+        .finally(function () {
+          _gpuBusy = false;
+          btn.disabled = false;
+          btn.style.opacity = "1";
+          pollGpu();
+        });
+    }, true);
+  }
+
   /* ---- Clear blocking overlays ---- */
   function clearBlockingOverlays() {
     if (!document.body.classList.contains("bt-history-open")) {
@@ -207,6 +314,7 @@
     if (document.getElementById("bt-history-panel")) return;
     var bd = document.createElement("div");
     bd.id = "bt-history-backdrop";
+    bd.style.cssText = "position:fixed;inset:0;z-index:80;background:rgba(0,0,0,0.45);display:none;pointer-events:none;";
     bd.addEventListener("click", function () {
       document.body.classList.remove("bt-history-open");
       clearBlockingOverlays();
@@ -216,17 +324,25 @@
     var panel = document.createElement("aside");
     panel.id = "bt-history-panel";
     panel.setAttribute("aria-label", "Chat history");
+    // Inline fixed styles so panel never drops into page flow under the composer
+    panel.style.cssText = "position:fixed;top:0;right:0;bottom:0;width:min(280px,92vw);max-width:320px;z-index:90;" +
+      "background:#121214;border-left:1px solid rgba(255,255,255,0.08);display:flex;flex-direction:column;" +
+      "transform:translateX(105%);transition:transform 0.2s ease;box-shadow:-8px 0 32px rgba(0,0,0,0.4);";
     panel.innerHTML =
-      '<div class="bt-hist-head">' +
-      "<h2>Chats</h2>" +
+      '<div class="bt-hist-head" style="display:flex;align-items:center;gap:8px;padding:12px 14px;border-bottom:1px solid rgba(255,255,255,0.08);flex-shrink:0">' +
+      '<h2 style="flex:1;margin:0;font-size:14px;font-weight:600;color:#ececef">Chats</h2>' +
       '<button type="button" class="bt-hdr-btn bt-hdr-newchat" id="bt-hist-new" title="New chat">' + ICONS.plus + " New</button>" +
       '<button type="button" class="bt-menu-btn" id="bt-hist-close" title="Close" aria-label="Close history">' + ICONS.close + "</button>" +
       "</div>" +
-      '<div class="bt-hist-list" id="bt-hist-list"><p style="color:#a1a1aa;font-size:12px;padding:12px">Loading…</p></div>';
+      '<div class="bt-hist-list" id="bt-hist-list" style="flex:1;overflow-y:auto;padding:8px"><p style="color:#a1a1aa;font-size:12px;padding:12px">Loading…</p></div>';
     document.body.appendChild(panel);
 
     document.getElementById("bt-hist-close").addEventListener("click", function () {
       document.body.classList.remove("bt-history-open");
+      var p = document.getElementById("bt-history-panel");
+      var b = document.getElementById("bt-history-backdrop");
+      if (p) p.style.transform = "translateX(105%)";
+      if (b) { b.style.display = "none"; b.style.pointerEvents = "none"; }
       clearBlockingOverlays();
     });
     document.getElementById("bt-hist-new").addEventListener("click", function () {
@@ -246,6 +362,10 @@
     if (!sessionId) return;
     // Close drawer immediately for snappy UX
     document.body.classList.remove("bt-history-open");
+    var _p = document.getElementById("bt-history-panel");
+    var _b = document.getElementById("bt-history-backdrop");
+    if (_p) _p.style.transform = "translateX(105%)";
+    if (_b) { _b.style.display = "none"; _b.style.pointerEvents = "none"; }
     clearBlockingOverlays();
 
     var onChat = /\/chat(\/|$|\?)/.test(location.pathname) || location.pathname === "/";
@@ -517,6 +637,7 @@
       hBtn.type = "button";
       hBtn.id = "bt-hist-btn";
       hBtn.className = "bt-hdr-btn";
+      hBtn.style.cssText = "height:28px;min-height:28px;padding:0 8px;font-size:12px;border-radius:7px;";
       hBtn.title = "Chat history";
       hBtn.setAttribute("aria-label", "Open chat history");
       hBtn.innerHTML = ICONS.hist;
@@ -525,11 +646,15 @@
         ev.stopPropagation();
         ensureHistoryPanel();
         document.body.classList.toggle("bt-history-open");
+        var panel = document.getElementById("bt-history-panel");
+        var bd = document.getElementById("bt-history-backdrop");
         if (document.body.classList.contains("bt-history-open")) {
-          var bd = document.getElementById("bt-history-backdrop");
-          if (bd) { bd.style.display = ""; bd.style.pointerEvents = "auto"; }
+          if (panel) panel.style.transform = "translateX(0)";
+          if (bd) { bd.style.display = "block"; bd.style.pointerEvents = "auto"; }
           loadHistory();
         } else {
+          if (panel) panel.style.transform = "translateX(105%)";
+          if (bd) { bd.style.display = "none"; bd.style.pointerEvents = "none"; }
           clearBlockingOverlays();
         }
       });
@@ -540,6 +665,7 @@
       nBtn.type = "button";
       nBtn.id = "bt-newchat-btn";
       nBtn.className = "bt-hdr-btn bt-hdr-newchat";
+      nBtn.style.cssText = "height:28px;min-height:28px;padding:0 8px;font-size:12px;border-radius:7px;";
       nBtn.title = "New chat";
       nBtn.innerHTML = ICONS.plus + " New";
       nBtn.addEventListener("click", function (ev) {
@@ -554,6 +680,7 @@
       sBtn.type = "button";
       sBtn.id = "bt-sys-prompt-btn";
       sBtn.className = "bt-hdr-btn";
+      sBtn.style.cssText = "height:28px;min-height:28px;padding:0 8px;font-size:12px;border-radius:7px;";
       sBtn.title = "System Prompt";
       sBtn.innerHTML = ICONS.prompt + " System Prompt";
       sBtn.addEventListener("click", function (ev) {
@@ -584,7 +711,8 @@
       }
     }
     mergeHeaderControls();
-    stripMockActivity(); enhanceCodeBlocks(); collapseThinking();
+    wireGpuButton();
+    stripMockActivity(); enhanceCodeBlocks(document); collapseThinking();
     if (!document.body.classList.contains("bt-history-open") &&
         !document.body.classList.contains("bt-nav-open")) {
       clearBlockingOverlays();
@@ -673,7 +801,7 @@
     syncChatMode();
     pollGpu().then(function () {
       forceLayout();
-      stripMockActivity(); enhanceCodeBlocks(); collapseThinking();
+      stripMockActivity(); enhanceCodeBlocks(document); collapseThinking();
       n += 1;
       setTimeout(tick, n < 20 ? 1500 : 8000);
     });
@@ -693,7 +821,7 @@
       if (_btMoTimer) return;
       _btMoTimer = setTimeout(function () {
         _btMoTimer = null;
-        stripMockActivity(); enhanceCodeBlocks(); collapseThinking();
+        stripMockActivity(); enhanceCodeBlocks(document); collapseThinking();
         syncChatMode();
         forceLayout();
       }, 120);
