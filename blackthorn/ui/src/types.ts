@@ -76,6 +76,8 @@ export interface GpuStatus {
   progress_kind?: 'stage' | 'bytes'
   progress_bytes_done?: number
   progress_bytes_total?: number
+  progress_label?: string
+  progress_stalled?: boolean
   elapsed_seconds?: number
   quota?: GpuQuota
   error?: string

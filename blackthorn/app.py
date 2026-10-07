@@ -103,7 +103,7 @@ def create_app(settings: Optional[Settings] = None, *, services: Optional[Servic
         cache = "public, max-age=31536000, immutable" if immutable else "no-cache"
         return FileResponse(path, headers={"Cache-Control": cache})
 
-    @app.get("/assets/{name:path}")
+    @app.api_route("/assets/{name:path}", methods=["GET", "HEAD"])
     async def assets(name: str):
         root = (bt.static_dir / "assets").resolve()
         target = (root / name).resolve()
@@ -112,7 +112,7 @@ def create_app(settings: Optional[Settings] = None, *, services: Optional[Servic
         # Only content-hashed names may be cached forever: a same-name file can then never go stale in a browser.
         return _file(target, immutable=bool(HASHED.search(target.name)))
 
-    @app.get("/{full_path:path}")
+    @app.api_route("/{full_path:path}", methods=["GET", "HEAD"])
     async def spa(full_path: str):
         if full_path.startswith("api/"):
             return JSONResponse({"detail": {"code": "not_found", "message": "unknown API route"}}, status_code=404)

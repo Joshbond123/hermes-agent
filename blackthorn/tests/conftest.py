@@ -125,7 +125,7 @@ async def stack(tmp_path) -> AsyncIterator[Stack]:
 class FakeD1:
     """Stand-in for ``cloudflare_d1_client`` with a deterministic boot sequence (one stage per status poll)."""
 
-    SEQUENCE = ["BOOTING_KAGGLE_GPU", "CHECKING_ENVIRONMENT", "CHECKING_CACHE", "CACHE_HIT", "STARTING_OLLAMA", "LOADING_MODEL", "WARMING_GPU"]
+    SEQUENCE = ["BOOTING_KAGGLE_GPU", "CHECKING_ENVIRONMENT", "CHECKING_CACHE", "DOWNLOADING_MODEL", "STARTING_OLLAMA", "LOADING_MODEL", "WARMING_GPU"]
 
     def __init__(self, status: str = "GPU_STOPPED_SAVING_QUOTA"):
         self.status = status
@@ -143,6 +143,7 @@ class FakeD1:
                 "engine_state": "ready" if ready else ("starting" if booting else "off"), "model": "Fake-Model", "model_loaded": True if ready else None,
                 "gpu_info": "Tesla T4 + Tesla T4" if (ready or booting) else ("FAILED: Kaggle refused the kernel push" if s == "BOOT_FAILED" else ""), "progress_step": s.replace("_", " ").title() if booting else "",
                 "quota": {"used_hours": 19.8, "total_hours": 30.0, "remaining_hours": 10.2, "used_pct": 66.0, "refresh_time": "2026-10-10T00:00:00Z"},
+                "detail": json.dumps({"label": "Downloading the model", "bytes_done": 4_200_000_000, "bytes_total": 16_800_000_000}) if s == "DOWNLOADING_MODEL" else "",
                 "cloudflare_d1": {"account_id": "acct", "database_id": "db"}, "busy": False, "worker_status": "RUNNING" if ready else "OFF"}
 
     def get_kaggle_gpu_status(self, refresh=False):

@@ -118,6 +118,7 @@ class AgentRun:
         self._flush_task: Optional[asyncio.Task] = None
         self._produced = False
         self._history_len = 0
+        self._last_step_text = ""
         s = deps.settings
         self._budget = prompts.prompt_budget(s.context_tokens, s.completion_reserve_tokens)
         self._schemas = deps.registry.schemas()
@@ -227,6 +228,7 @@ class AgentRun:
         messages.append({"role": "user", "content": self.user_message})
 
         force_final = False
+        empty_retries = 0
         while True:
             self._check()
             self.steps += 1
@@ -241,10 +243,17 @@ class AgentRun:
             if result.calls and not force_final:
                 await self._run_tools(result, messages)
                 continue
+            if not result.text.strip() and empty_retries < 1:
+                # The model produced nothing visible (an intermittent quirk: reasoning, then stop). Nothing was shown or
+                # saved for this step, so asking once more is invisible apart from the extra wait.
+                empty_retries += 1
+                self.run.emit("notice", level="info", text="The model returned an empty answer; asking once more.")
+                continue
             self.finish_reason = result.finish or "stop"
+            self._last_step_text = result.text
             break
 
-        if not any(p["type"] == "text" and p["text"].strip() for p in self.parts):
+        if not self._last_step_text.strip():
             if any(p["type"] == "tool" for p in self.parts):
                 raise RunFailure("no_answer", "The model ran its tools but did not write an answer. Retry to ask again.", True)
             raise RunFailure("empty_response", "The model returned an empty response (it produced only reasoning). Retry to ask again.", True)

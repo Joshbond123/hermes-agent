@@ -68,6 +68,10 @@ class GpuService:
         done, total = detail.get("bytes_done"), detail.get("bytes_total")
         if booting and isinstance(done, (int, float)) and isinstance(total, (int, float)) and total > 0:
             pub.update(progress_bytes_done=int(done), progress_bytes_total=int(total), progress_kind="bytes")
+            if detail.get("label"):
+                pub["progress_label"] = str(detail["label"])[:80]
+        if booting and detail.get("stalled"):
+            pub["progress_stalled"] = True
         if booting:
             started = await self._boot_started()
             if started:

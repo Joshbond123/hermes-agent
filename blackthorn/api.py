@@ -84,7 +84,7 @@ def _err(status: int, code: str, message: str, **extra: Any) -> HTTPException:
 
 
 # --------------------------------------------------------------------------- health / version
-@router.get("/api/health")
+@router.api_route("/api/health", methods=["GET", "HEAD"])
 async def health() -> Dict[str, Any]:
     return {"ok": True, "app": "blackthorn"}
 

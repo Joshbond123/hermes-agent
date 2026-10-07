@@ -83,7 +83,7 @@ export function GpuPanel({ gpu, onClose }: { gpu: GpuView; onClose: () => void }
         {s?.booting && (
           <div className="progress-block" data-testid="gpu-progress">
             <div className="progress-line">
-              <span>{bytes ? `Downloading · ${formatBytes(bytes.progress_bytes_done ?? 0)} of ${formatBytes(bytes.progress_bytes_total ?? 0)}` : s.progress_stage ? `Step ${s.progress_stage} of ${s.progress_total_stages}` : 'Starting'}</span>
+              <span>{bytes ? `${s.progress_label ?? 'Transferring'} · ${formatBytes(bytes.progress_bytes_done ?? 0)} of ${formatBytes(bytes.progress_bytes_total ?? 0)}` : s.progress_stage ? `Step ${s.progress_stage} of ${s.progress_total_stages}` : 'Starting'}</span>
               {elapsed != null && <span className="muted">{formatElapsed(elapsed)} elapsed</span>}
             </div>
             <div className="bar" role="progressbar" aria-valuemin={0} aria-valuemax={100}
@@ -91,6 +91,7 @@ export function GpuPanel({ gpu, onClose }: { gpu: GpuView; onClose: () => void }
               <i style={{ width: `${Math.round((bytes ? (bytes.progress_bytes_done ?? 0) / (bytes.progress_bytes_total ?? 1) : stageFrac) * 100)}%` }} />
             </div>
             <div className="muted small">{s.progress_step}</div>
+            {s.progress_stalled && <div className="notice warn" data-testid="gpu-stalled">No progress for several minutes. The watchdog will restart this step if it does not recover.</div>}
           </div>
         )}
 

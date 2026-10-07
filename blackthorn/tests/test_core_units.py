@@ -136,3 +136,11 @@ async def test_gpu_ready_and_off_states_offer_the_right_actions():
     o = await svc._augment(off)
     assert r["online"] and r["can_turn_off"] and not r["can_turn_on"]
     assert not o["online"] and o["can_turn_on"] and not o["can_turn_off"]
+
+
+async def test_gpu_status_carries_the_notebook_label_and_stalled_flag():
+    import time
+    state = {"active": False, "booting": True, "status": "DOWNLOADING_MODEL", "tunnel_url": "", "model": "m", "gpu_info": "T4",
+             "detail": '{"label": "Downloading the model", "bytes_done": 10, "bytes_total": 100, "stalled": true}'}
+    out = await GpuService(Store(time.time() - 5), FakeD1(state))._augment(state)
+    assert out["progress_label"] == "Downloading the model" and out["progress_stalled"] is True and out["progress_kind"] == "bytes"

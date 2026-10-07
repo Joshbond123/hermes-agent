@@ -150,3 +150,11 @@ async def test_unknown_api_route_is_json_404_and_spa_serves_index(stack):
         assert page.headers["cache-control"] == "no-store"
         assert "default-src 'self'" in page.headers["content-security-policy"]
         assert page.headers["x-content-type-options"] == "nosniff"
+
+
+async def test_head_requests_work_for_uptime_monitors(stack):
+    async with httpx.AsyncClient() as c:
+        for path in ("/", "/api/health", "/some/spa/route"):
+            r = await c.head(f"{stack.url}{path}")
+            assert r.status_code == 200, (path, r.status_code)
+        assert (await c.head(f"{stack.url}/api/health")).headers["cache-control"] == "no-store"

@@ -73,14 +73,14 @@ def _gateway_api_key(max_age: float = 20.0) -> str:
 _PUBLIC_STATUS_FIELDS = (
     "active", "booting", "status", "display_status", "engine_state", "busy", "model", "model_loaded",
     "gpu_info", "progress_pct", "progress_step", "progress_stage", "progress_total_stages", "progress_kind",
-    "progress_bytes_done", "progress_bytes_total", "elapsed_seconds", "worker_status", "quota",
+    "progress_bytes_done", "progress_bytes_total", "progress_label", "progress_stalled", "elapsed_seconds", "worker_status", "quota",
     "auto_off", "boot_seconds", "cache_source", "download_skipped", "error", "kaggle_kernel",
 )
 
 
 def public_gpu_status(state: Dict[str, Any]) -> Dict[str, Any]:
     """Allow-listed, secret-free view of the GPU state for HTTP responses."""
-    out = {k: state[k] for k in _PUBLIC_STATUS_FIELDS if k in state}
+    out = {k: state[k] for k in _PUBLIC_STATUS_FIELDS if state.get(k) is not None}
     out["online"] = bool(state.get("active")) and not bool(state.get("booting"))
     out["has_endpoint"] = bool(state.get("tunnel_url"))
     return out
@@ -806,6 +806,39 @@ def _note_status_transition(status: str) -> None:
             pass
 
 
+def _refresh_quota(force_refresh: bool = False) -> Optional[Dict[str, Any]]:
+    """Weekly GPU quota from Kaggle (cached 25 s). Returns the last known value, or None if it was never fetched.
+
+    Never invents numbers: a process that has not yet reached Kaggle reports *no* quota instead of "0 h used".
+    """
+    global _QUOTA_CACHE, _QUOTA_CACHE_TS
+    now_mono = time.monotonic()
+    if force_refresh or _QUOTA_CACHE is None or (now_mono - _QUOTA_CACHE_TS) >= 25.0:
+        try:
+            q_dict = _kaggle_rpc("GetAcceleratorQuotaStatistics", {})
+            gpu_q = q_dict.get("gpuQuota") or {}
+            raw_used = str(gpu_q.get("timeUsed") or "0").replace("s", "")
+            parts = raw_used.split(".")
+            used_sec = float(parts[0] + ("." + parts[1] if len(parts) > 1 else ""))
+            total_sec = float(str(gpu_q.get("totalTimeAllowed") or "108000").replace("s", "").split(".")[0])
+            display_total_sec = 108000.0 if total_sec <= 21600 else total_sec
+            reserved_sec = float(str(gpu_q.get("timeReserved") or "0").replace("s", "").split(".")[0])
+            _QUOTA_CACHE = {
+                "used_seconds": round(used_sec, 1),
+                "used_hours": round(used_sec / 3600.0, 2),
+                "total_seconds": display_total_sec,
+                "total_hours": round(display_total_sec / 3600.0, 1),
+                "remaining_hours": max(0.0, round((display_total_sec - used_sec) / 3600.0, 2)),
+                "used_pct": min(100.0, round((used_sec / display_total_sec) * 100.0, 1)) if display_total_sec > 0 else 0.0,
+                "refresh_time": str(q_dict.get("quotaRefreshTime") or ""),
+                "reserved_seconds": reserved_sec,
+            }
+            _QUOTA_CACHE_TS = now_mono
+        except Exception as q_err:
+            logger.debug("Quota fetch note: %s", q_err)
+    return _QUOTA_CACHE
+
+
 def get_kaggle_gpu_status(force_refresh: bool = False) -> Dict[str, Any]:
     """Return comprehensive Kaggle GPU usage, quota, kernel state, and live tunnel status."""
     global _STATUS_CACHE, _STATUS_CACHE_TS, _QUOTA_CACHE, _QUOTA_CACHE_TS
@@ -840,7 +873,7 @@ def get_kaggle_gpu_status(force_refresh: bool = False) -> Dict[str, Any]:
                 "tunnel_url": "", "model": CYBER_ORNITH_MODEL,
                 "gpu_info": "2× NVIDIA Tesla T4", "display_status": "Starting Kaggle",
                 "engine_state": "starting", "busy": False,
-                "quota": _QUOTA_CACHE or {"used_hours": 0, "total_hours": 30, "used_pct": 0, "remaining_hours": 30},
+                "quota": _QUOTA_CACHE,
             }
         _STATUS_REFRESH_IN_FLIGHT = True
         _STATUS_REFRESH_TS = time.time()
@@ -860,22 +893,16 @@ def get_kaggle_gpu_status(force_refresh: bool = False) -> Dict[str, Any]:
             "kaggle_username": KAGGLE_USERNAME,
             "kaggle_kernel": KAGGLE_KERNEL_ID,
             "worker_status": "OFF",
-            "quota": _QUOTA_CACHE or {
-                "used_seconds": 0.0,
-                "used_hours": 0.0,
-                "total_seconds": 108000.0,
-                "total_hours": 30.0,
-                "remaining_hours": 30.0,
-                "used_pct": 0.0,
-                "refresh_time": "",
-                "reserved_seconds": 0.0,
-            },
+            "quota": _QUOTA_CACHE,
             "cloudflare_d1": {
                 "connected": True,
                 "account_id": CLOUDFLARE_ACCOUNT_ID,
                 "database_id": CLOUDFLARE_D1_DATABASE_ID,
             },
         }
+
+        if state.get("quota") is None:
+            state.pop("quota", None)  # unknown is not "0 h used"
 
         # 1. Read persisted state from Cloudflare D1
         d1_row: Dict[str, Any] = {}
@@ -928,6 +955,9 @@ def get_kaggle_gpu_status(force_refresh: bool = False) -> Dict[str, Any]:
             and state.get("tunnel_url")
             and _st_up in ("ONLINE", "MODEL_READY_AND_WARMED", "HEARTBEAT_ONLINE", "MODEL_READY", "MODEL_READY_COLD")
         ):
+            quota = _refresh_quota(False) if force_refresh else _QUOTA_CACHE   # HTTP polls use the cache; the watchdog refreshes it
+            if quota:
+                state["quota"] = quota
             state["booting"] = False
             state["worker_status"] = state.get("worker_status") or "RUNNING"
             state["progress_pct"] = 100
@@ -1006,34 +1036,9 @@ def get_kaggle_gpu_status(force_refresh: bool = False) -> Dict[str, Any]:
 
         # 2. Check Kaggle API for live quota statistics (cached 25s) & kernel session status
         try:
-            if force_refresh or _QUOTA_CACHE is None or (now_mono - _QUOTA_CACHE_TS) >= 25.0:
-                try:
-                    q_dict = _kaggle_rpc("GetAcceleratorQuotaStatistics", {})
-                    gpu_q = q_dict.get("gpuQuota") or {}
-                    raw_used = str(gpu_q.get("timeUsed") or "0").replace("s", "")
-                    parts = raw_used.split(".")
-                    used_sec = float(parts[0] + ("." + parts[1] if len(parts) > 1 else ""))
-                    total_sec = float(str(gpu_q.get("totalTimeAllowed") or "108000").replace("s", "").split(".")[0])
-                    display_total_sec = 108000.0 if total_sec <= 21600 else total_sec
-                    reserved_sec = float(str(gpu_q.get("timeReserved") or "0").replace("s", "").split(".")[0])
-                    used_hr = round(used_sec / 3600.0, 2)
-                    total_hr = round(display_total_sec / 3600.0, 1)
-                    rem_hr = max(0.0, round((display_total_sec - used_sec) / 3600.0, 2))
-                    used_pct = min(100.0, round((used_sec / display_total_sec) * 100.0, 1)) if display_total_sec > 0 else 0.0
-                    _QUOTA_CACHE = {
-                        "used_seconds": round(used_sec, 1),
-                        "used_hours": used_hr,
-                        "total_seconds": display_total_sec,
-                        "total_hours": total_hr,
-                        "remaining_hours": rem_hr,
-                        "used_pct": used_pct,
-                        "refresh_time": str(q_dict.get("quotaRefreshTime") or ""),
-                        "reserved_seconds": reserved_sec,
-                    }
-                    _QUOTA_CACHE_TS = now_mono
-                    state["quota"] = _QUOTA_CACHE
-                except Exception as q_err:
-                    logger.debug("Quota fetch note: %s", q_err)
+            quota = _refresh_quota(force_refresh)
+            if quota:
+                state["quota"] = quota
 
             try:
                 st_dict = _kaggle_rpc(

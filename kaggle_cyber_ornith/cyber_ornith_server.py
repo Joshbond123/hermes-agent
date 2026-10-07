@@ -16,6 +16,7 @@
 # ==============================================================================
 
 import concurrent.futures
+import contextlib
 import hashlib
 import json
 import os
@@ -24,6 +25,7 @@ import shutil
 import subprocess
 import zipfile
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -104,6 +106,133 @@ def log(msg: str) -> None:
 _LAST_TUNNEL_URL = ""
 
 
+# --------------------- LIVE PROGRESS (real bytes, never guesses) ---------------------
+# Long boot steps (model download, unpacking, ollama pull) used to be silent. The Render-side watchdog treats a boot
+# stage that stays quiet for 4 minutes as stuck and re-pushes the kernel, so a slow-but-healthy download could be killed
+# by its own watchdog. This reporter publishes the REAL bytes transferred and refreshes `updated_at` only while the bytes
+# keep advancing: moving => alive, frozen for PROGRESS_STALL_SECONDS => stop refreshing so a genuine hang is still healed.
+# Everything here is best-effort: reporting must never be able to break a boot.
+BOOT_STAGES = {
+    "CHECKING_ENVIRONMENT", "INSTALLING_DEPS", "CHECKING_CACHE", "CACHE_MISS", "DOWNLOADING_MODEL", "MODEL_DOWNLOADED",
+    "VERIFYING_MODEL", "STARTING_OLLAMA", "LOADING_MODEL", "STARTING_GATEWAY", "TUNNEL_ONLINE", "WARMING_GPU", "CACHE_HIT",
+}
+PROGRESS_EVERY = 10.0
+PROGRESS_STALL_SECONDS = 240.0
+STAGE_MAX_SECONDS = 1500.0  # a non-measurable stage may stay "alive" this long before it stops refreshing
+
+
+class _Progress:
+    def __init__(self) -> None:
+        self.status = ""
+        self.since = 0.0
+        self.label = ""
+        self.total = 0
+        self.probe = None
+        self.last_bytes = -1
+        self.last_moved = 0.0
+
+
+PROGRESS = _Progress()
+
+
+def progress_stage(status: str) -> None:
+    PROGRESS.status, PROGRESS.since = status, time.time()
+    PROGRESS.label, PROGRESS.total, PROGRESS.probe, PROGRESS.last_bytes, PROGRESS.last_moved = "", 0, None, -1, time.time()
+
+
+@contextlib.contextmanager
+def progress_probe(label: str, total: int, probe):
+    """While the block runs, publish ``probe()`` (bytes done so far) out of ``total``."""
+    PROGRESS.label, PROGRESS.total, PROGRESS.probe = label, int(total or 0), probe
+    PROGRESS.last_bytes, PROGRESS.last_moved = -1, time.time()
+    try:
+        yield
+    finally:
+        PROGRESS.probe = None
+
+
+def dir_bytes(path: str) -> int:
+    total = 0
+    try:
+        for root, _dirs, files in os.walk(path):
+            for name in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, name))
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return total
+
+
+def file_bytes(path: str) -> int:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def _d1_exec(sql: str, params: list) -> None:
+    acct, db, tok = (os.environ.get(k, "") for k in ("CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_D1_DATABASE_ID", "CLOUDFLARE_API_TOKEN"))
+    if not (acct and db and tok):
+        return
+    req = urllib.request.Request(
+        f"https://api.cloudflare.com/client/v4/accounts/{acct}/d1/database/{db}/query",
+        data=json.dumps({"sql": sql, "params": params}).encode("utf-8"),
+        headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json", "User-Agent": "HermesKaggleGPU/1.0"},
+        method="POST",
+    )
+    urllib.request.urlopen(req, timeout=8)
+
+
+def progress_tick(now: float = 0.0) -> bool:
+    """Publish one progress sample. Returns True when `updated_at` was refreshed (the stage is alive)."""
+    now = now or time.time()
+    status = PROGRESS.status
+    if status not in BOOT_STAGES:
+        return False
+    done = None
+    if PROGRESS.probe is not None:
+        try:
+            done = int(PROGRESS.probe())
+        except Exception:
+            done = None
+    if done is not None:
+        if done > PROGRESS.last_bytes:
+            PROGRESS.last_bytes, PROGRESS.last_moved = done, now
+        alive = (now - PROGRESS.last_moved) <= PROGRESS_STALL_SECONDS
+    else:
+        alive = (now - PROGRESS.since) <= STAGE_MAX_SECONDS
+    detail = {"stage": status, "label": PROGRESS.label, "elapsed": int(now - PROGRESS.since)}
+    if done is not None and PROGRESS.total:
+        detail.update(bytes_done=done, bytes_total=PROGRESS.total)
+    if not alive:
+        detail["stalled"] = True
+    try:
+        if alive:
+            _d1_exec("UPDATE kaggle_gpu_state SET detail = ?, updated_at = ? WHERE id = 'primary' AND status = ?",
+                     [json.dumps(detail), now, status])
+        else:
+            _d1_exec("UPDATE kaggle_gpu_state SET detail = ? WHERE id = 'primary' AND status = ?", [json.dumps(detail), status])
+    except Exception:
+        return False
+    return alive
+
+
+def _progress_loop() -> None:
+    while True:
+        time.sleep(PROGRESS_EVERY)
+        try:
+            progress_tick()
+        except Exception:
+            pass
+
+
+def start_progress_reporter() -> None:
+    threading.Thread(target=_progress_loop, daemon=True, name="blackthorn-progress").start()
+
+
+
 def notify_workspace(status: str, tunnel_url: str = "", extra: dict = None) -> None:
     """Publish live status + tunnel URL to the Blackthorn workspace (ntfy + D1).
 
@@ -112,6 +241,10 @@ def notify_workspace(status: str, tunnel_url: str = "", extra: dict = None) -> N
     while the GPU is perfectly healthy).
     """
     global _LAST_TUNNEL_URL
+    try:
+        progress_stage(status)
+    except Exception:
+        pass
     if tunnel_url:
         _LAST_TUNNEL_URL = tunnel_url
     else:
@@ -306,9 +439,10 @@ def download_from_cache_dataset(dest: str) -> str:
     url = f"https://www.kaggle.com/api/v1/datasets/download/{CACHE_DATASET_SLUG}"
     log(f"⬇️  Checking the Kaggle dataset copy first: {CACHE_DATASET_SLUG}")
     for attempt in (1, 2):
-        proc = subprocess.run(["curl", "-fL", "--retry", "2", "--retry-delay", "2", "-C", "-",
-                               "-H", f"Authorization: Bearer {KAGGLE_API_TOKEN}",
-                               "-o", zip_part, url], capture_output=True, text=True)
+        with progress_probe("Downloading the model archive", expected, lambda: file_bytes(zip_part)):
+            proc = subprocess.run(["curl", "-fL", "--retry", "2", "--retry-delay", "2", "-C", "-",
+                                   "-H", f"Authorization: Bearer {KAGGLE_API_TOKEN}",
+                                   "-o", zip_part, url], capture_output=True, text=True)
         if proc.returncode != 0:
             log(f"   dataset fetch rc={proc.returncode}: {(proc.stderr or '')[-160:]}")
             if os.path.exists(zip_part):
@@ -324,8 +458,9 @@ def download_from_cache_dataset(dest: str) -> str:
                     log("   archive carries no .gguf member — falling back")
                     break
                 part = dest + ".part"
-                with zf.open(member) as src, open(part, "wb") as dst:
-                    shutil.copyfileobj(src, dst, 8 * 1024 * 1024)
+                with progress_probe("Unpacking the model", expected, lambda: file_bytes(part)):
+                    with zf.open(member) as src, open(part, "wb") as dst:
+                        shutil.copyfileobj(src, dst, 8 * 1024 * 1024)
         except zipfile.BadZipFile:
             log("   incomplete archive on disk — retrying")
             if attempt == 2:
@@ -421,9 +556,10 @@ def download_model(dest: str) -> str:
             os.remove(partial)  # never resume a bad partial file
         have = os.path.getsize(partial) if os.path.exists(partial) else 0
         log(f"⬇️  Download attempt {attempt}: {HF_GGUF_URL} (resume at {have} bytes)")
-        proc = subprocess.run(["curl", "-fL", "--retry", "8", "--retry-delay", "5", "--retry-all-errors",
-                               "--connect-timeout", "30", "--max-time", "0",
-                               "-C", "-", "-o", partial, HF_GGUF_URL], capture_output=True, text=True)
+        with progress_probe("Downloading the model", expected, lambda: file_bytes(partial)):
+            proc = subprocess.run(["curl", "-fL", "--retry", "8", "--retry-delay", "5", "--retry-all-errors",
+                                   "--connect-timeout", "30", "--max-time", "0",
+                                   "-C", "-", "-o", partial, HF_GGUF_URL], capture_output=True, text=True)
         if proc.returncode == 0:
             size = os.path.getsize(partial)
             if not expected or size == expected:
@@ -727,7 +863,8 @@ def ollama_pull_model(ollama_bin: str) -> bool:
         log(f"Trying ollama pull {tag}")
         notify_workspace("DOWNLOADING_MODEL", extra={"note": f"ollama pull {tag}"})
         try:
-            proc = subprocess.run([ollama_bin, "pull", tag], capture_output=True, text=True, timeout=3600)
+            with progress_probe("Pulling the model from the Ollama registry", MODEL_BYTES.get(MODEL_QUANT, 0), lambda: dir_bytes(PERSIST_MODELS_DIR)):
+                proc = subprocess.run([ollama_bin, "pull", tag], capture_output=True, text=True, timeout=3600)
             if proc.returncode == 0:
                 OLLAMA_MODEL_NAME = tag
                 log(f"ollama pull succeeded: {tag}")
@@ -1155,6 +1292,10 @@ def launch_cloudflared(cloudflared_bin: str):
 def main() -> None:
     started = time.time()
     boot_state = {"gpu": "", "cache_source": "", "download_skipped": False, "boot_seconds": 0}
+    try:
+        start_progress_reporter()
+    except Exception:
+        pass
     notify_workspace("CHECKING_ENVIRONMENT")
 
     try:

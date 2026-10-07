@@ -273,11 +273,30 @@ async def test_persistent_upstream_failure_ends_in_error_not_a_hang(stack):
     assert out.of("error")[0]["retryable"] is True
 
 
-async def test_empty_model_response_is_reported_not_silently_saved(stack):
-    stack.backend.queue([think("hmm"), finish("stop")])
+async def test_empty_model_response_is_retried_once_invisibly(stack):
+    stack.backend.queue([think("hmm"), finish("stop")], [*say("Here is the real answer."), finish("stop")])
     out = await stack.stream({"message": "hello"})
-    assert out.end["status"] == "error"
-    assert out.of("error")[0]["code"] == "empty_response"
+    assert out.end["status"] == "stop" and out.text == "Here is the real answer."
+    assert len(stack.backend.requests) == 2                                   # one transparent second attempt
+    assert any("asking once more" in n["text"] for n in out.of("notice"))
+    data = await session_messages(stack, out.session_id)
+    assert data["messages"][-1]["content"] == "Here is the real answer."       # nothing from the empty attempt was saved
+
+
+async def test_two_empty_responses_end_in_an_honest_error_not_a_hang(stack):
+    stack.backend.queue([think("hmm"), finish("stop")], [think("still nothing"), finish("stop")])
+    out = await stack.stream({"message": "hello"})
+    assert out.end["status"] == "error" and out.of("error")[0]["code"] == "empty_response" and out.of("error")[0]["retryable"] is True
+    assert len(stack.backend.requests) == 2                                   # exactly one retry, never a loop
+
+
+async def test_tools_then_silence_is_retried_then_reported(stack):
+    stack.backend.queue([sh("ls", cid="s1"), finish("tool_calls")], [finish("stop")], [*say("Found a.txt."), finish("stop")])
+    ok = await stack.stream({"message": "list files"})
+    assert ok.end["status"] == "stop" and ok.text == "Found a.txt."
+    stack.backend.queue([sh("ls", cid="s2"), finish("tool_calls")], [finish("stop")], [finish("stop")])
+    bad = await stack.stream({"message": "list files again"})
+    assert bad.end["status"] == "error" and bad.of("error")[0]["code"] == "no_answer"
 
 
 async def test_context_overflow_is_recovered_by_trimming(stack):

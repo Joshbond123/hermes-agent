@@ -451,6 +451,11 @@ async def test_gpu_lifecycle_reflects_real_state_progress_and_recovery(pages, ui
     await progress.wait_for()
     first = await progress.inner_text()
     assert re.search(r"Step \d+ of 12", first), first
+    # a stage that reports real bytes shows them (label + done of total), not a made-up percentage
+    await page.wait_for_function("() => (document.querySelector('[data-testid=gpu-progress]')?.innerText || '').includes('Downloading the model')", timeout=30000)
+    txt = await page.get_by_test_id("gpu-progress").inner_text()
+    assert "4.20 GB of 16.80 GB" in txt.replace("\u00a0", " ") or "GB of" in txt, txt
+    assert await page.locator("[data-testid=gpu-progress] [role=progressbar]").get_attribute("aria-valuenow") == "25"      # 4.2 / 16.8
     await page.wait_for_function("() => document.querySelector('[data-testid=gpu-button]').innerText.includes('GPU ready')", timeout=40000)
     steps = ui_stack.d1.stage
     assert steps >= 5                                                                            # it really walked the reported stages
