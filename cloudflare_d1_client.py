@@ -611,6 +611,11 @@ def auto_off_decision() -> Dict[str, Any]:
 
 
 _LAST_SAVED_TUNNEL_URL: str = ""
+# Statuses of a GPU that was steadily online. Only for these may a failed health probe mean "the tunnel died", and only for
+# these may a missing URL in D1 be treated as a write artefact worth papering over. During boot / error / off the URL in D1 is
+# authoritative: remembering an old (dead) URL there resurrects it and overwrites the notebook's real boot progress.
+_STEADY_ONLINE = ("ONLINE", "MODEL_READY_AND_WARMED", "HEARTBEAT_ONLINE", "MODEL_READY", "MODEL_READY_COLD")
+_STEADY_ONLINE_SQL = ", ".join(f"'{x}'" for x in _STEADY_ONLINE)
 _TUNNEL_CHANGE_HOOKS: List[Any] = []
 
 
@@ -841,7 +846,7 @@ def _refresh_quota(force_refresh: bool = False) -> Optional[Dict[str, Any]]:
 
 def get_kaggle_gpu_status(force_refresh: bool = False) -> Dict[str, Any]:
     """Return comprehensive Kaggle GPU usage, quota, kernel state, and live tunnel status."""
-    global _STATUS_CACHE, _STATUS_CACHE_TS, _QUOTA_CACHE, _QUOTA_CACHE_TS
+    global _STATUS_CACHE, _STATUS_CACHE_TS, _QUOTA_CACHE, _QUOTA_CACHE_TS, _LAST_SAVED_TUNNEL_URL
     now_mono = time.monotonic()
     # Keep ONLINE status sticky for longer so page reloads never flash "OFF".
     cache_ttl = 12.0
@@ -915,7 +920,8 @@ def get_kaggle_gpu_status(force_refresh: bool = False) -> Dict[str, Any]:
                 # A status update that carries no URL (e.g. the notebook's cache
                 # bookkeeping) must not blank a tunnel we already know about —
                 # otherwise the UI reports "Connection Lost" on a healthy GPU.
-                state["tunnel_url"] = row_url or _LAST_SAVED_TUNNEL_URL
+                row_steady = str(d1_row.get("status") or "").upper() in _STEADY_ONLINE
+                state["tunnel_url"] = row_url or (_LAST_SAVED_TUNNEL_URL if row_steady else "")
 
                 # Sticky ONLINE: if D1 already recorded a live tunnel, treat GPU as on
                 # immediately so page reloads never show "OFF" while health is re-probed.
@@ -932,7 +938,7 @@ def get_kaggle_gpu_status(force_refresh: bool = False) -> Dict[str, Any]:
                         state["progress_pct"] = 100
                         state["progress_step"] = "GPU Permanently Connected & Active"
                         state["display_status"] = "Kaggle Ready"
-                if not row_url and _LAST_SAVED_TUNNEL_URL:
+                if not row_url and _LAST_SAVED_TUNNEL_URL and row_steady:
                     try:
                         d1_query(
                             "UPDATE kaggle_gpu_state SET tunnel_url = ? WHERE id = 'primary' AND (tunnel_url IS NULL OR tunnel_url = '');",
@@ -1001,12 +1007,14 @@ def get_kaggle_gpu_status(force_refresh: bool = False) -> Dict[str, Any]:
                     (state.get("tunnel_url") or "")[:48],
                 )
                 try:
+                    # guarded: a boot the notebook has just started must never be overwritten by this verdict
                     d1_query(
-                        "UPDATE kaggle_gpu_state SET status = ?, tunnel_url = '' WHERE id = 'primary';",
+                        f"UPDATE kaggle_gpu_state SET status = ?, tunnel_url = '' WHERE id = 'primary' AND status IN ({_STEADY_ONLINE_SQL});",
                         ["TUNNEL_ERROR"],
                     )
                 except Exception:
                     pass
+                _LAST_SAVED_TUNNEL_URL = ""   # a confirmed-dead URL must be forgotten, never resurrected
                 state["tunnel_url"] = ""
                 state["active"] = False
                 state["booting"] = False
@@ -1170,7 +1178,10 @@ def get_kaggle_gpu_status(force_refresh: bool = False) -> Dict[str, Any]:
                     update_hermes_model_endpoint(state["tunnel_url"])
                 else:
                     tunnel_healthy = False
-                    if dead_tunnel:
+                    if dead_tunnel and str(d1_row.get("status") or "").upper() not in _STEADY_ONLINE:
+                        # a boot is in progress (or the GPU is off): the old URL is simply not usable yet, that is not an error
+                        state["tunnel_url"] = ""
+                    elif dead_tunnel:
                         logger.info(
                             "Tunnel health failed (HTTP %s / %s) — clearing stale endpoint %s",
                             http_code or "?",
@@ -1185,11 +1196,12 @@ def get_kaggle_gpu_status(force_refresh: bool = False) -> Dict[str, Any]:
                         state["progress_step"] = "Cloudflare tunnel is down — turn GPU ON to recover"
                         try:
                             d1_query(
-                                "UPDATE kaggle_gpu_state SET status = ?, tunnel_url = '' WHERE id = 'primary';",
+                                f"UPDATE kaggle_gpu_state SET status = ?, tunnel_url = '' WHERE id = 'primary' AND status IN ({_STEADY_ONLINE_SQL});",
                                 ["TUNNEL_ERROR"],
                             )
                         except Exception:
                             pass
+                        _LAST_SAVED_TUNNEL_URL = ""
                         _notify_tunnel_change("")
 
         if not tunnel_healthy:

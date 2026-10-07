@@ -490,3 +490,47 @@ async def test_system_prompt_is_short_and_has_no_keyword_rules(stack):
         assert banned not in system
     schemas = json.dumps(stack.backend.requests[0]["tools"])
     assert "minLength" not in schemas and "maximum" not in schemas       # validation-only keys stay server-side
+
+
+# ---------------------------------------------------------------------------------------------------- GPU activity bookkeeping
+class _Activity:
+    def __init__(self): self.events = []
+    def run_started(self): self.events.append("start")
+    def run_touched(self, reason="tool"): self.events.append("touch")
+    def run_finished(self): self.events.append("finish")
+
+
+async def test_every_run_marks_the_gpu_busy_and_always_releases_it(stack):
+    rec = _Activity()
+    stack.services.gpu = rec
+    stack.backend.queue([sh("echo hi", cid="a1"), finish("tool_calls")], [*say("done"), finish("stop")])
+    out = await stack.stream({"message": "run something"})
+    assert out.end["status"] == "stop" and rec.events == ["start", "touch", "finish"]
+    rec.events.clear()
+    stack.backend.queue([{"drop": 1}])
+    bad = await stack.stream({"message": "this one fails"})
+    assert bad.end["status"] == "error" and rec.events == ["start", "finish"]            # released even on failure
+    rec.events.clear()
+    stack.backend.queue([*[{"content": "w "} if i % 2 == 0 else pause(0.1) for i in range(100)], finish("stop")])
+    async with httpx.AsyncClient(timeout=30) as c:
+        async with c.stream("POST", f"{stack.url}/api/chat/stream", json={"message": "long"}) as resp:
+            from .conftest import Streamed
+            got = Streamed()
+            await got.consume(resp, stop_after=4)
+            await c.post(f"{stack.url}/api/chat/runs/{got.of('run.start')[0]['run_id']}/cancel")
+            await got.consume(resp)
+    assert got.end["status"] == "cancelled" and rec.events == ["start", "finish"]       # released even when cancelled
+
+
+async def test_chat_activity_resets_the_real_controllers_idle_clock(stack):
+    """With auto-off enabled the controller stops the GPU after N idle minutes; real chats must keep it from firing."""
+    import cloudflare_d1_client as ctl
+    from blackthorn.gpu import GpuService
+    stack.services.gpu = GpuService(stack.services.store)                                  # the real facade over the real module
+    ctl._LAST_ACTIVITY_TS = time.time() - 3600                                              # pretend it has been idle for an hour
+    before = ctl.activity_snapshot()
+    assert before["idle_seconds"] > 3000
+    stack.backend.queue([*say("hello"), finish("stop")])
+    await stack.stream({"message": "hi"})
+    after = ctl.activity_snapshot()
+    assert after["idle_seconds"] < 10 and after["active_tasks"] == 0                        # clock reset, nothing left "running"

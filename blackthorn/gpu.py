@@ -87,6 +87,28 @@ class GpuService:
         pub["server_time"] = time.time()
         return pub
 
+    # -- activity: tells the controller real work is happening, so inactivity auto-off never fires mid-conversation -------
+    def run_started(self) -> None:
+        try:
+            d1 = self._module()
+            d1.task_started("chat")
+        except Exception:
+            pass
+
+    def run_touched(self, reason: str = "tool") -> None:
+        try:
+            self._module().mark_activity(reason)
+        except Exception:
+            pass
+
+    def run_finished(self) -> None:
+        try:
+            d1 = self._module()
+            d1.task_finished("chat")
+            d1.mark_activity("chat-done")
+        except Exception:
+            pass
+
     async def status(self, refresh: bool = False) -> Dict[str, Any]:
         d1 = self._module()
         return await self._augment(await asyncio.to_thread(d1.get_kaggle_gpu_status, refresh))

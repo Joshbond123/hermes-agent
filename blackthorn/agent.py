@@ -82,6 +82,7 @@ class Deps:
     http: httpx.AsyncClient
     tavily: Any
     computer: Any
+    activity: Any = None   # run_started() / run_touched() / run_finished(): keeps the GPU's inactivity clock honest
 
 
 @dataclass
@@ -177,8 +178,17 @@ class AgentRun:
             log.warning("progress save failed: %s", exc)
 
     # ------------------------------------------------------------------ entry point
+    def _activity(self, hook: str, *args: Any) -> None:
+        fn = getattr(self.deps.activity, hook, None) if self.deps.activity is not None else None
+        if fn is not None:
+            try:
+                fn(*args)
+            except Exception:  # bookkeeping must never affect a run
+                pass
+
     async def execute(self) -> None:
         status, error = "stop", None
+        self._activity("run_started")
         try:
             await self._loop()
             status = "length" if self.finish_reason == "length" else "stop"
@@ -211,6 +221,7 @@ class AgentRun:
                 saved = False
                 log.error("final save failed: %s", exc)
                 self.run.emit("notice", level="error", text="This response could not be saved to history: " + str(exc)[:160])
+            self._activity("run_finished")
             self.run.emit("run.end", status=status, finish_reason=self.finish_reason, duration_ms=self._elapsed_ms(),
                           first_token_ms=self.first_token_ms, message_id=self.run.assistant_uid, session_id=self.run.session_id,
                           steps=self.steps, tool_calls=self.tool_calls_total, usage=dict(self.usage), saved=saved)
@@ -396,6 +407,7 @@ class AgentRun:
             part: Dict[str, Any] = {"type": "tool", "id": call_id, "name": name, "status": "running", "args": summary,
                                     "summary": "", "step": self.steps}
             self.parts.append(part)
+            self._activity("run_touched", "tool")
             self.run.emit("tool.start", id=call_id, name=name, summary=summary, step=self.steps)
             started = time.monotonic()
             if index >= s.max_calls_per_step:

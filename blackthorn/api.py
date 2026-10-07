@@ -46,7 +46,7 @@ class Services:
 
     def deps(self) -> Deps:
         return Deps(settings=self.settings, store=self.store, resolver=self.resolver, registry=self.registry,
-                    http=self.http, tavily=self.tavily, computer=self.computer)
+                    http=self.http, tavily=self.tavily, computer=self.computer, activity=self.gpu)
 
     async def user_prompt(self) -> str:
         ts, value = self._prompt_cache
