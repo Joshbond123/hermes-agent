@@ -303,9 +303,23 @@ async def _lifespan(app: "FastAPI"):
 
     start_background_bootstrap()
 
+    # Blackthorn product layer: GPU supervisor + recovery of turns cut short by a restart. Never fatal.
+    _blackthorn_lifecycle = None
+    try:
+        from blackthorn import lifecycle as _blackthorn_lifecycle
+
+        await _blackthorn_lifecycle.startup()
+    except Exception:
+        _log.warning("Blackthorn startup skipped", exc_info=True)
+
     try:
         yield
     finally:
+        if _blackthorn_lifecycle is not None:
+            try:
+                await _blackthorn_lifecycle.shutdown()
+            except Exception:
+                _log.debug("Blackthorn shutdown skipped", exc_info=True)
         try:
             tui_gateway.server.clear_tui_message_injector()
         except Exception:
@@ -514,6 +528,16 @@ def _dashboard_public_hosts() -> frozenset[str]:
     return frozenset({hostname.lower()}) if hostname else frozenset()
 
 
+def _blackthorn_public_dashboard() -> bool:
+    """Blackthorn is a single-user app on a public URL: ``blackthorn_start.py`` opts in with
+    ``BLACKTHORN_PUBLIC_DASHBOARD=1`` so the dashboard may bind publicly without the OAuth gate.
+    Set ``HERMES_FORCE_OAUTH_GATE=1`` to turn the gate back on. Without the opt-in, upstream behaviour applies."""
+    return (
+        os.environ.get("BLACKTHORN_PUBLIC_DASHBOARD") == "1"
+        and os.environ.get("HERMES_FORCE_OAUTH_GATE") != "1"
+    )
+
+
 def should_require_auth(host: str, allow_public: bool = False) -> bool:
     """True iff the auth gate must be active: any non-loopback bind.
 
@@ -521,6 +545,8 @@ def should_require_auth(host: str, allow_public: bool = False) -> bool:
     is the threat model. ``allow_public`` (legacy ``--insecure``) is accepted for
     old launch scripts but IGNORED since the June 2026 hermes-0day campaign.
     """
+    if _blackthorn_public_dashboard():
+        return False
     return host not in _LOOPBACK_HOST_VALUES
 
 
@@ -533,6 +559,8 @@ def should_require_dashboard_auth(
     Callers may pass the already-resolved host set so startup and request
     validation share one snapshot.
     """
+    if _blackthorn_public_dashboard():
+        return False
     if trusted_public_hosts is None:
         trusted_public_hosts = _dashboard_public_hosts()
     return should_require_auth(host) or any(h not in _LOOPBACK_HOST_VALUES for h in trusted_public_hosts)
@@ -1035,6 +1063,10 @@ app.include_router(_skills_routes.router)
 app.include_router(_tools_routes.router)
 app.include_router(_analytics_routes.router)
 app.include_router(_chat_ws_routes.router)
+# Blackthorn product API: chat streaming, history, GPU control (package committed in this repo).
+from blackthorn.api import router as _blackthorn_router  # noqa: E402
+
+app.include_router(_blackthorn_router)
 app.include_router(_chat_workspaces_routes.router)
 app.include_router(_dashboard_ui_routes.router)
 app.include_router(_shared_metrics_routes.router)
