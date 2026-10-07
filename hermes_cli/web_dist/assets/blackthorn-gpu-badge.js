@@ -1,6 +1,6 @@
 (function () {
   "use strict";
-  // blackthorn-ui v2026-10-07e history-nav-single
+  // blackthorn-ui v2026-10-07f product-ui
 
   var TOKEN = (window.__HERMES_SESSION_TOKEN__ || "");
   var MOCK_TITLES = [
@@ -179,6 +179,17 @@
   }
   function paintGpu(st) {
     if (!st) return;
+    // Sticky ONLINE: ignore transient OFF flashes within 90s of a known-good status
+    try {
+      var su = String(st.status || '').toUpperCase();
+      var isOn = !!(st.active || /ONLINE|MODEL_READY|HEARTBEAT/.test(su));
+      if (isOn) window._btLastOnlineTs = Date.now();
+      else if (window._btLastOnlineTs && (Date.now() - window._btLastOnlineTs) < 90000
+               && /OFF|UNKNOWN|ERROR/.test(su) && !st.booting) {
+        return; // keep prior ONLINE paint
+      }
+    } catch (e) {}
+
     _lastGpuStatus = st;
     var status = String(st.status || "").toUpperCase();
     var online = ["ONLINE", "MODEL_READY_AND_WARMED", "HEARTBEAT_ONLINE", "MODEL_READY", "MODEL_READY_COLD", "TUNNEL_ONLINE"];
@@ -969,7 +980,11 @@
       forceLayout();
       stripMockActivity(); enhanceCodeBlocks(document); collapseThinking();
       n += 1;
-      setTimeout(tick, n < 20 ? 1500 : 8000);
+      var st = (_lastGpuStatus && String(_lastGpuStatus.status || "").toUpperCase()) || "";
+      var online = /ONLINE|MODEL_READY|HEARTBEAT/.test(st) && _lastGpuStatus && _lastGpuStatus.active;
+      // Slow poll when healthy so refresh/network blips don't thrash status; faster while booting.
+      var delay = online ? 20000 : (n < 20 ? 2000 : 10000);
+      setTimeout(tick, delay);
     });
   }
 

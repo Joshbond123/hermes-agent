@@ -204,3 +204,58 @@ body.bt-chat-mode textarea{background:var(--bt-elevated)!important;border:1px so
 
 .bt-hist-item.is-active{ background: rgba(249,115,22,.12)!important; border: 1px solid rgba(249,115,22,.25); }
 .bt-hist-item{ cursor: pointer; }
+
+
+/* ===== Product polish (ChatGPT / Grok / Replit inspired) ===== */
+body.bt-chat-mode {
+  --bt-composer-max: 48rem;
+}
+body.bt-chat-mode .bt-md p,
+body.bt-chat-mode .prose p {
+  margin: 0.55em 0 !important;
+}
+body.bt-chat-mode .bt-md ul,
+body.bt-chat-mode .prose ul {
+  padding-left: 1.25rem !important;
+}
+/* Single assistant column — roomy, readable */
+body.bt-chat-mode [data-role="assistant"],
+body.bt-chat-mode .bt-ai-msg {
+  max-width: var(--bt-max) !important;
+  margin-left: auto !important;
+  margin-right: auto !important;
+  padding: 0.35rem 1rem !important;
+}
+/* Composer dock */
+body.bt-chat-mode form:has(textarea),
+body.bt-chat-mode .bt-composer-wrap {
+  max-width: var(--bt-composer-max);
+  margin-left: auto;
+  margin-right: auto;
+}
+body.bt-chat-mode textarea {
+  min-height: 52px !important;
+  max-height: 200px !important;
+}
+/* Streaming caret feel */
+body.bt-chat-mode .bt-streaming::after {
+  content: "▍";
+  animation: btBlink 1s step-end infinite;
+  margin-left: 2px;
+  color: var(--bt-muted);
+}
+@keyframes btBlink { 50% { opacity: 0; } }
+/* Tool activity compact */
+body.bt-chat-mode [data-bt-activity="tool"] {
+  font-size: 12.5px !important;
+}
+/* Code block polish */
+body.bt-chat-mode .bt-code-block {
+  font-variant-ligatures: none;
+}
+body.bt-chat-mode .bt-code-header span {
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  font-size: 10.5px !important;
+}

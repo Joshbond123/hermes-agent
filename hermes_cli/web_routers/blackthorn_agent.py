@@ -749,13 +749,19 @@ def _user_message_needs_tools(text: str, has_attachments: bool = False) -> bool:
     if any(x in t for x in web_triggers + terminal_triggers + file_triggers + kaggle_triggers):
         return True
     # Short conversational messages without action verbs → no tools
-    if len(pure.split()) <= 6 and not any(
+    words = pure.split()
+    if len(words) <= 12 and not any(
         w in pure for w in (
             "search", "browse", "run", "install", "execute", "fetch", "download",
             "write", "create", "delete", "list", "read", "open", "code", "script",
             "news", "latest", "current", "online", "web", "url", "http",
+            "research", "investigate", "scan", "assess", "terminal", "gpu",
+            "kaggle", "workspace", "file", "command", "python", "shell",
         )
     ):
+        return False
+    # Very short messages (≤4 words) never need tools unless an explicit trigger matched above
+    if len(words) <= 4:
         return False
     # Default: allow tools (model still decides via tool_choice auto)
     return True
