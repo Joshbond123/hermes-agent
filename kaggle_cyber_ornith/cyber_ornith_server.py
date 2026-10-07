@@ -5,7 +5,7 @@
 # Engine: llama.cpp CUDA (built on-device) with layer split across dual T4
 # Tunnel: Cloudflare Quick Tunnel
 # Auth  : Bearer API key
-# GPUs  : 2× NVIDIA Tesla T4 (~30 GB VRAM total) — tensor-split 50/50
+# GPUs  : T4 #0 hosts the model; T4 #1 reserved for agent computer tasks
 #
 # Boot order (cache first, never re-download if possible):
 #   1. Persistent /kaggle/working GGUF or ollama store
@@ -804,28 +804,40 @@ def ensure_llama_server_bin() -> str:
 
 
 def start_llama_server(gguf_path: str) -> None:
-    """Start OpenAI-compatible llama-server with dual-T4 layer split."""
+    """Start OpenAI-compatible llama-server on GPU 0 only.
+
+    GPU 1 is intentionally left free for the agent's computer / terminal workloads
+    (kernels, compile, tools). The 27B Q4 weights (~16.8 GB) do not fully fit in one
+    15 GB T4, so layers that do not fit spill to system RAM via -ngl rather than
+    claiming the second GPU.
+    """
     binary = ensure_llama_server_bin()
-    log(f"Starting CUDA llama-server on :{OLLAMA_PORT} with {gguf_path} (tensor-split 0.5,0.5)")
+    # Context window: prefer env, default 16384 so multi-step agent turns fit.
+    try:
+        n_ctx = int(os.environ.get("QWEN38_NUM_CTX") or os.environ.get("BLACKTHORN_CONTEXT_TOKENS") or "16384")
+    except ValueError:
+        n_ctx = 16384
+    n_ctx = max(4096, min(n_ctx, 32768))
+    log(f"Starting CUDA llama-server on :{OLLAMA_PORT} with {gguf_path} (GPU0 only, ctx={n_ctx})")
     logf = open("/tmp/llama_server.log", "w")
-    # Dual T4: ~15 GB each. Q4_K_M ~16.8 GB needs layer split.
-    # -c 4096 keeps KV cache modest; -np 1 single slot for stability.
+    # Pin the process to GPU 0 so GPU 1 stays available for agent tasks.
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = "0"
     cmd = [
         binary,
         "-m", gguf_path,
         "-ngl", "99",
-        "-c", "4096",
+        "-c", str(n_ctx),
         "--host", "0.0.0.0",
         "--port", str(OLLAMA_PORT),
         "-np", "1",
-        "--split-mode", "layer",
-        "--tensor-split", "0.5,0.5",
+        "--main-gpu", "0",
         "--flash-attn", "on",
         "-b", "512",
         "-ub", "256",
         "--no-mmap",
     ]
-    subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT)
+    subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, env=env)
     # Model load can take 60-180 s on first start
     for i in range(240):
         try:

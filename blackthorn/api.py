@@ -288,6 +288,10 @@ async def get_prompt(request: Request):
         value = await s.store.get_setting("blackthorn_system_prompt")
     except Exception:
         raise _err(502, "storage_unavailable", "Could not load the system prompt.")
+    # Always show a usable default in the header UI when the user has not saved one yet.
+    if not (value or "").strip():
+        from .prompts import BASE_PROMPT
+        value = BASE_PROMPT
     return {"prompt": value}
 
 

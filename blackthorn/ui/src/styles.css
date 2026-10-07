@@ -108,7 +108,19 @@ h1, h2, h3, h4, h5, h6 { line-height: 1.3; }
 .waiting.dots i:nth-child(2) { animation-delay: 0.2s; } .waiting.dots i:nth-child(3) { animation-delay: 0.4s; }
 @keyframes blink { 0%, 80%, 100% { opacity: 0.25; } 40% { opacity: 1; } }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
-.is-streaming > :last-child::after { content: ""; display: inline-block; width: 7px; height: 1.05em; margin-left: 3px; vertical-align: text-bottom; background: var(--muted); animation: pulse 1s infinite; border-radius: 1px; }
+.is-streaming { 
+  /* cool line-by-line reveal from shadow — not a typing cursor */
+  mask-image: linear-gradient(to bottom, #000 0%, #000 calc(100% - 1.4em), transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, #000 0%, #000 calc(100% - 1.4em), transparent 100%);
+}
+.is-streaming > :last-child {
+  animation: btLineReveal 0.35s ease-out;
+}
+@keyframes btLineReveal {
+  from { opacity: 0.35; filter: blur(0.4px); transform: translateY(2px); }
+  to { opacity: 1; filter: none; transform: none; }
+}
+.is-streaming > :last-child::after { content: none !important; display: none !important; }
 .is-streaming > .code:last-child::after, .is-streaming > .table-wrap:last-child::after { display: none; }
 .notice { margin: 8px 0 0; padding: 8px 12px; border-radius: 10px; font-size: 13px; border: 1px solid var(--line); background: var(--bg-2); }
 .notice.info { color: var(--muted); } .notice.warn { border-color: color-mix(in srgb, var(--warn) 45%, var(--line)); background: color-mix(in srgb, var(--warn) 9%, transparent); }

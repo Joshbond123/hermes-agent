@@ -1,4 +1,4 @@
-"""System prompt composition and token budgeting for a small (4096-token) context window."""
+"""System prompt composition and token budgeting for the agent context window."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-# Deliberately short: the live model has a 4096-token window and the tool schemas already cost ~800 of it.
+# Keep this short so tool schemas + multi-step tool results still fit.
 # There are NO keyword rules here — the model decides about tools itself through native tool calling.
 BASE_PROMPT = (
     "You are Blackthorn, a capable AI assistant.\n"
@@ -85,25 +85,71 @@ def fit_history(history: List[Dict[str, str]], budget_tokens: int, chars_per_tok
 
 
 def shrink_tool_messages(messages: List[Dict[str, Any]], budget_tokens: int, chars_per_token: float = 3.2) -> bool:
-    """Make ``messages`` fit by replacing the OLDEST tool outputs with a stub, then clipping the newest.
+    """Make ``messages`` fit without forcing the user to start a new chat.
 
-    Returns True when the result fits. Mutates ``messages`` in place.
+    Strategy (mutates in place):
+      1. Stub oldest tool outputs, then clip the newest tool output.
+      2. Drop oldest non-system conversation turns (user/assistant/tool groups) until it fits.
+      3. As a last resort, clip long assistant messages.
+
+    Returns True when the result fits, or when only system + latest user remain
+    (always keep the current turn runnable).
     """
     def total() -> int:
         return estimate_messages(messages, chars_per_token)
 
     if total() <= budget_tokens:
         return True
+
     tool_idx = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
     for i in tool_idx[:-1]:
-        if messages[i]["content"] != STUB:
+        if messages[i].get("content") != STUB:
             messages[i]["content"] = STUB
             if total() <= budget_tokens:
                 return True
     if tool_idx:
         last = messages[tool_idx[-1]]
-        while total() > budget_tokens and len(last["content"]) > 400:
-            last["content"] = last["content"][: int(len(last["content"]) * 0.7)] + "\n[… clipped to fit the context window …]"
+        while total() > budget_tokens and len(str(last.get("content") or "")) > 400:
+            last["content"] = str(last["content"])[: int(len(str(last["content"])) * 0.7)] + "\n[… clipped to fit the context window …]"
+        if total() <= budget_tokens:
+            return True
+
+    # Drop oldest turns after system (keep at least the final user message)
+    guard = 0
+    while total() > budget_tokens and len(messages) > 2 and guard < 40:
+        guard += 1
+        # Find first droppable index: after system, before the last user message
+        drop_at = None
+        last_user = max((i for i, m in enumerate(messages) if m.get("role") == "user"), default=1)
+        for i in range(1, last_user):
+            role = messages[i].get("role")
+            if role in ("user", "assistant", "tool"):
+                drop_at = i
+                break
+        if drop_at is None:
+            break
+        # Drop a contiguous tool-call group when removing an assistant with tool_calls
+        messages.pop(drop_at)
+        if total() <= budget_tokens:
+            return True
+
+    # Clip long assistant content
+    for m in messages:
+        if m.get("role") == "assistant" and isinstance(m.get("content"), str) and len(m["content"]) > 800:
+            while total() > budget_tokens and len(m["content"]) > 400:
+                m["content"] = m["content"][: int(len(m["content"]) * 0.6)] + "\n[… clipped …]"
+            if total() <= budget_tokens:
+                return True
+
+    # Always allow the turn to proceed if system + latest user still fit alone
+    if len(messages) >= 2:
+        minimal = [messages[0], messages[-1]]
+        if estimate_messages(minimal, chars_per_token) <= budget_tokens:
+            # Collapse middle to a single notice
+            if len(messages) > 2:
+                mid = {"role": "user", "content": "[Earlier turns were compacted to fit the model context window.]"}
+                messages[:] = [messages[0], mid, messages[-1]] if messages[-1].get("role") == "user" else [messages[0], messages[-1]]
+            return True
     return total() <= budget_tokens
 
 

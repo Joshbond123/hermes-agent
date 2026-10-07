@@ -278,7 +278,28 @@ class AgentRun:
             self._check()
             budget = self._budget - (self._schema_cost if tools else 0)
             if not prompts.shrink_tool_messages(messages, budget, s.chars_per_token):
-                raise RunFailure("context_full", "This conversation no longer fits the model's context window. Start a new chat.", False)
+                # Last resort: keep system + latest user only and continue (do not force a new chat).
+                if len(messages) > 2:
+                    messages[:] = [messages[0], messages[-1]]
+                    self.run.emit(
+                        "notice",
+                        level="info",
+                        text="Earlier turns were compacted so this conversation can continue in the model window.",
+                    )
+                    if not prompts.shrink_tool_messages(messages, budget, s.chars_per_token):
+                        raise RunFailure(
+                            "context_full",
+                            "This single message is too large for the model window even after compaction. "
+                            "Shorten the message or clear attachments and try again.",
+                            True,
+                        )
+                else:
+                    raise RunFailure(
+                        "context_full",
+                        "This single message is too large for the model window even after compaction. "
+                        "Shorten the message or clear attachments and try again.",
+                        True,
+                    )
             route = await self.deps.resolver.get()
             self.model = route.model
             self._produced = False

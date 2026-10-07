@@ -133,7 +133,8 @@ async def test_unfinished_response_after_restart_is_marked_interrupted(stack):
 
 async def test_system_prompt_roundtrip_and_is_used_next_turn(stack):
     async with httpx.AsyncClient() as c:
-        assert (await c.get(f"{stack.url}/api/system-prompt")).json() == {"prompt": ""}
+        r = (await c.get(f"{stack.url}/api/system-prompt")).json()
+        assert "prompt" in r and len(r["prompt"]) > 20  # default BASE_PROMPT when unset
         r = await c.put(f"{stack.url}/api/system-prompt", json={"prompt": "Always answer in French."})
         assert r.status_code == 200
         assert (await c.get(f"{stack.url}/api/system-prompt")).json()["prompt"] == "Always answer in French."
