@@ -1,6 +1,6 @@
 (function () {
   "use strict";
-  // blackthorn-ui v2026-10-07b modals+history+pin
+  // blackthorn-ui v2026-10-07c gpu-panel
 
   var TOKEN = (window.__HERMES_SESSION_TOKEN__ || "");
   var MOCK_TITLES = [
@@ -179,6 +179,7 @@
   }
   function paintGpu(st) {
     if (!st) return;
+    _lastGpuStatus = st;
     var status = String(st.status || "").toUpperCase();
     var online = ["ONLINE", "MODEL_READY_AND_WARMED", "HEARTBEAT_ONLINE", "MODEL_READY", "MODEL_READY_COLD", "TUNNEL_ONLINE"];
     var active = !!(st.active || online.indexOf(status) >= 0);
@@ -213,7 +214,12 @@
     var color = pctU > 85 ? "#ef4444" : (pctU > 60 ? "#f59e0b" : "#10b981");
     host.innerHTML = "<span>GPU " + used.toFixed(1) + "h/" + total.toFixed(0) + "h</span>" +
       '<span class="bt-q-bar"><i style="width:' + Math.max(2, Math.min(100, pctU)) + "%;background:" + color + '"></i></span>';
+  
+    paintQuota(st);
+    refreshGpuPanel(st);
   }
+  var _lastGpuStatus = null;
+
   function pollGpu() {
     return fetch("/api/kaggle-gpu/status", { credentials: "include" })
       .then(function (r) { return r.ok ? r.json() : null; })
@@ -225,69 +231,149 @@
   var _gpuBusy = false;
   var _gpuPollTimer = null;
 
+  
+  var _lastGpuStatus = null;
+
+  function escHtml(s) {
+    return String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  function paintQuota(st) {
+    var q = (st && st.quota) || null;
+    var host = document.getElementById("bt-quota-chip");
+    if (!host) {
+      host = document.createElement("span");
+      host.id = "bt-quota-chip";
+      host.title = "Kaggle GPU weekly quota";
+      var btn = findGpuButton();
+      if (btn && btn.parentElement) btn.parentElement.insertBefore(host, btn);
+      else return;
+    }
+    if (!q) { host.textContent = "Quota …"; return; }
+    var used = (typeof q.used_hours === "number") ? q.used_hours : 0;
+    var total = (typeof q.total_hours === "number") ? q.total_hours : 30;
+    var pct = (typeof q.used_pct === "number") ? q.used_pct : 0;
+    var color = pct > 85 ? "#ef4444" : (pct > 60 ? "#f59e0b" : "#10b981");
+    host.innerHTML =
+      "<span>GPU " + used.toFixed(1) + "h/" + total.toFixed(0) + "h</span>" +
+      '<span class="bt-q-bar"><i style="width:' + Math.max(2, Math.min(100, pct)) + "%;background:" + color + '"></i></span>';
+  }
+
+  function ensureGpuPanel() {
+    if (document.getElementById("bt-gpu-panel")) return;
+    var panel = document.createElement("div");
+    panel.id = "bt-gpu-panel";
+    panel.setAttribute("role", "dialog");
+    panel.setAttribute("aria-label", "GPU status");
+    panel.innerHTML =
+      '<div class="bt-gpu-panel-card">' +
+      '  <header class="bt-gpu-panel-head">' +
+      '    <div><strong>Kaggle GPU</strong><span class="bt-gpu-panel-sub" id="bt-gpu-panel-sub">Status</span></div>' +
+      '    <button type="button" class="bt-menu-btn" id="bt-gpu-panel-close" aria-label="Close">×</button>' +
+      '  </header>' +
+      '  <div class="bt-gpu-panel-body" id="bt-gpu-panel-body"><p class="bt-gpu-note">Loading status…</p></div>' +
+      '  <div class="bt-gpu-panel-actions">' +
+      '    <button type="button" class="bt-hdr-btn" id="bt-gpu-panel-refresh">Refresh</button>' +
+      '    <button type="button" class="bt-hdr-btn bt-primary" id="bt-gpu-panel-toggle">Turn on</button>' +
+      '  </div>' +
+      '</div>';
+    document.body.appendChild(panel);
+    document.getElementById("bt-gpu-panel-close").addEventListener("click", function () { closeGpuPanel(); });
+    panel.addEventListener("click", function (e) { if (e.target === panel) closeGpuPanel(); });
+    document.getElementById("bt-gpu-panel-refresh").addEventListener("click", function () { pollGpu(); });
+    document.getElementById("bt-gpu-panel-toggle").addEventListener("click", function () { runGpuToggle(); });
+    document.addEventListener("keydown", function (ev) {
+      if (ev.key === "Escape") closeGpuPanel();
+    });
+  }
+
+  function closeGpuPanel() {
+    var panel = document.getElementById("bt-gpu-panel");
+    if (panel) panel.classList.remove("bt-open");
+  }
+
+  function openGpuPanel() {
+    ensureGpuPanel();
+    var panel = document.getElementById("bt-gpu-panel");
+    panel.classList.add("bt-open");
+    if (_lastGpuStatus) refreshGpuPanel(_lastGpuStatus);
+    pollGpu();
+  }
+
+  function refreshGpuPanel(st) {
+    var body = document.getElementById("bt-gpu-panel-body");
+    var sub = document.getElementById("bt-gpu-panel-sub");
+    var toggle = document.getElementById("bt-gpu-panel-toggle");
+    if (!body || !st) return;
+    var status = String(st.status || "").toUpperCase();
+    var online = ["ONLINE","MODEL_READY_AND_WARMED","HEARTBEAT_ONLINE","MODEL_READY","MODEL_READY_COLD","TUNNEL_ONLINE"];
+    var active = !!(st.active || online.indexOf(status) >= 0);
+    var booting = !!st.booting || /BOOTING|STARTING|DOWNLOAD|WARMING|ALLOCAT/i.test(status);
+    var q = st.quota || {};
+    var used = (typeof q.used_hours === "number") ? q.used_hours : 0;
+    var total = (typeof q.total_hours === "number") ? q.total_hours : 30;
+    var pct = (typeof q.used_pct === "number") ? q.used_pct : 0;
+    var remain = (typeof q.remaining_hours === "number") ? q.remaining_hours : (total - used);
+    var barColor = pct > 85 ? "#ef4444" : (pct > 60 ? "#f59e0b" : "#10b981");
+    if (sub) sub.textContent = st.display_status || st.status || "—";
+    body.innerHTML =
+      '<div class="bt-gpu-row"><span>State</span><strong>' + (active ? "Online" : (booting ? "Starting" : "Offline")) + "</strong></div>" +
+      '<div class="bt-gpu-row"><span>Status</span><strong>' + escHtml(st.display_status || st.status || "—") + "</strong></div>" +
+      ((booting || st.progress_step) ? ('<div class="bt-gpu-row"><span>Progress</span><strong>' + (st.progress_pct || 0) + "% — " + escHtml(st.progress_step || "") + "</strong></div>") : "") +
+      '<div class="bt-gpu-row"><span>Model</span><strong>' + escHtml(st.model || "—") + "</strong></div>" +
+      '<div class="bt-gpu-row"><span>Hardware</span><strong>' + escHtml(st.gpu_info || "—") + "</strong></div>" +
+      '<div class="bt-gpu-row"><span>Kernel</span><strong>' + escHtml(st.kaggle_kernel || "—") + "</strong></div>" +
+      (st.tunnel_url ? ('<div class="bt-gpu-row"><span>Tunnel</span><strong class="bt-gpu-mono">' + escHtml(st.tunnel_url) + "</strong></div>") : "") +
+      '<div class="bt-gpu-quota">' +
+      '  <div class="bt-gpu-quota-top"><span>Weekly quota</span><span>' + used.toFixed(1) + "h / " + total.toFixed(0) + "h · " + remain.toFixed(1) + "h left</span></div>" +
+      '  <div class="bt-q-bar bt-q-bar-lg"><i style="width:' + Math.max(2, Math.min(100, pct)) + "%;background:" + barColor + '"></i></div>' +
+      "</div>" +
+      (st.auto_off ? ('<div class="bt-gpu-note">' + escHtml(st.auto_off.reason || "") + "</div>") : "");
+    if (toggle) {
+      toggle.textContent = (active || booting) ? "Turn off" : "Turn on";
+      toggle.disabled = false;
+    }
+  }
+
+  function runGpuToggle() {
+    if (typeof _gpuBusy !== "undefined" && _gpuBusy) return;
+    _gpuBusy = true;
+    var st = _lastGpuStatus || {};
+    var status = String(st.status || "").toUpperCase();
+    var online = ["ONLINE","MODEL_READY_AND_WARMED","HEARTBEAT_ONLINE","MODEL_READY","MODEL_READY_COLD","TUNNEL_ONLINE"];
+    var active = !!(st.active || online.indexOf(status) >= 0);
+    var booting = !!st.booting || /BOOTING|STARTING|DOWNLOAD|WARMING|ALLOCAT/i.test(status);
+    var isOn = active || booting;
+    var endpoint = isOn ? "/api/kaggle-gpu/turn-off?reason=user" : "/api/kaggle-gpu/turn-on";
+    var toggle = document.getElementById("bt-gpu-panel-toggle");
+    if (toggle) { toggle.disabled = true; toggle.textContent = isOn ? "Stopping…" : "Starting…"; }
+    var btn = findGpuButton();
+    if (btn) {
+      Array.from(btn.querySelectorAll("span")).forEach(function (s) {
+        if (/GPU/i.test(s.textContent || "")) s.textContent = isOn ? "GPU …" : "GPU starting…";
+      });
+    }
+    fetch(endpoint, { method: "POST", credentials: "include", headers: authHeaders() })
+      .then(function () { return pollGpu(); })
+      .catch(function () {})
+      .then(function () {
+        _gpuBusy = false;
+        if (toggle) toggle.disabled = false;
+      });
+  }
+
+
   function wireGpuButton() {
     var btn = findGpuButton();
     if (!btn || btn.dataset.btGpuWired === "1") return;
     btn.dataset.btGpuWired = "1";
     btn.style.cursor = "pointer";
+    btn.setAttribute("aria-haspopup", "dialog");
     btn.addEventListener("click", function (ev) {
       ev.preventDefault();
       ev.stopPropagation();
-      if (_gpuBusy) return;
-      var label = (btn.textContent || "").toUpperCase();
-      var isOn = /GPU\s*ON/i.test(label) || btn.classList.contains("bt-gpu-live");
-      var endpoint = isOn ? "/api/kaggle-gpu/turn-off?reason=user" : "/api/kaggle-gpu/turn-on";
-      _gpuBusy = true;
-      btn.disabled = true;
-      btn.style.opacity = "0.7";
-      // optimistic UI
-      Array.from(btn.querySelectorAll("span")).forEach(function (s) {
-        if (/GPU/i.test(s.textContent || "")) s.textContent = isOn ? "GPU …" : "GPU starting…";
-      });
-      fetch(endpoint, {
-        method: "POST",
-        credentials: "include",
-        headers: authHeaders(),
-      })
-        .then(function (r) {
-          return r.json().then(function (j) {
-            return { ok: r.ok, status: r.status, body: j };
-          }).catch(function () {
-            return { ok: r.ok, status: r.status, body: null };
-          });
-        })
-        .then(function (res) {
-          if (res.body) paintGpu(res.body);
-          // Start fast polling while booting
-          if (!isOn) {
-            if (_gpuPollTimer) clearInterval(_gpuPollTimer);
-            var n = 0;
-            _gpuPollTimer = setInterval(function () {
-              n += 1;
-              pollGpu().then(function () {
-                var b2 = findGpuButton();
-                var t = (b2 && b2.textContent) || "";
-                if (/GPU\s*ON/i.test(t) || n > 90) {
-                  clearInterval(_gpuPollTimer);
-                  _gpuPollTimer = null;
-                }
-              });
-            }, 3000);
-          }
-        })
-        .catch(function (err) {
-          console.warn("gpu toggle failed", err);
-          Array.from(btn.querySelectorAll("span")).forEach(function (s) {
-            if (/GPU/i.test(s.textContent || "")) s.textContent = "GPU ERR";
-          });
-        })
-        .finally(function () {
-          _gpuBusy = false;
-          btn.disabled = false;
-          btn.style.opacity = "1";
-          pollGpu();
-        });
-    }, true);
+      openGpuPanel();
+    });
   }
 
   /* ---- Clear blocking overlays ---- */
@@ -926,6 +1012,8 @@
   }
 
   function boot() {
+    ensureGpuPanel();
+    wireGpuButton();
     syncChatMode();
     ensureHistoryPanel();
     ensureSystemPromptUI();

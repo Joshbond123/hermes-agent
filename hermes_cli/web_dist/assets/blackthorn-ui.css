@@ -144,3 +144,60 @@ body.bt-chat-mode textarea{background:var(--bt-elevated)!important;border:1px so
   body.bt-chat-mode textarea{font-size:16px!important}
   .bt-sp-card{max-height:90vh}
 }
+
+
+/* ===== GPU quota chip + status panel ===== */
+#bt-quota-chip{
+  display:inline-flex; align-items:center; gap:6px;
+  font-size:11px; font-weight:600; color:var(--bt-muted);
+  padding:0.2rem 0.55rem; border-radius:999px;
+  border:1px solid var(--bt-border); background:var(--bt-elevated);
+  margin-right:6px; white-space:nowrap;
+}
+#bt-quota-chip .bt-q-bar, .bt-q-bar{
+  display:inline-block; width:42px; height:4px; border-radius:99px;
+  background:rgba(255,255,255,.08); overflow:hidden; vertical-align:middle;
+}
+#bt-quota-chip .bt-q-bar i, .bt-q-bar i{ display:block; height:100%; border-radius:99px; }
+.bt-q-bar-lg{ width:100%!important; height:6px!important; display:block!important; margin-top:6px; }
+
+#bt-gpu-panel{
+  position:fixed; inset:0; z-index:13500;
+  display:none; align-items:flex-start; justify-content:flex-end;
+  background:rgba(0,0,0,.45); backdrop-filter:blur(6px);
+  padding:3.5rem 1rem 1rem;
+}
+#bt-gpu-panel.bt-open{ display:flex!important; }
+.bt-gpu-panel-card{
+  width:min(380px,100%);
+  background:var(--bt-surface); border:1px solid var(--bt-border-strong);
+  border-radius:16px; box-shadow:0 20px 60px rgba(0,0,0,.55);
+  color:var(--bt-text); overflow:hidden;
+  animation: btGpuIn .15s ease-out;
+}
+@keyframes btGpuIn{ from{ opacity:0; transform:translateY(-6px);} to{ opacity:1; transform:none;} }
+.bt-gpu-panel-head{
+  display:flex; align-items:flex-start; justify-content:space-between;
+  padding:.9rem 1rem; border-bottom:1px solid var(--bt-border);
+}
+.bt-gpu-panel-head strong{ display:block; font-size:14px; }
+.bt-gpu-panel-sub{ display:block; font-size:12px; color:var(--bt-muted); margin-top:2px; }
+.bt-gpu-panel-body{ padding:.75rem 1rem 0.25rem; }
+.bt-gpu-row{
+  display:flex; justify-content:space-between; gap:12px;
+  padding:.35rem 0; font-size:12.5px; border-bottom:1px solid rgba(255,255,255,.04);
+}
+.bt-gpu-row span{ color:var(--bt-faint); flex-shrink:0; }
+.bt-gpu-row strong{ text-align:right; font-weight:500; color:var(--bt-text); word-break:break-word; }
+.bt-gpu-mono{ font-family:var(--bt-mono); font-size:11px; }
+.bt-gpu-quota{ margin-top:.75rem; padding:.65rem .7rem; border-radius:10px; background:var(--bt-elevated); border:1px solid var(--bt-border); }
+.bt-gpu-quota-top{ display:flex; justify-content:space-between; font-size:12px; color:var(--bt-muted); gap:8px; }
+.bt-gpu-note{ margin-top:.65rem; font-size:11.5px; color:var(--bt-faint); line-height:1.4; }
+.bt-gpu-panel-actions{
+  display:flex; justify-content:flex-end; gap:8px;
+  padding:.85rem 1rem 1rem;
+}
+.bt-gpu-panel-actions .bt-primary{
+  background:var(--bt-accent-soft)!important; border-color:rgba(249,115,22,.45)!important; color:#fdba74!important;
+}
+.bt-gpu-btn{ cursor:pointer!important; }
