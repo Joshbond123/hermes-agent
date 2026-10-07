@@ -39,7 +39,7 @@ from hermes_cli.web_routers._common import log
 
 router = APIRouter(tags=["blackthorn-agent"])
 
-MAX_STEPS = 6
+MAX_STEPS = 24
 TOOL_OUTPUT_CHARS = 6000
 COMMAND_TIMEOUT = 60.0
 FETCH_TIMEOUT = 20.0
@@ -812,7 +812,7 @@ async def agent_stream(payload: AgentChatRequest, request: Request):
     t_start = time.perf_counter()
     session_id = (payload.session_id or "").strip() or f"studio-{uuid.uuid4().hex[:12]}"
     root = _workspace_root(request)
-    max_steps = max(1, min(int(payload.max_steps or MAX_STEPS), 8))
+    max_steps = max(1, min(int(payload.max_steps or MAX_STEPS), 32))
 
     is_new_session = not (payload.session_id or "").strip()
     route_task = studio._cached_route()
@@ -847,6 +847,15 @@ async def agent_stream(payload: AgentChatRequest, request: Request):
     if not needs_tools:
         max_steps = 1  # single direct answer — no tool loop
     system_prompt = studio._compose_system(memories, attachments) + "\n\n" + TOOL_SYSTEM_PROMPT
+    system_prompt += """
+
+AUTONOMY RULES (mandatory):
+- Complete the user's task in this single turn using as many tool calls as needed.
+- Never ask the user to say "continue" or send another message to finish.
+- After each tool result, immediately decide the next tool call or the final answer.
+- Prefer action (tools) over narrating plans. Emit real tool calls, not descriptions of them.
+- When the task is done, give a clear final answer summarizing results and evidence.
+"""
     system_prompt += f"\nWorkspace root: {root}"
     if not needs_tools:
         system_prompt += NO_TOOL_SYSTEM_ADDON
@@ -967,6 +976,11 @@ async def agent_stream(payload: AgentChatRequest, request: Request):
             route_retry_signal = False
             step_budget = max_steps
             for step_no in range(1, step_budget + 1):
+                try:
+                    # Refresh idle clock only — do NOT nest task_started (would leak counters)
+                    studio.mark_activity_safe("agent-step")
+                except Exception:
+                    pass
                 if stop_all or await client_gone():
                     cancelled = True
                     finish_reason = finish_reason if finish_reason == "cancelled" else "cancelled"
@@ -1230,8 +1244,10 @@ async def agent_stream(payload: AgentChatRequest, request: Request):
                                      "content": f'<tool_call>{{"name": "{name}", "arguments": {json.dumps(args)}}}</tool_call>'})
                     messages.append({"role": "user",
                                      "content": f"Tool `{name}` finished. Real result:\n\n```\n{_truncate(result)}\n```\n\n"
-                                                "Continue and give the user the final answer, or call another tool if needed."})
+                                                "Continue autonomously: call another tool now if needed, or give the FINAL complete answer. Do not ask the user to continue."})
                 answer_text = ""  # intermediate text is not the final answer
+                if finish_reason == "tool_calls":
+                    finish_reason = "stop"  # continue autonomous loop
         except asyncio.CancelledError:
             cancelled = True
             finish_reason = "cancelled"
@@ -1247,15 +1263,28 @@ async def agent_stream(payload: AgentChatRequest, request: Request):
         # GeneratorExit, and yielding after that is a RuntimeError.
         answer = (answer_text or "").strip()
         duration_ms = prework_ms + int((time.perf_counter() - t_start_model) * 1000)
-        if answer or finish_reason in ("stop", "cancelled"):
-            yield _sse({
-                "type": "done", "session_id": session_id, "finish_reason": finish_reason,
-                "first_token_ms": first_token_ms, "duration_ms": duration_ms,
-                "output_tokens": out_tokens or None,
-                "cancelled": cancelled,
-                "steps": steps,
-            })
-        asyncio.create_task(persist(answer, out_tokens or None, finish_reason, steps))
+        # If the model stopped on tool_calls without a final answer, surface a clear
+        # completion note so history is not empty "thought-only" rows.
+        if not answer and steps and finish_reason in ("tool_calls", "length", "stop"):
+            tool_titles = [s.get("title") or s.get("kind") for s in steps if s.get("kind") == "tool"]
+            if tool_titles:
+                answer = (
+                    "Completed tool steps in this turn:\n"
+                    + "\n".join(f"- {t}" for t in tool_titles[:20])
+                    + ("\n\n(Partial run — step budget reached before a final narrative answer.)"
+                       if finish_reason == "tool_calls" else "")
+                )
+                # stream the fallback so the live UI is not blank
+                yield _sse({"type": "delta", "delta": answer})
+        # Always emit done so the client closes cleanly and persists activity.
+        yield _sse({
+            "type": "done", "session_id": session_id, "finish_reason": finish_reason or "stop",
+            "first_token_ms": first_token_ms, "duration_ms": duration_ms,
+            "output_tokens": out_tokens or None,
+            "cancelled": cancelled,
+            "steps": steps,
+        })
+        asyncio.create_task(persist(answer, out_tokens or None, finish_reason or "stop", steps))
 
     return StreamingResponse(
         event_stream(),
