@@ -1,6 +1,6 @@
 (function () {
   "use strict";
-  // blackthorn-ui v2026-10-07g grok-layout
+  // blackthorn-ui v2026-10-07h two-headers
 
   var TOKEN = (window.__HERMES_SESSION_TOKEN__ || "");
   var MOCK_TITLES = [
@@ -895,14 +895,54 @@
   function forceLayout() {
     if (!document.body.classList.contains("bt-chat-mode")) return;
 
-    // Hide non-blackthorn asides (history is our panel)
+    // ----- Exactly TWO headers -----
+    // 1) App chrome (brand + GPU / primary actions)
+    // 2) Chat context (New / title / Export / Files)
+    // Hide mobile-only top header on wide screens; fold offline banner into chips.
+    var headers = Array.prototype.slice.call(document.querySelectorAll("header"));
+    var isWide = window.innerWidth >= 1024;
+    headers.forEach(function (h, idx) {
+      var cls = (h.className || "").toString();
+      var text = (h.textContent || "").replace(/\s+/g, " ").trim();
+      // Mobile fixed header — hide on desktop (duplicate of app chrome)
+      if (cls.indexOf("lg:hidden") >= 0 || (cls.indexOf("fixed") >= 0 && cls.indexOf("top-0") >= 0 && text.indexOf("Hermes Agent") >= 0 && text.length < 40)) {
+        if (isWide) {
+          h.style.setProperty("display", "none", "important");
+          h.setAttribute("data-bt-header", "mobile-hidden");
+        } else {
+          h.style.removeProperty("display");
+          h.setAttribute("data-bt-header", "mobile");
+        }
+        return;
+      }
+      // App chrome vs studio context
+      if (/GPU|Chat/i.test(text) && /GPU\s*(ON|OFF)/i.test(text)) {
+        h.setAttribute("data-bt-header", "app");
+        h.style.setProperty("display", "flex", "important");
+      } else if (/New chat|Export|Files/i.test(text)) {
+        h.setAttribute("data-bt-header", "chat");
+        h.style.setProperty("display", "flex", "important");
+      }
+    });
+
+    // Collapse the full-width offline banner (3rd visual band) into a compact note in chat header
+    document.querySelectorAll("div, section, p").forEach(function (el) {
+      if (el.closest("header, form, #app-sidebar, #bt-history-panel, #bt-gpu-panel")) return;
+      var t = (el.textContent || "").replace(/\s+/g, " ").trim();
+      if (/^Kaggle GPU is offline/i.test(t) && t.length < 220 && el.children.length <= 3) {
+        el.style.setProperty("display", "none", "important");
+        el.setAttribute("data-bt-offline-banner", "1");
+      }
+    });
+
+    // Hide non-blackthorn asides
     document.querySelectorAll("aside").forEach(function (a) {
       if (a.id === "app-sidebar" || a.id === "bt-history-panel") return;
       a.style.setProperty("display", "none", "important");
       a.style.pointerEvents = "none";
     });
 
-    // Grok-style: remove decorative avatars / letter circles next to messages
+    // Grok-style: remove decorative avatars / letter circles beside messages
     document.querySelectorAll(
       'img[alt*="avatar" i], img[alt*="user" i], img[alt*="assistant" i], ' +
       '[class*="avatar" i], [class*="Avatar"]'
@@ -910,9 +950,8 @@
       if (el.closest("#app-sidebar, #bt-history-panel, header, nav")) return;
       el.style.setProperty("display", "none", "important");
     });
-    // Letter badge circles (e.g. "B") sitting beside message rows
     document.querySelectorAll("div, span").forEach(function (el) {
-      if (el.closest("#app-sidebar, #bt-history-panel, header, form, #bt-gpu-panel")) return;
+      if (el.closest("#app-sidebar, #bt-history-panel, header, form, #bt-gpu-panel, [data-bt-header]")) return;
       if (el.children.length > 0) return;
       var t = (el.textContent || "").trim();
       if (t.length === 1 && /[A-Za-z0-9]/.test(t)) {
@@ -925,19 +964,16 @@
       }
     });
 
-    // Widen conversation column — Grok uses near full content width
-    var candidates = document.querySelectorAll(
-      "main, [class*='chat'], [class*='Chat'], [class*='message'], [class*='Message'], " +
-      "[class*='prose'], [class*='markdown'], [class*='Markdown'], [class*='transcript']"
-    );
-    candidates.forEach(function (el) {
+    // Widen conversation column
+    document.querySelectorAll(
+      "main, [class*='prose'], [class*='markdown'], [class*='Markdown'], [class*='transcript']"
+    ).forEach(function (el) {
       if (el.closest("#app-sidebar, #bt-history-panel, form")) return;
-      var mw = el.style.maxWidth || window.getComputedStyle(el).maxWidth;
+      var mw = window.getComputedStyle(el).maxWidth;
       if (mw && mw !== "none" && parseFloat(mw) > 0 && parseFloat(mw) < 900) {
         el.style.setProperty("max-width", "52rem", "important");
       }
     });
-    // Message rows: full usable width inside main
     document.querySelectorAll("[data-role], [class*='message-row'], [class*='MessageRow']").forEach(function (el) {
       el.style.setProperty("max-width", "52rem", "important");
       el.style.setProperty("margin-left", "auto", "important");
@@ -945,6 +981,7 @@
       el.style.setProperty("width", "100%", "important");
     });
   }
+
 
   function wireSidebar() {
     document.addEventListener("click", function (ev) {
