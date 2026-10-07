@@ -451,3 +451,6 @@ body.bt-chat-mode .bt-activity-toggle {
     display: flex !important;
   }
 }
+
+body.bt-chat-mode [data-bt-metrics-banner="1"] { display: none !important; height: 0 !important; overflow: hidden !important; }
+body.bt-chat-mode header[data-bt-header="mobile-hidden"] { display: none !important; height: 0 !important; min-height: 0 !important; padding: 0 !important; border: none !important; overflow: hidden !important; }
