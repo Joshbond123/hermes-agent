@@ -133,7 +133,8 @@ export function Sidebar(props: SidebarProps) {
           {props.version && (
             <div className="muted tiny" data-testid="version-foot" title={`UI build ${props.version.ui?.hash ?? 'unknown'}`}>
               Blackthorn v{props.version.version} · {props.version.commit.slice(0, 7)}
-              {props.version.integrity?.drift?.length ? <span className="integrity" role="alert"> · deployed files differ from the commit</span> : null}
+              {props.version.integrity?.drift?.length ? <span className="integrity" role="alert" data-testid="integrity-warning"> · deployed files differ from the commit</span> : null}
+              {props.version.overlay?.active ? <span className="integrity" role="alert" data-testid="overlay-warning"> · a code overlay is active (running code may differ from Git)</span> : null}
             </div>
           )}
         </div>

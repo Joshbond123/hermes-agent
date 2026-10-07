@@ -68,6 +68,9 @@ def create_app(settings: Optional[Settings] = None, *, services: Optional[Servic
         integrity = check_manifest()
         if integrity.get("drift"):
             log.error("INTEGRITY: deployed files differ from the committed manifest: %s", integrity["drift"])
+        from .version import overlay_status
+        if overlay_status().get("active"):
+            log.error("INTEGRITY: a code overlay was extracted over the checkout at build time; running code may differ from Git")
         if start_daemon:
             try:
                 import cloudflare_d1_client

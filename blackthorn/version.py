@@ -78,6 +78,19 @@ def _git_commit() -> str:
         return "unknown"
 
 
+def overlay_status(root: Path = ROOT) -> Dict[str, object]:
+    """Was anything extracted over the checkout at build time? (the old pipeline did this from Cloudflare D1)
+
+    The build command writes ``.blackthorn_overlay_stamp``. The neutral archive that replaced the legacy overlay carries
+    ``.blackthorn_overlay_disabled``. A stamp *without* that marker means a real overlay was applied: the running code
+    may then differ from Git, and the UI says so.
+    """
+    stamp = root / ".blackthorn_overlay_stamp"
+    disabled = (root / ".blackthorn_overlay_disabled").exists()
+    present = stamp.exists()
+    return {"stamp": stamp.read_text().strip()[:12] if present else None, "disabled": disabled, "active": present and not disabled}
+
+
 def build_info(static_dir: Path) -> Dict[str, object]:
     ui: Dict[str, object] = {}
     try:
@@ -90,7 +103,7 @@ def build_info(static_dir: Path) -> Dict[str, object]:
         "branch": os.environ.get("RENDER_GIT_BRANCH", ""), "ui": ui,
         "started_at": STARTED_AT, "uptime_seconds": int(time.time() - STARTED_AT),
         "python": sys.version.split()[0], "integrity": integrity,
-        "overlay_stamp_present": (ROOT / ".blackthorn_overlay_stamp").exists(),
+        "overlay": overlay_status(),
     }
 
 

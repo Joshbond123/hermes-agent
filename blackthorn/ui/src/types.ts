@@ -90,6 +90,7 @@ export interface VersionInfo {
   commit: string
   ui?: { hash?: string }
   integrity?: { drift?: string[]; checked?: number }
+  overlay?: { active: boolean; disabled: boolean; stamp: string | null }
 }
 
 // ---- server-sent events ------------------------------------------------------------------------------------

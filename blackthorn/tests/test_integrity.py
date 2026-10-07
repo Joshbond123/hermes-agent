@@ -93,3 +93,11 @@ def test_committed_ui_build_matches_the_ui_source():
     """If you edit blackthorn/ui, run `npm run build` (and `python -m blackthorn.version --write`) before committing."""
     info = json.loads((ROOT / "blackthorn" / "static" / "build.json").read_text())
     assert info["source_hash"] == _ui_source_hash(), "blackthorn/static is stale: the UI source changed after the last build"
+
+
+def test_overlay_status_distinguishes_disabled_from_active(tmp_path):
+    assert version.overlay_status(tmp_path) == {"stamp": None, "disabled": False, "active": False}
+    (tmp_path / ".blackthorn_overlay_stamp").write_text("abcdef1234567890")
+    assert version.overlay_status(tmp_path) == {"stamp": "abcdef123456", "disabled": False, "active": True}      # a real overlay was applied
+    (tmp_path / ".blackthorn_overlay_disabled").write_text("neutral")
+    assert version.overlay_status(tmp_path) == {"stamp": "abcdef123456", "disabled": True, "active": False}      # neutral archive only
