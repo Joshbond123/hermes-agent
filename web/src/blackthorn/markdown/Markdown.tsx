@@ -1,6 +1,7 @@
 import { memo, useMemo, type ReactNode } from "react";
-import { marked, type Token, type Tokens } from "marked";
+import type { Token, Tokens } from "marked";
 import { CodeBlock } from "./CodeBlock";
+import { isSafeUrl, lexMarkdown } from "./utils";
 
 /**
  * Markdown -> React elements (never `dangerouslySetInnerHTML`, never raw HTML from the model).
@@ -10,16 +11,6 @@ import { CodeBlock } from "./CodeBlock";
  * tokens stream in. An unterminated ``` fence renders as a growing code block; a table appears the
  * moment its delimiter row arrives.
  */
-const LEX_OPTIONS = { gfm: true, breaks: false } as const;
-
-export function isSafeUrl(href: string | undefined | null): boolean {
-  if (!href) return false;
-  // eslint-disable-next-line no-control-regex
-  const cleaned = href.replace(/[\u0000-\u001f\u007f\s]+/g, "").toLowerCase();
-  if (cleaned.startsWith("#") || cleaned.startsWith("/") || cleaned.startsWith("./") || cleaned.startsWith("../")) return true;
-  return /^(https?:|mailto:)/.test(cleaned);
-}
-
 function Inline({ tokens }: { tokens: Token[] | undefined }): ReactNode {
   if (!tokens) return null;
   return tokens.map((t, i) => <InlineToken key={i} token={t} />);
@@ -167,10 +158,6 @@ const Block = memo(
   },
   (a, b) => a.token.raw === b.token.raw && a.caret === b.caret,
 );
-
-export function lexMarkdown(text: string): Token[] {
-  return marked.lexer(text, LEX_OPTIONS) as Token[];
-}
 
 export const Markdown = memo(function Markdown({ text, streaming = false }: { text: string; streaming?: boolean }) {
   const tokens = useMemo(() => lexMarkdown(text), [text]);

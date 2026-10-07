@@ -1,6 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { Markdown, isSafeUrl, lexMarkdown } from "./markdown/Markdown";
+import { Markdown } from "./markdown/Markdown";
+import { isSafeUrl, lexMarkdown } from "./markdown/utils";
 import { escapeHtml, highlight, languageLabel, normalizeLanguage } from "./markdown/highlight";
 
 const html = (text: string, streaming = false) => renderToStaticMarkup(<Markdown text={text} streaming={streaming} />);

@@ -86,10 +86,15 @@ export interface ApiMessage {
   attachments?: string[] | null;
 }
 
+/** Decoded SSE payload. The wire format is JSON of server-chosen shape per event type; the reducer
+ *  validates every field it reads. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type EventData = Record<string, any>;
+
 export interface StreamEvent {
   seq: number;
   type: string;
-  data: Record<string, any>;
+  data: EventData;
 }
 
 export type GpuStateName = "unknown" | "off" | "starting" | "ready" | "stopping" | "error";

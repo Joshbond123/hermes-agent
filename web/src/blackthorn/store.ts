@@ -154,7 +154,7 @@ function updateTool(parts: Part[], id: string, patch: Partial<ToolPart>): Part[]
 export function applyEvents(state: ChatState, events: StreamEvent[], now = Date.now()): ChatState {
   let { messages, turn } = state;
   let activeId = state.activeId;
-  let title = state.title;
+  const title = state.title;
   for (const ev of events) {
     if (ev.seq <= turn.lastSeq) continue; // duplicate (replayed after a reconnect)
     turn = { ...turn, lastSeq: ev.seq };

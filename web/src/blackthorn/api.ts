@@ -211,7 +211,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<RunTurnResult> {
         if (eof) break;
         const batch: StreamEvent[] = [];
         for (const frame of parser.push(decoder.decode(value, { stream: true }))) {
-          let data: Record<string, any>;
+          let data: StreamEvent["data"];
           try {
             data = JSON.parse(frame.data);
           } catch {
