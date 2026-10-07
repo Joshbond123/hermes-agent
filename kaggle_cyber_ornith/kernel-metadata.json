@@ -1,0 +1,19 @@
+{
+  "id": "joshbond123/qwen3-8-27b-uncensored-api-server-dual-t4",
+  "title": "Qwen3.8-27B-Uncensored API Server (dual T4)",
+  "code_file": "cyber_ornith_server.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "keywords": [
+    "qwen"
+  ],
+  "dataset_sources": [],
+  "kernel_sources": [],
+  "competition_sources": [],
+  "model_sources": [],
+  "machine_shape": "NvidiaTeslaT4"
+}
