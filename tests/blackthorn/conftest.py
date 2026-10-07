@@ -48,6 +48,11 @@ CREATE TABLE messages (
 );
 CREATE INDEX idx_messages_session ON messages(session_id);
 CREATE TABLE state_meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE kaggle_gpu_state (
+  id TEXT PRIMARY KEY, status TEXT NOT NULL, tunnel_url TEXT NOT NULL DEFAULT '', api_key TEXT NOT NULL DEFAULT '',
+  model TEXT NOT NULL DEFAULT 'm', gpu_info TEXT NOT NULL DEFAULT '', updated_at REAL NOT NULL,
+  detail TEXT NOT NULL DEFAULT ''
+);
 CREATE TABLE hermes_memories (
   id TEXT PRIMARY KEY, target TEXT, content TEXT, memory_type TEXT, importance REAL, user_id TEXT,
   session_id TEXT, profile TEXT, created_at REAL, updated_at REAL
@@ -68,7 +73,11 @@ class FakeD1:
         with self.lock:
             self.calls += 1
             for sql, params in statements:
-                cur = self.conn.execute(sql, list(params or []))
+                try:
+                    cur = self.conn.execute(sql, list(params or []))
+                except sqlite3.Error as exc:  # the real client surfaces SQL errors as D1Error
+                    self.conn.rollback()
+                    raise d1mod.D1Error(f"Cloudflare D1 error: {exc}") from exc
                 rows = [dict(r) for r in cur.fetchall()] if cur.description else []
                 out.append(D1Result(rows, {"changes": max(cur.rowcount, 0), "last_row_id": cur.lastrowid}))
             self.conn.commit()
@@ -114,6 +123,7 @@ class FakeUpstream:
         self.exec_output = "[ok]"
         self.exec_code = 0
         self.exec_delay = 0.0
+        self.verify_reply = "OK"
         self.disconnected = threading.Event()
         self.completed = 0
         self.token_delay = 0.005
@@ -161,6 +171,9 @@ class FakeUpstream:
     async def _chat(self, request: Request):
         body = await request.json()
         self.requests.append(body)
+        if body.get("stream") is False:
+            return JSONResponse({"choices": [{"message": {"content": self.verify_reply}}],
+                                 "usage": {"completion_tokens": 2}})
         scenario = self.scenarios.pop(0) if self.scenarios else [{"content": "ok"}, {"finish": "stop"}]
         status = next((a["status"] for a in scenario if "status" in a), None)
         if status:

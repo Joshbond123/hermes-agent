@@ -1,0 +1,1553 @@
+# ==============================================================================
+# 🛡️ Qwen3.8-27B-Uncensored — Kaggle dual-T4 API Server (cache-aware fast start)
+# ==============================================================================
+# Model : ressl/Qwen3.8-27B-uncensored-GGUF (Q4_K_M ~16.8 GB)
+# Engine: llama.cpp CUDA (built on-device) with layer split across dual T4
+# Tunnel: Cloudflare Quick Tunnel
+# Auth  : Bearer API key
+# GPUs  : 2× NVIDIA Tesla T4 (~30 GB VRAM total) — tensor-split 50/50
+#
+# Boot order (cache first, never re-download if possible):
+#   1. Persistent /kaggle/working GGUF or ollama store
+#   2. Attached private Kaggle dataset
+#   3. Hugging Face resumable download (then publish as dataset)
+# Engine prefers CUDA llama-server (stable on large GGUF). Ollama is fallback only.
+# Status is reported to D1 at every stage.
+# ==============================================================================
+
+import concurrent.futures
+import threading
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import zipfile
+import sys
+import time
+import urllib.error
+import urllib.request
+
+# --------------------- CONFIGURATION ---------------------
+# Credentials are filled in by the Render service when it pushes this notebook (see blackthorn/notebook.py).
+# They are never committed to the repository.
+API_KEY = "__BT_GATEWAY_API_KEY__"
+MODEL_QUANT = os.environ.get("QWEN38_QUANT", os.environ.get("CYBER_ORNITH_QUANT", "Q4_K_M"))
+MODEL_ALIAS = "Qwen3.8-27B-Uncensored"
+OLLAMA_MODEL_NAME = "qwen38:uncensored"
+GGUF_BASENAME = "Qwen3.8-27B-uncensored-{quant}.gguf"
+HF_REPO = "ressl/Qwen3.8-27B-uncensored-GGUF"
+HF_GGUF_URL = f"https://huggingface.co/{HF_REPO}/resolve/main/{GGUF_BASENAME}"
+FALLBACK_REPO = "orcarouter/Qwen3.8-27B-Uncensored-GGUF"
+# Sizes from HF API (bytes). SHA left empty when unknown — size check still applies.
+MODEL_SHA256 = {
+    "Q4_K_M": "",
+    "Q4_K_S": "",
+    "Q5_K_M": "",
+    "Q6_K": "",
+    "Q8_0": "",
+    "IQ4_XS": "",
+}
+MODEL_BYTES = {
+    "Q4_K_M": 16810714496,
+    "Q4_K_S": 15825298816,
+    "Q5_K_M": 19535701376,
+    "Q6_K": 22430999936,
+    "Q8_0": 29047084416,
+    "IQ4_XS": 15309039200,
+}
+
+GATEWAY_PORT = 8000
+OLLAMA_PORT = 11434
+# Dual T4 (~15GB each): keep model on GPU, limit context to avoid OOM on KV cache
+OLLAMA_NUM_PARALLEL = int(os.environ.get("OLLAMA_NUM_PARALLEL", "1"))
+OLLAMA_MAX_LOADED_MODELS = "1"
+OLLAMA_FLASH_ATTENTION = "1"
+# 4096 tokens could not even hold the agent's system prompt + tool schemas + one tool result.
+DEFAULT_NUM_CTX = int(os.environ.get("QWEN38_NUM_CTX", "16384"))
+DEFAULT_NUM_GPU_LAYERS = int(os.environ.get("QWEN38_NUM_GPU_LAYERS", "999"))  # offload all layers to GPU
+MAX_RUNTIME_SECONDS = int(os.environ.get("MAX_RUNTIME_SECONDS", str(11 * 3600)))
+
+KAGGLE_USERNAME = "__BT_KAGGLE_USERNAME__"
+KAGGLE_API_TOKEN = "__BT_KAGGLE_API_TOKEN__"
+CF_ACCOUNT_ID = "__BT_CF_ACCOUNT_ID__"
+CF_DATABASE_ID = "__BT_CF_DATABASE_ID__"
+CF_API_TOKEN = "__BT_CF_API_TOKEN__"
+CACHE_DATASET_SLUG = os.environ.get("QWEN38_CACHE_DATASET", f"{KAGGLE_USERNAME}/qwen38-27b-uncensored-cache")
+CACHE_DATASET_TITLE = "Qwen3.8-27B-Uncensored Model Cache"
+
+INPUT_ROOT = "/kaggle/input"
+WORK_ROOT = "/kaggle/working"
+# Prefer /kaggle/tmp for the large GGUF when present (more free space than working)
+_tmp = "/kaggle/tmp" if os.path.isdir("/kaggle/tmp") else WORK_ROOT
+PERSIST_MODELS_DIR = f"{WORK_ROOT}/ollama_models"
+BLIND_DISK_DIR = f"{_tmp}/model_cache"
+UPLOAD_DIR = f"{WORK_ROOT}/cache_upload"
+MARKER_PATH = f"{BLIND_DISK_DIR}/.verified"
+LOG_PATH = "/tmp/qwen38_uncensored.log"
+
+# Only used for direct API callers that send no system message; the Blackthorn app always sends its own.
+DEFAULT_SYSTEM_PROMPT = "You are a capable, direct and honest assistant. Be concise and accurate."
+
+_LOGS: list = []
+
+
+# --------------------- STATUS / TELEMETRY ---------------------
+GATEWAY_LOG = "/tmp/qwen38.log"
+
+
+def log(msg: str) -> None:
+    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+    _LOGS.append(line)
+    del _LOGS[:-400]
+    print(line, flush=True)
+    try:  # the gateway's /logs endpoint serves this file (the UI's log viewer)
+        with open(GATEWAY_LOG, "a") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+
+
+_LAST_TUNNEL_URL = ""
+_STATE_LOCK = threading.Lock()
+_CURRENT = {"status": "", "tunnel_url": "", "extra": {}, "stage_started": 0.0, "written_at": 0.0}
+_GPU_INFO = ""
+_UPSERT_SQL = (
+    "INSERT INTO kaggle_gpu_state (id, status, tunnel_url, api_key, model, gpu_info, detail, updated_at) "
+    "VALUES ('primary', ?, ?, ?, ?, ?, ?, ?) "
+    "ON CONFLICT(id) DO UPDATE SET status = excluded.status, tunnel_url = excluded.tunnel_url, "
+    "api_key = excluded.api_key, model = excluded.model, gpu_info = excluded.gpu_info, "
+    "detail = excluded.detail, updated_at = excluded.updated_at"
+)
+
+
+def _d1_write(status: str, tunnel_url: str, extra: dict, stage_started: float) -> None:
+    """Write the live state to Cloudflare D1 (the only status channel — no public broadcast)."""
+    detail = dict((extra or {}).get("detail") or {})
+    detail["stage_started"] = stage_started
+    for key in ("note", "source", "dataset", "boot_seconds", "reason", "error"):
+        if (extra or {}).get(key) is not None:
+            detail[key] = (extra or {})[key]
+    gpu_info = ((extra or {}).get("gpu") or (extra or {}).get("gpu_info") or _GPU_INFO
+                or ((extra or {}).get("error") and ("FAILED: " + str((extra or {}).get("error"))[:150]))
+                or "2x NVIDIA Tesla T4")
+    body = {"sql": _UPSERT_SQL, "params": [status, tunnel_url or "", API_KEY, MODEL_ALIAS, str(gpu_info),
+                                           json.dumps(detail), time.time()]}
+    req = urllib.request.Request(
+        f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/d1/database/{CF_DATABASE_ID}/query",
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json",
+                 "User-Agent": "BlackthornKaggleGPU/2.0"},
+        method="POST",
+    )
+    urllib.request.urlopen(req, timeout=10).read()
+
+
+def notify_workspace(status: str, tunnel_url: str = "", extra: dict = None) -> None:
+    """Publish the stage (+ real progress detail) and the tunnel URL.
+
+    The tunnel URL is sticky: a later status update never blanks the URL the backend routes
+    chat traffic to.
+    """
+    global _LAST_TUNNEL_URL, _GPU_INFO
+    if tunnel_url:
+        _LAST_TUNNEL_URL = tunnel_url
+    else:
+        tunnel_url = _LAST_TUNNEL_URL
+    extra = dict(extra or {})
+    if extra.get("gpu"):
+        _GPU_INFO = str(extra["gpu"])
+    with _STATE_LOCK:
+        if status != _CURRENT["status"]:
+            _CURRENT["stage_started"] = time.time()
+        _CURRENT.update(status=status, tunnel_url=tunnel_url, extra=extra, written_at=time.time())
+        stage_started = _CURRENT["stage_started"]
+    try:
+        _d1_write(status, tunnel_url, extra, stage_started)
+    except Exception as exc:  # a failed report must never break the boot
+        log(f"   (status report failed: {type(exc).__name__})")
+    shown = {k: v for k, v in extra.items() if k not in ("detail",)}
+    log(f"status → {status} {json.dumps(shown) if shown else ''}")
+
+
+def _heartbeat_loop() -> None:
+    """Re-publish the current state every ~15 s so long silent stages are not mistaken for a stall."""
+    while True:
+        time.sleep(15)
+        with _STATE_LOCK:
+            cur = dict(_CURRENT)
+        if not cur["status"] or time.time() - cur["written_at"] < 14:
+            continue
+        try:
+            _d1_write(cur["status"], cur["tunnel_url"], cur["extra"], cur["stage_started"])
+            with _STATE_LOCK:
+                _CURRENT["written_at"] = time.time()
+        except Exception:
+            pass
+
+
+_LAST_PROGRESS = 0.0
+
+
+def report_progress(status: str, label: str, done: float, total: float = 0, unit: str = "bytes") -> None:
+    """Throttled, *measured* progress (bytes actually on disk / pulled). Never estimated."""
+    global _LAST_PROGRESS
+    now = time.time()
+    finished = bool(total) and done >= total
+    if now - _LAST_PROGRESS < 3.0 and not finished:
+        return
+    _LAST_PROGRESS = now
+    detail = {"label": label, "done": float(done), "unit": unit}
+    if total:
+        detail["total"] = float(total)
+    notify_workspace(status, extra={"detail": detail})
+
+
+def watch_file_growth(path: str, status: str, label: str, total: int):
+    """Report the size of ``path`` while a downloader writes it. Returns a stop() callable."""
+    stop = threading.Event()
+
+    def _run() -> None:
+        while not stop.wait(2.5):
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                size = 0
+            gb = size / 1e9
+            text = f"{label} — {gb:.1f} of {total / 1e9:.1f} GB" if total else f"{label} — {gb:.1f} GB"
+            report_progress(status, text, size, total)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return stop.set
+
+
+def fail(status: str, message: str) -> None:
+    """Publish a terminal failure together with its reason (surfaced in the UI)."""
+    notify_workspace(status, extra={"error": message[:400], "gpu_info": f"FAILED: {message[:150]}"})
+    log(f"❌ {status}: {message}")
+
+
+# --------------------- MODEL CACHE DISCOVERY ---------------------
+def _healthy_file(path: str, expected_bytes: int) -> bool:
+    """True when a file exists at full size. Never raises."""
+    try:
+        if not os.path.isfile(path):
+            return False
+        size = os.path.getsize(path)
+        if expected_bytes and size != expected_bytes:
+            log(f"   size mismatch for {os.path.basename(path)}: {size} != {expected_bytes}")
+            return False
+        return size > 1024 * 1024
+    except OSError:
+        return False
+
+
+def _sha256(path: str, chunk: int = 8 * 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(chunk), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _marker_ok(path: str, expected_sha: str) -> bool:
+    try:
+        with open(MARKER_PATH) as fh:
+            data = json.load(fh)
+        return data.get("path") == path and data.get("sha256") == expected_sha
+    except Exception:
+        return False
+
+
+def _write_marker(path: str, expected_sha: str) -> None:
+    try:
+        os.makedirs(BLIND_DISK_DIR, exist_ok=True)
+        with open(MARKER_PATH, "w") as fh:
+            json.dump({"path": path, "sha256": expected_sha, "at": time.time()}, fh)
+    except Exception:
+        pass
+
+
+def find_local_store_model() -> str:
+    """Model blob already materialised in the persistent ollama store.
+
+    Ollama names blobs ``sha256-<digest of the file contents>``, so a blob that
+    was created from our GGUF matches the published GGUF digest exactly.
+    """
+    digest = MODEL_SHA256.get(MODEL_QUANT, "")
+    expected = MODEL_BYTES.get(MODEL_QUANT, 0)
+    candidates = []
+    if digest:
+        candidates.append(os.path.join(PERSIST_MODELS_DIR, "blobs", f"sha256-{digest}"))
+    blobs_dir = os.path.join(PERSIST_MODELS_DIR, "blobs")
+    if os.path.isdir(blobs_dir):
+        for name in os.listdir(blobs_dir):
+            if name.startswith("sha256-"):
+                candidates.append(os.path.join(blobs_dir, name))
+    for path in candidates:
+        if _healthy_file(path, expected):
+            return path
+    return ""
+
+
+def _scan_input_tree(max_depth: int = 5) -> list:
+    """Every plausible mount of the cache dataset, newest Kaggle layouts included."""
+    hits = []
+    if not os.path.isdir(INPUT_ROOT):
+        return hits
+    target = GGUF_BASENAME.format(quant=MODEL_QUANT)
+    try:
+        for root, dirs, files in os.walk(INPUT_ROOT):
+            if root.count(os.sep) - INPUT_ROOT.count(os.sep) > max_depth:
+                dirs[:] = []
+                continue
+            for name in files:
+                if name == target or name.endswith(".gguf"):
+                    hits.append(os.path.join(root, name))
+    except Exception as exc:
+        log(f"⚠️ input scan note: {exc}")
+    return hits
+
+
+def find_dataset_gguf() -> str:
+    """GGUF shipped inside an attached Kaggle dataset (read-only mount).
+
+    The mount path has moved between Kaggle releases
+    (``/kaggle/input/<slug>/`` vs ``/kaggle/input/datasets/<owner>/<slug>/``), so
+    the whole input tree is scanned instead of guessing one path.
+    """
+    expected = MODEL_BYTES.get(MODEL_QUANT, 0)
+    candidates = _scan_input_tree()
+    log(f"🔎 Scanning {INPUT_ROOT}: {len(candidates)} .gguf candidate(s)")
+    for path in candidates[:20]:
+        log(f"   • {path} ({os.path.getsize(path) if os.path.exists(path) else '?'} bytes)")
+    # exact-size match first, then any file that at least looks like the model
+    for path in candidates:
+        if _healthy_file(path, expected):
+            log(f"✅ Persistent model found in dataset mount: {path}")
+            return path
+    for path in candidates:
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        if expected and abs(size - expected) <= max(1024 * 1024, expected * 0.01):
+            log(f"✅ Persistent model found (size within 1%): {path}")
+            return path
+    return ""
+
+
+def blob_path_for(gguf_path: str) -> str:
+    """Where ollama stores the model blob once the GGUF is registered."""
+    return os.path.join(PERSIST_MODELS_DIR, "blobs", f"sha256-{MODEL_SHA256.get(MODEL_QUANT, '')}")
+
+
+def download_from_cache_dataset(dest: str) -> str:
+    """Pull the model from our own Kaggle dataset (datacenter-to-datacenter, no HF egress)."""
+    expected = MODEL_BYTES.get(MODEL_QUANT, 0)
+    zip_part = dest + ".zip.part"
+    url = f"https://www.kaggle.com/api/v1/datasets/download/{CACHE_DATASET_SLUG}"
+    log(f"⬇️  Checking the Kaggle dataset copy first: {CACHE_DATASET_SLUG}")
+    for attempt in (1, 2):
+        stop_watch = watch_file_growth(zip_part, "DOWNLOADING_MODEL", "Downloading the model (Kaggle dataset)", expected)
+        try:
+            proc = subprocess.run(["curl", "-fL", "--retry", "2", "--retry-delay", "2", "-C", "-",
+                                   "-H", f"Authorization: Bearer {KAGGLE_API_TOKEN}",
+                                   "-o", zip_part, url], capture_output=True, text=True)
+        finally:
+            stop_watch()
+        if proc.returncode != 0:
+            log(f"   dataset fetch rc={proc.returncode}: {(proc.stderr or '')[-160:]}")
+            if os.path.exists(zip_part):
+                try:
+                    os.remove(zip_part)  # a rejected/partial archive cannot be resumed
+                except OSError:
+                    pass
+            continue
+        try:
+            with zipfile.ZipFile(zip_part) as zf:
+                member = next((n for n in zf.namelist() if n.lower().endswith(".gguf")), "")
+                if not member:
+                    log("   archive carries no .gguf member — falling back")
+                    break
+                part = dest + ".part"
+                with zf.open(member) as src, open(part, "wb") as dst:
+                    shutil.copyfileobj(src, dst, 8 * 1024 * 1024)
+        except zipfile.BadZipFile:
+            log("   incomplete archive on disk — retrying")
+            if attempt == 2:
+                try:
+                    os.remove(zip_part)
+                except OSError:
+                    pass
+            continue
+        try:
+            os.remove(zip_part)
+        except OSError:
+            pass
+        part = dest + ".part"
+        size = os.path.getsize(part) if os.path.exists(part) else 0
+        if expected and size != expected:
+            log(f"   extracted size mismatch ({size} vs {expected})")
+            try:
+                os.remove(part)
+            except OSError:
+                pass
+            continue
+        os.replace(part, dest)
+        log("✅ Model pulled from the Kaggle dataset copy")
+        return dest
+    return ""
+
+
+def _probe_remote_size(url: str) -> int:
+    try:
+        req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "Qwen38Blackthorn/1.0"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return int(resp.headers.get("Content-Length") or resp.headers.get("x-linked-size") or 0)
+    except Exception as exc:
+        log(f"   size probe note: {exc}")
+        return 0
+
+
+def _parallel_download(url: str, dest_partial: str, connections: int = 8) -> bool:
+    """Ranged download over several connections — Kaggle's NIC is far faster than
+    a single HTTP stream, so 8 workers noticeably cut the 5.6 GB transfer."""
+    total = _probe_remote_size(url)
+    if total <= 0:
+        return False
+    chunk = total // connections
+    procs = []
+    try:
+        with open(dest_partial, "wb") as fh:
+            fh.truncate(total)
+        for i in range(connections):
+            start = i * chunk
+            end = total - 1 if i == connections - 1 else (start + chunk - 1)
+            part = f"{dest_partial}.part{i}"
+            procs.append((subprocess.Popen(
+                ["curl", "-fsL", "--retry", "2", "--retry-delay", "2", "-r", f"{start}-{end}",
+                 "-o", part, url],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL), part, start))
+        for proc, part, start in procs:
+            if proc.wait() != 0:
+                return False
+            want = min(chunk, total - start)
+            got = os.path.getsize(part) if os.path.exists(part) else 0
+            if got != want:
+                log(f"   range {start} returned {got} bytes, expected {want} — falling back")
+                return False
+            with open(part, "rb") as src, open(dest_partial, "r+b") as dst:
+                dst.seek(start)
+                shutil.copyfileobj(src, dst, 8 * 1024 * 1024)
+            os.remove(part)
+        return os.path.getsize(dest_partial) == total
+    except Exception as exc:
+        log(f"   ranged download note: {exc}")
+        return False
+    finally:
+        for proc, part, _ in procs:
+            if proc.poll() is None:
+                proc.kill()
+            if os.path.exists(part):
+                try:
+                    os.remove(part)
+                except OSError:
+                    pass
+
+
+def download_model(dest: str) -> str:
+    """Resumable, verified download. Returns (path, verified_sha_ok)."""
+    expected = MODEL_BYTES.get(MODEL_QUANT, 0)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    partial = dest + ".part"
+    for attempt in range(1, 5):
+        if attempt == 1:
+            log(f"⚡ Single-stream resumable download — {HF_GGUF_URL}")
+        if attempt > 1 and os.path.exists(partial) and expected and os.path.getsize(partial) != expected:
+            os.remove(partial)  # never resume a bad partial file
+        have = os.path.getsize(partial) if os.path.exists(partial) else 0
+        log(f"⬇️  Download attempt {attempt}: {HF_GGUF_URL} (resume at {have} bytes)")
+        stop_watch = watch_file_growth(partial, "DOWNLOADING_MODEL", "Downloading the model (Hugging Face)", expected)
+        try:
+            # --retry (without --retry-all-errors): a 404/401 is final and must not be retried for minutes
+            proc = subprocess.run(["curl", "-fL", "--retry", "6", "--retry-delay", "4",
+                                   "--connect-timeout", "30", "--max-time", "0",
+                                   "-C", "-", "-o", partial, HF_GGUF_URL], capture_output=True, text=True)
+        finally:
+            stop_watch()
+        if proc.returncode == 0:
+            size = os.path.getsize(partial)
+            if not expected or size == expected:
+                os.replace(partial, dest)
+                return dest, "verified"
+            log(f"   size mismatch: got {size}, expected {expected}")
+        else:
+            log(f"   curl rc={proc.returncode}: {(proc.stderr or '')[-200:]}")
+        time.sleep(3)
+
+    log("⚠️ Primary HF download failed; trying the imatrix mirror (size-checked only)")
+    mirror = (f"https://huggingface.co/{FALLBACK_REPO}/resolve/main/"
+              f"Qwen3.8-27B-Uncensored.i1-{MODEL_QUANT}.gguf")
+    if os.path.exists(partial):
+        os.remove(partial)
+    subprocess.run(["curl", "-fL", "--retry", "3", "-C", "-", "-o", partial, mirror], check=True)
+    if os.path.getsize(partial) < 3 * 1024 * 1024 * 1024:
+        raise RuntimeError(f"mirror download too small: {os.path.getsize(partial)} bytes")
+    os.replace(partial, dest)
+    return dest, "mirror"
+
+
+def cache_dataset_is_ready(expected_bytes: int = 0) -> bool:
+    """The published cache dataset already holds a full-size model?"""
+    expected = expected_bytes or MODEL_BYTES.get(MODEL_QUANT, 0)
+    try:
+        req = urllib.request.Request(
+            f"https://www.kaggle.com/api/v1/datasets/view/{CACHE_DATASET_SLUG}",
+            headers={"Authorization": f"Bearer {KAGGLE_API_TOKEN}", "User-Agent": "Qwen38Blackthorn/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8")) or {}
+        total = int(data.get("totalBytesNullable") or data.get("totalBytes") or 0)
+        return bool(total and (expected <= 0 or total >= expected))
+    except Exception as exc:
+        log(f"cache dataset check note: {exc}")
+        return False
+
+
+def publish_cache_dataset(gguf_path: str) -> None:
+    """One-time: publish the verified GGUF as a private Kaggle dataset so future
+    sessions mount it instantly instead of downloading 5.6 GB again."""
+    try:
+        os.makedirs(UPLOAD_DIR, exist_ok=True)
+        target = os.path.join(UPLOAD_DIR, os.path.basename(gguf_path))
+        if not _healthy_file(target, MODEL_BYTES.get(MODEL_QUANT, 0)):
+            if os.path.exists(target):
+                os.remove(target)
+            log("📦 Seeding cache dataset upload dir (hardlink/copy of verified GGUF)...")
+            try:
+                os.link(gguf_path, target)
+            except OSError:
+                shutil.copy2(gguf_path, target)
+        with open(os.path.join(UPLOAD_DIR, "dataset-metadata.json"), "w") as fh:
+            json.dump(
+                {
+                    "title": CACHE_DATASET_TITLE,
+                    "id": CACHE_DATASET_SLUG,
+                    "licenses": [{"name": "other"}],
+                },
+                fh,
+            )
+        env = dict(os.environ)
+        env["KAGGLE_USERNAME"] = KAGGLE_USERNAME
+        env["KAGGLE_KEY"] = KAGGLE_API_TOKEN
+        env["KAGGLE_API_TOKEN"] = KAGGLE_API_TOKEN
+        env["KAGGLE_CONFIG_DIR"] = "/tmp/.kaggle"
+        os.makedirs("/tmp/.kaggle", exist_ok=True)
+        with open("/tmp/.kaggle/kaggle.json", "w") as fh:
+            json.dump({"username": KAGGLE_USERNAME, "key": KAGGLE_API_TOKEN}, fh)
+        os.chmod("/tmp/.kaggle/kaggle.json", 0o600)
+
+        if shutil.which("kaggle") is None:
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-q", "--no-input", "kaggle"],
+                check=False,
+            )
+        # Version the dataset when it already exists, otherwise create it.
+        create = subprocess.run(
+            ["kaggle", "datasets", "create", "-p", UPLOAD_DIR, "--dir-mode", "zip", "-q"],
+            env=env, capture_output=True, text=True,
+        )
+        if create.returncode != 0:
+            log(f"   create note: {create.stderr.strip()[:200]}")
+            version = subprocess.run(
+                ["kaggle", "datasets", "version", "-p", UPLOAD_DIR, "--dir-mode", "zip", "-q",
+                 "-m", f"Qwen3.8-27B {MODEL_QUANT} verified {time.strftime('%Y-%m-%d')}"],
+                env=env, capture_output=True, text=True,
+            )
+            if version.returncode != 0:
+                log(f"⚠️ Cache dataset publish failed: {version.stderr.strip()[:200]}")
+                return
+        log(f"✅ Cache dataset published: {CACHE_DATASET_SLUG}")
+        notify_workspace("CACHE_DATASET_PUBLISHED", extra={"dataset": CACHE_DATASET_SLUG})
+    except Exception as exc:
+        log(f"⚠️ Cache dataset publish skipped: {exc}")
+
+
+# --------------------- DEPENDENCY SETUP (skip when present) ---------------------
+def ensure_python_deps() -> None:
+    missing = []
+    for module, package in (("fastapi", "fastapi"), ("uvicorn", "uvicorn"),
+                            ("httpx", "httpx"), ("pydantic", "pydantic")):
+        try:
+            __import__(module)
+        except Exception:
+            missing.append(package)
+    if missing:
+        log(f"📦 Installing missing python packages: {missing}")
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-q", "--no-input", *missing],
+            check=False,
+        )
+    else:
+        log("✅ Python deps already present — skipping pip install")
+
+
+def ensure_ollama() -> str:
+    binary = shutil.which("ollama")
+    if binary:
+        log(f"✅ Ollama already installed: {binary}")
+        return binary
+    log("🦙 Installing Ollama (not present in this fresh container)...")
+    for tool in ("zstd", "pciutils", "lshw"):
+        if shutil.which(tool) is None:
+            subprocess.run("apt-get update -qq && apt-get install -y -qq zstd pciutils lshw",
+                           shell=True, check=False)
+            break
+    subprocess.run("curl -fsSL https://ollama.com/install.sh | sh", shell=True, check=True)
+    binary = shutil.which("ollama") or "/usr/local/bin/ollama"
+    return binary
+
+
+def start_ollama_daemon(ollama_bin: str) -> None:
+    """Idempotent: bring the engine up as early as possible (during the download)."""
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{OLLAMA_PORT}/api/tags", timeout=2)
+        log("✅ Ollama daemon already serving")
+        return
+    except Exception:
+        pass
+    os.makedirs(PERSIST_MODELS_DIR, exist_ok=True)
+    env = os.environ.copy()
+    env["OLLAMA_HOST"] = f"127.0.0.1:{OLLAMA_PORT}"
+    env["OLLAMA_ORIGINS"] = "*"
+    env["OLLAMA_KEEP_ALIVE"] = "-1"
+    env.setdefault("OLLAMA_CONTEXT_LENGTH", "32768")
+    env["OLLAMA_MODELS"] = PERSIST_MODELS_DIR
+    subprocess.Popen([ollama_bin, "serve"], env=env,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(60):
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{OLLAMA_PORT}/api/tags", timeout=2)
+            log("✅ Ollama daemon up")
+            return
+        except Exception:
+            time.sleep(1)
+    raise RuntimeError("ollama serve did not come up in 60s")
+
+
+def ensure_ollama_serving() -> str:
+    """Install (only if missing) *and* start the engine — runs during the download."""
+    binary = ensure_ollama()
+    start_ollama_daemon(binary)
+    return binary
+
+
+def ensure_cloudflared() -> str:
+    for candidate in ("/tmp/cloudflared", "/usr/local/bin/cloudflared"):
+        if os.path.exists(candidate):
+            log(f"✅ cloudflared present: {candidate}")
+            return candidate
+    binary = "/tmp/cloudflared"
+    log("🌐 Fetching cloudflared...")
+    subprocess.run([
+        "curl", "-fsSL",
+        "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",
+        "-o", binary,
+    ], check=True)
+    os.chmod(binary, 0o755)
+    return binary
+
+
+def ollama_model_present() -> bool:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{OLLAMA_PORT}/api/tags", timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        names = [m.get("name", "") for m in (data.get("models") or [])]
+        return any(n.split(":")[0] == OLLAMA_MODEL_NAME.split(":")[0] for n in names)
+    except Exception:
+        return False
+
+
+
+def ensure_llama_server_bin() -> str:
+    """Build or reuse a CUDA-enabled llama-server for dual T4."""
+    binary = "/tmp/llama-server"
+    if os.path.isfile(binary) and os.access(binary, os.X_OK):
+        # quick sanity: prefer CUDA build
+        try:
+            out = subprocess.check_output([binary, "--version"], stderr=subprocess.STDOUT, timeout=10).decode()
+            if "CUDA" in out or "ggml" in out.lower():
+                log("Reusing existing llama-server binary")
+                return binary
+        except Exception:
+            pass
+    build_dir = "/tmp/llama.cpp"
+    log("Building llama.cpp with CUDA (~5-12 min on T4)...")
+    notify_workspace("BUILDING_ENGINE", extra={"detail": {"label": "Compiling the CUDA inference engine (5–12 min)"}})
+    if not os.path.isdir(build_dir):
+        subprocess.run(
+            ["git", "clone", "--depth", "1", "https://github.com/ggerganov/llama.cpp", build_dir],
+            check=True, timeout=180,
+        )
+    # Install minimal build deps if missing
+    subprocess.run(
+        ["bash", "-c", "which cmake || (apt-get update -qq && apt-get install -y -qq cmake build-essential)"],
+        check=False, timeout=180,
+    )
+    cmake_cmd = [
+        "cmake", "-B", "build",
+        "-DGGML_CUDA=ON",
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DLLAMA_CURL=OFF",
+    ]
+    subprocess.run(cmake_cmd, cwd=build_dir, check=True, timeout=300)
+    subprocess.run(
+        ["cmake", "--build", "build", "--config", "Release", "-j", "4"],
+        cwd=build_dir, check=True, timeout=900,
+    )
+    src = os.path.join(build_dir, "build", "bin", "llama-server")
+    if not os.path.isfile(src):
+        # older layout
+        for root, dirs, files in os.walk(os.path.join(build_dir, "build")):
+            if "llama-server" in files:
+                src = os.path.join(root, "llama-server")
+                break
+    if not os.path.isfile(src):
+        raise RuntimeError("llama-server binary not found after CUDA build")
+    shutil.copy2(src, binary)
+    os.chmod(binary, 0o755)
+    log("✅ CUDA llama-server ready at " + binary)
+    return binary
+
+
+def start_llama_server(gguf_path: str) -> None:
+    """Start OpenAI-compatible llama-server with dual-T4 layer split."""
+    binary = ensure_llama_server_bin()
+    log(f"Starting CUDA llama-server on :{OLLAMA_PORT} with {gguf_path} (tensor-split 0.5,0.5)")
+    logf = open("/tmp/llama_server.log", "w")
+    # Dual T4: ~15 GB each. Q4_K_M ~16.8 GB needs layer split.
+    # -c 4096 keeps KV cache modest; -np 1 single slot for stability.
+    cmd = [
+        binary,
+        "-m", gguf_path,
+        "-ngl", "99",
+        "-c", str(DEFAULT_NUM_CTX),
+        "--jinja",  # required for native tool calling (the model's own chat template)
+        "--host", "0.0.0.0",
+        "--port", str(OLLAMA_PORT),
+        "-np", "1",
+        "--split-mode", "layer",
+        "--tensor-split", "0.5,0.5",
+        "--flash-attn", "on",
+        "-b", "512",
+        "-ub", "256",
+        "--no-mmap",
+    ]
+    subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT)
+    # Model load can take 60-180 s on first start
+    for i in range(240):
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{OLLAMA_PORT}/health", timeout=3)
+            log("llama-server healthy")
+            # mark engine mode for gateway
+            with open("/tmp/engine_mode.txt", "w") as fh:
+                fh.write("llama")
+            return
+        except Exception:
+            if i % 15 == 0:
+                log(f"  waiting for llama-server... ({i*2}s)")
+            time.sleep(2)
+    # dump last log lines for diagnosis
+    try:
+        with open("/tmp/llama_server.log") as lf:
+            tail = lf.read()[-800:]
+        log("llama-server log tail: " + tail)
+    except Exception:
+        pass
+    raise RuntimeError("llama-server failed to start — see /tmp/llama_server.log")
+
+
+
+def ollama_pull_model(ollama_bin: str) -> bool:
+    """Pull the model from the Ollama registry through its API so progress is *measured*."""
+    global OLLAMA_MODEL_NAME
+    tags = [
+        OLLAMA_MODEL_NAME,
+        "orcarouter/qwen3.8-27b-uncensored:q4_K_M",
+        "orcarouter/qwen3.8-27b-uncensored:latest",
+        "huihui_ai/qwen3-abliterated:latest",
+    ]
+    for tag in tags:
+        log(f"Trying ollama pull {tag}")
+        notify_workspace("DOWNLOADING_MODEL", extra={"note": f"ollama pull {tag}",
+                                                      "detail": {"label": f"Downloading {tag}"}})
+        layers = {}
+        ok = False
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{OLLAMA_PORT}/api/pull",
+                data=json.dumps({"name": tag, "stream": True}).encode("utf-8"),
+                headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=3600) as resp:
+                for raw in resp:
+                    try:
+                        obj = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if obj.get("error"):
+                        raise RuntimeError(str(obj["error"]))
+                    if obj.get("digest") and obj.get("total"):
+                        layers[obj["digest"]] = (float(obj.get("completed") or 0), float(obj["total"]))
+                        done = sum(d for d, _ in layers.values())
+                        total = sum(t for _, t in layers.values())
+                        report_progress("DOWNLOADING_MODEL",
+                                        f"Downloading {tag} — {done / 1e9:.1f} of {total / 1e9:.1f} GB", done, total)
+                    if obj.get("status") == "success":
+                        ok = True
+            if ok:
+                OLLAMA_MODEL_NAME = tag
+                log(f"ollama pull succeeded: {tag}")
+                return True
+            log(f"pull ended without success for {tag}")
+        except Exception as e:
+            log(f"pull exception {tag}: {e}")
+    return False
+
+
+def register_model(ollama_bin: str, gguf_path: str) -> None:
+    """Prefer CUDA llama-server for large GGUF stability on dual T4.
+    Ollama create is attempted only when disk allows; failures fall through
+    cleanly to llama-server without aborting the boot.
+    """
+    # Always prefer llama path for Q4 ~16.8 GB on dual T4 — more reliable
+    prefer_llama = os.environ.get("PREFER_LLAMA", "1") == "1"
+    if prefer_llama and gguf_path and os.path.isfile(gguf_path):
+        log("🚀 Preferring CUDA llama-server for dual-T4 stability")
+        start_llama_server(gguf_path)
+        return
+
+    if ollama_model_present():
+        log("✅ Model already registered in the ollama store — skipping create")
+        with open("/tmp/engine_mode.txt", "w") as fh:
+            fh.write("ollama")
+        return
+    # Free space check — ollama create can need ~2x the GGUF size briefly
+    try:
+        usage = shutil.disk_usage(WORK_ROOT)
+        free_gb = usage.free / (1024**3)
+        log(f"Disk free on {WORK_ROOT}: {free_gb:.1f} GB")
+        if free_gb < 20:  # need headroom for create
+            log("Insufficient free disk for ollama create — using llama-server")
+            start_llama_server(gguf_path)
+            return
+        # purge any partial blobs
+        blobs = os.path.join(PERSIST_MODELS_DIR, "blobs")
+        if os.path.isdir(blobs):
+            for name in os.listdir(blobs):
+                try:
+                    os.remove(os.path.join(blobs, name))
+                except Exception:
+                    pass
+            log("Purged partial ollama blobs to reclaim space")
+    except Exception as e:
+        log(f"disk check note: {e}")
+    modelfile = "/tmp/Modelfile"
+    with open(modelfile, "w") as fh:
+        fh.write(f"FROM {gguf_path}\n")
+        fh.write(f"PARAMETER num_ctx 4096\n")
+        fh.write(f"PARAMETER num_gpu 99\n")
+        fh.write("PARAMETER temperature 0.6\n")
+        fh.write("PARAMETER num_batch 256\n")
+        fh.write("PARAMETER num_thread 8\n")
+        fh.write('SYSTEM """' + DEFAULT_SYSTEM_PROMPT + '"""\n')
+    log(f"🧱 Registering model from {gguf_path} (one-time)...")
+    try:
+        proc = subprocess.run(
+            [ollama_bin, "create", OLLAMA_MODEL_NAME, "-f", modelfile],
+            capture_output=True, text=True, timeout=600,
+        )
+    except Exception as e:
+        log(f"ollama create exception: {e}")
+        start_llama_server(gguf_path)
+        return
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()[:400]
+        log(f"ollama create failed (rc={proc.returncode}): {err}")
+        start_llama_server(gguf_path)
+        return
+    with open("/tmp/engine_mode.txt", "w") as fh:
+        fh.write("ollama")
+    log("✅ Model registered in ollama")
+
+
+# --------------------- GATEWAY + TUNNEL ---------------------
+def gateway_code() -> str:
+    return '''
+import json, time, os, signal
+import httpx
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+
+API_KEY = "''' + API_KEY + '''"
+MODEL_ALIAS = "''' + MODEL_ALIAS + '''"
+OLLAMA_MODEL = "''' + OLLAMA_MODEL_NAME + '''"
+OLLAMA_URL = "http://127.0.0.1:''' + str(OLLAMA_PORT) + '''"
+DEFAULT_SYSTEM_PROMPT = """''' + DEFAULT_SYSTEM_PROMPT + '''"""
+START_TIME = time.time()
+BOOT_STATE = json.load(open("/tmp/boot_state.json")) if os.path.exists("/tmp/boot_state.json") else {}
+LOGS = "/tmp/qwen38.log"
+
+app = FastAPI(title="Qwen3.8-27B-Uncensored API Server", version="4.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
+                   allow_methods=["*"], allow_headers=["*"])
+
+
+async def verify_api_key(authorization: str = Header(default=None), x_api_key: str = Header(default=None)):
+    token = None
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization[7:].strip()
+    elif x_api_key:
+        token = x_api_key.strip()
+    if token != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API Key.")
+    return token
+
+
+@app.get("/")
+@app.get("/health")
+async def health():
+    """Liveness plus the honest model state."""
+    model_loaded = False
+    engine = "unknown"
+    try:
+        if os.path.exists("/tmp/engine_mode.txt"):
+            engine = open("/tmp/engine_mode.txt").read().strip()
+    except Exception:
+        pass
+    try:
+        async with httpx.AsyncClient(timeout=4) as client:
+            if engine == "llama":
+                h = await client.get(f"{OLLAMA_URL}/health")
+                model_loaded = h.status_code == 200
+            else:
+                ps = await client.get(f"{OLLAMA_URL}/api/ps")
+                if ps.status_code == 200:
+                    names = [str(m.get("name") or m.get("model") or "") for m in (ps.json().get("models") or [])]
+                    model_loaded = any(n.split(":")[0] == OLLAMA_MODEL.split(":")[0] for n in names)
+    except Exception:
+        model_loaded = bool(BOOT_STATE.get("warmup_ok"))
+    return {
+        "status": "online",
+        "model": MODEL_ALIAS,
+        "backend_model": OLLAMA_MODEL,
+        "model_loaded": model_loaded,
+        "gpu": BOOT_STATE.get("gpu", ""),
+        "uptime_seconds": round(time.time() - START_TIME, 1),
+        "boot": {k: BOOT_STATE.get(k) for k in ("cache_source", "boot_seconds", "download_skipped", "warmup_ok")},
+        "endpoints": ["/v1/models", "/v1/chat/completions", "/chat", "/logs", "/health", "/computer/info", "/computer/exec", "/computer/list_files", "/computer/read_file", "/computer/write_file", "/computer/fetch_url"],
+        "auth_required": True,
+    }
+
+
+@app.get("/logs")
+async def logs(dependencies=[Depends(verify_api_key)]):
+    try:
+        with open(LOGS, "r", errors="ignore") as fh:
+            return {"lines": fh.read().splitlines()[-200:]}
+    except Exception as exc:
+        return {"lines": [], "error": str(exc)}
+
+
+@app.get("/v1/models")
+async def list_models(dependencies=[Depends(verify_api_key)]):
+    return {"object": "list", "data": [{"id": MODEL_ALIAS, "object": "model",
+            "created": int(START_TIME), "owned_by": "DuoNeural",
+            "backing_gguf": OLLAMA_MODEL}]}
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request, dependencies=[Depends(verify_api_key)]):
+    body = await request.json()
+    messages = body.get("messages", [])
+    if not any(m.get("role") == "system" for m in messages):
+        messages = [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}] + messages
+    engine = "ollama"
+    try:
+        if os.path.exists("/tmp/engine_mode.txt"):
+            engine = open("/tmp/engine_mode.txt").read().strip()
+    except Exception:
+        pass
+    if engine == "llama":
+        body["model"] = body.get("model") or MODEL_ALIAS
+        body.pop("keep_alive", None)
+    else:
+        body["model"] = OLLAMA_MODEL
+        body.setdefault("keep_alive", -1)
+    body["messages"] = messages
+    if body.get("stream"):
+        async def event_generator():
+            timeout = httpx.Timeout(connect=10.0, read=900.0, write=60.0, pool=10.0)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                async with client.stream("POST", f"{OLLAMA_URL}/v1/chat/completions", json=body) as resp:
+                    async for chunk in resp.aiter_bytes():
+                        yield chunk
+        return StreamingResponse(event_generator(), media_type="text/event-stream")
+    timeout = httpx.Timeout(connect=10.0, read=900.0, write=60.0, pool=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(f"{OLLAMA_URL}/v1/chat/completions", json=body)
+        data = resp.json()
+        if isinstance(data, dict):
+            data["model"] = MODEL_ALIAS
+        return JSONResponse(content=data, status_code=resp.status_code)
+
+
+@app.post("/chat")
+async def simple_chat(request: Request, dependencies=[Depends(verify_api_key)]):
+    body = await request.json()
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [
+            {"role": "system", "content": body.get("system", DEFAULT_SYSTEM_PROMPT)},
+            {"role": "user", "content": body.get("prompt") or body.get("message") or ""},
+        ],
+        "temperature": body.get("temperature", 0.6),
+        "max_tokens": body.get("max_tokens", 1024),
+        "stream": False,
+    }
+    timeout = httpx.Timeout(connect=10.0, read=900.0, write=60.0, pool=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(f"{OLLAMA_URL}/v1/chat/completions", json=payload)
+        data = resp.json()
+        try:
+            reply = data["choices"][0]["message"]["content"]
+        except Exception:
+            reply = ""
+        return {"model": MODEL_ALIAS, "response": reply}
+
+
+# ---- Kaggle Computer Workspace API ----
+import pathlib as _pathlib
+import asyncio as _asyncio
+COMPUTER_ROOT = "/kaggle/working/blackthorn_workspace"
+_pathlib.Path(COMPUTER_ROOT).mkdir(parents=True, exist_ok=True)
+
+def _csafe(rel: str):
+    rel = (rel or ".").strip()
+    root_str = COMPUTER_ROOT.rstrip("/")
+    if rel == root_str or rel.startswith(root_str + "/"):
+        rel = rel[len(root_str):]  # an absolute path inside the workspace is already rooted (no nesting)
+    rel = rel.lstrip("/") or "."
+    target = (_pathlib.Path(COMPUTER_ROOT) / rel).resolve()
+    root = _pathlib.Path(COMPUTER_ROOT).resolve()
+    if root not in target.parents and target != root:
+        raise HTTPException(status_code=400, detail="path escapes workspace: " + rel)
+    return target
+
+@app.get("/computer/info")
+async def computer_info(_=Depends(verify_api_key)):
+    import platform, shutil
+    gpu = ""
+    try:
+        gpu = __import__("subprocess").check_output(
+            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
+            text=True, timeout=5).strip()
+    except Exception:
+        gpu = "unavailable"
+    du = shutil.disk_usage(COMPUTER_ROOT)
+    return {
+        "workspace": COMPUTER_ROOT,
+        "hostname": platform.node(),
+        "platform": platform.platform(),
+        "python": platform.python_version(),
+        "gpu": gpu,
+        "disk_free_gb": round(du.free / 1e9, 2),
+        "disk_total_gb": round(du.total / 1e9, 2),
+        "environment": "kaggle-computer",
+        "cuda_available": bool(gpu and "Tesla" in gpu),
+    }
+
+@app.post("/computer/exec")
+async def computer_exec(request: Request, _=Depends(verify_api_key)):
+    body = await request.json()
+    cmd = str(body.get("command") or "").strip()
+    if not cmd:
+        raise HTTPException(status_code=400, detail="command required")
+    try:
+        timeout = max(1, min(int(body.get("timeout_seconds") or 60), 600))
+    except (TypeError, ValueError):
+        timeout = 60
+    cwd = COMPUTER_ROOT
+    if body.get("cwd"):
+        try:
+            cwd = str(_csafe(str(body["cwd"])))
+        except Exception:
+            cwd = COMPUTER_ROOT
+    env = dict(os.environ)
+    env["HOME"] = COMPUTER_ROOT
+    env["PWD"] = cwd
+    env["BLACKTHORN_WORKSPACE"] = COMPUTER_ROOT
+    # A real process group that we can kill: on timeout, and when the caller goes away (Stop button).
+    proc = await _asyncio.create_subprocess_exec(
+        "bash", "-c", cmd, cwd=cwd, env=env, start_new_session=True,
+        stdout=_asyncio.subprocess.PIPE, stderr=_asyncio.subprocess.STDOUT)
+    chunks = []
+    size = [0]
+
+    async def pump():
+        while True:
+            data = await proc.stdout.read(65536)
+            if not data:
+                break
+            if size[0] < 130000:
+                chunks.append(data)
+                size[0] += len(data)
+
+    def kill_group():
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    pump_task = _asyncio.ensure_future(pump())
+    state = "done"
+    deadline = time.time() + timeout
+    try:
+        while True:
+            try:
+                await _asyncio.wait_for(_asyncio.shield(proc.wait()), timeout=0.5)
+                break
+            except _asyncio.TimeoutError:
+                pass
+            if await request.is_disconnected():
+                state = "client_disconnected"
+                kill_group()
+                break
+            if time.time() >= deadline:
+                state = "timed_out"
+                kill_group()
+                break
+        await proc.wait()
+        try:
+            await _asyncio.wait_for(pump_task, timeout=5)
+        except Exception:
+            pump_task.cancel()
+    except _asyncio.CancelledError:
+        kill_group()
+        raise
+    out = b"".join(chunks).decode("utf-8", "replace")
+    if len(out) > 100000:
+        out = out[:100000] + "\\n... [truncated]"
+    if state == "timed_out":
+        out += "\\n[killed: the command exceeded " + str(timeout) + "s]"
+    return {"ok": True, "exit_code": proc.returncode, "output": out or "(no output)", "state": state,
+            "cwd": cwd, "workspace": COMPUTER_ROOT, "host": "kaggle-computer"}
+
+@app.post("/computer/list_files")
+async def computer_list(request: Request, _=Depends(verify_api_key)):
+    body = await request.json()
+    path = str(body.get("path") or ".")
+    try:
+        target = _csafe(path)
+    except HTTPException as e:
+        return {"ok": False, "error": str(e.detail)}
+    if not target.is_dir():
+        return {"ok": False, "error": path + " is not a directory"}
+    rows = []
+    for entry in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))[:300]:
+        try:
+            size = "" if entry.is_dir() else ("  " + str(entry.stat().st_size) + " B")
+        except OSError:
+            size = ""
+        rows.append(("DIR " if entry.is_dir() else "FILE") + " " + entry.name + size)
+    return {"ok": True, "path": str(target), "listing": "\\n".join(rows) or "(empty)", "host": "kaggle-computer"}
+
+@app.post("/computer/read_file")
+async def computer_read(request: Request, _=Depends(verify_api_key)):
+    body = await request.json()
+    path = str(body.get("path") or "").strip()
+    if not path:
+        return {"ok": False, "error": "path required"}
+    try:
+        target = _csafe(path)
+    except HTTPException as e:
+        return {"ok": False, "error": str(e.detail)}
+    if not target.is_file():
+        return {"ok": False, "error": path + " is not a file"}
+    if target.stat().st_size > 4 * 1024 * 1024:
+        return {"ok": False, "error": "file larger than 4 MB"}
+    data = target.read_bytes()
+    try:
+        content = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return {"ok": False, "error": "binary file (" + str(len(data)) + " bytes)"}
+    if len(content) > 100000:
+        content = content[:100000] + "\\n... [truncated]"
+    return {"ok": True, "path": str(target), "content": content, "host": "kaggle-computer"}
+
+@app.post("/computer/write_file")
+async def computer_write(request: Request, _=Depends(verify_api_key)):
+    body = await request.json()
+    path = str(body.get("path") or "").strip()
+    content = body.get("content")
+    if content is None:
+        return {"ok": False, "error": "content required"}
+    if not path:
+        return {"ok": False, "error": "path required"}
+    try:
+        target = _csafe(path)
+    except HTTPException as e:
+        return {"ok": False, "error": str(e.detail)}
+    target.parent.mkdir(parents=True, exist_ok=True)
+    data = content if isinstance(content, str) else str(content)
+    target.write_text(data, encoding="utf-8")
+    return {"ok": True, "path": str(target), "bytes": len(data.encode("utf-8")), "host": "kaggle-computer"}
+
+@app.post("/computer/fetch_url")
+async def computer_fetch(request: Request, _=Depends(verify_api_key)):
+    body = await request.json()
+    url = str(body.get("url") or "").strip()
+    if not url.startswith(("http://", "https://")):
+        return {"ok": False, "error": "url must start with http(s)://"}
+    import urllib.request, re as _re
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "BlackthornKaggleComputer/1.0"})
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            raw = resp.read(1_500_000)
+            charset = resp.headers.get_content_charset() or "utf-8"
+        body_text = raw.decode(charset, errors="replace")
+    except Exception as exc:
+        return {"ok": False, "error": type(exc).__name__ + ": " + str(exc), "host": "kaggle-computer"}
+    body_text = _re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", body_text)
+    body_text = _re.sub(r"(?s)<[^>]+>", " ", body_text)
+    body_text = _re.sub(r"\\s+", " ", body_text).strip()
+    if len(body_text) > 100000:
+        body_text = body_text[:100000] + " ...[truncated]"
+    return {"ok": True, "url": url, "text": body_text, "host": "kaggle-computer"}
+
+
+
+'''
+
+
+def write_gateway() -> str:
+    path = "/tmp/gateway_server.py"
+    with open(path, "w") as fh:
+        fh.write(gateway_code())
+    os.chmod(path, 0o600)
+    return path
+
+
+def start_gateway() -> None:
+    write_gateway()
+    subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "gateway_server:app", "--host", "0.0.0.0",
+         "--port", str(GATEWAY_PORT), "--log-level", "warning"],
+        cwd="/tmp", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    for _ in range(30):
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{GATEWAY_PORT}/health", timeout=2)
+            return
+        except Exception:
+            time.sleep(1)
+    raise RuntimeError("Gateway did not come up on port 8000")
+
+
+def launch_cloudflared(cloudflared_bin: str):
+    cf_log_path = "/tmp/cloudflared.log"
+    handle = open(cf_log_path, "w")
+    proc = subprocess.Popen(
+        [cloudflared_bin, "tunnel", "--url", f"http://127.0.0.1:{GATEWAY_PORT}", "--no-autoupdate"],
+        stdout=handle, stderr=subprocess.STDOUT, text=True,
+    )
+    found = None
+    deadline = time.time() + 45
+    while time.time() < deadline:
+        try:
+            with open(cf_log_path, "r", errors="ignore") as fh:
+                match = re.search(r"(https://[a-zA-Z0-9-]+\.trycloudflare\.com)", fh.read())
+            if match:
+                found = match.group(1)
+                break
+        except Exception:
+            pass
+        time.sleep(0.3)
+    return proc, found
+
+
+def main() -> None:
+    started = time.time()
+    threading.Thread(target=_heartbeat_loop, daemon=True).start()
+    try:  # the code is already loaded; do not leave the credential-bearing source file on the box
+        os.unlink(__file__)
+    except Exception:
+        pass
+    boot_state = {"gpu": "", "cache_source": "", "download_skipped": False, "boot_seconds": 0}
+    notify_workspace("CHECKING_ENVIRONMENT")
+
+    try:
+        gpu_out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"]
+        ).decode().strip()
+        boot_state["gpu"] = gpu_out
+        log(f"✅ GPU detected: {gpu_out}")
+    except Exception:
+        gpu_out = "CPU / No GPU attached"
+        boot_state["gpu"] = gpu_out
+        fail("GPU_UNAVAILABLE", "No NVIDIA GPU detected. Set Accelerator → GPU T4 x2 in Kaggle session options.")
+        return
+
+    try:
+        urllib.request.urlopen("https://huggingface.co", timeout=8)
+    except Exception as exc:
+        fail("INTERNET_UNAVAILABLE", f"Kaggle internet is off ({exc}). Enable Internet in session options.")
+        return
+
+    # ---- installs run in the background while the model is fetched ----
+    # These three steps are independent of the model transfer, so overlapping them
+    # removes ~40-70 s from every cold start. The result arrives via futures.
+    install_pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+    deps_future = install_pool.submit(ensure_python_deps)
+    cloudflared_future = install_pool.submit(ensure_cloudflared)
+    ollama_future = install_pool.submit(ensure_ollama_serving)
+    notify_workspace("INSTALLING_DEPS", extra={"gpu": gpu_out, "note": "in parallel with the model transfer"})
+
+    # ---- 1/2: find an existing persistent copy (no download) ----
+    notify_workspace("CHECKING_CACHE", extra={"gpu": gpu_out})
+    gguf = ""
+    source = ""
+    local_blob = find_local_store_model()
+    if local_blob:
+        gguf, source = local_blob, "persistent-store"
+
+    if not gguf:
+        mount = find_dataset_gguf()
+        if mount:
+            gguf, source = mount, "dataset"
+
+    # ---- 3: download only when nothing valid exists ----
+    if not gguf:
+        notify_workspace("CACHE_MISS", extra={"gpu": gpu_out,
+                                              "note": "no persistent copy mounted — downloading once"})
+        notify_workspace("DOWNLOADING_MODEL", extra={"gpu": gpu_out, "note": "first run only"})
+        dest = os.path.join(BLIND_DISK_DIR, GGUF_BASENAME.format(quant=MODEL_QUANT))
+        # Speed-ordered sources: Hugging Face CDN measured ~60 s for the whole
+        # 5.6 GB from inside Kaggle, while the dataset archive took ~5 min. The
+        # dataset copy stays as the fallback so the GGUF is never fetched from HF
+        # when a permanent Kaggle-side copy can serve it.
+        try:
+            gguf, how = download_model(dest)
+        except Exception as exc:
+            log(f"⚠️ Hugging Face source failed: {exc}")
+            gguf, how = "", ""
+        if not gguf:
+            gguf = download_from_cache_dataset(dest)
+            how = "kaggle-dataset" if gguf else ""
+        if not gguf:
+            log("GGUF sources failed — attempting ollama pull as last resort")
+            try:
+                ollama_bin_early = ensure_ollama_serving()
+                if ollama_pull_model(ollama_bin_early):
+                    gguf = "ollama-registry"
+                    source = "ollama-pull"
+                    how = "ollama-pull"
+                else:
+                    fail("MODEL_CORRUPT", "no model source reachable — HF GGUF, Kaggle dataset, and ollama pull all failed")
+                    return
+            except Exception as e:
+                fail("MODEL_CORRUPT", f"no model source reachable — {e}")
+                return
+        expected_sha = MODEL_SHA256.get(MODEL_QUANT, "")
+        if expected_sha and how in ("verified", "kaggle-dataset"):
+            notify_workspace("VERIFYING_MODEL", extra={"gpu": gpu_out})
+            actual = _sha256(gguf)
+            if actual != expected_sha:
+                # Retry once from a clean slate before declaring the model unusable.
+                log(f"⚠️ sha256 mismatch ({actual[:12]}…) — re-downloading from scratch once")
+                try:
+                    os.remove(gguf)
+                except OSError:
+                    pass
+                gguf, how = download_model(dest)
+                if how == "verified" and _sha256(gguf) != expected_sha:
+                    try:
+                        os.remove(gguf)
+                    except OSError:
+                        pass
+                    fail("MODEL_CORRUPT", "the model download failed its sha256 check twice; "
+                                          "re-run the boot to retry (resume is safe)")
+                    return
+            _write_marker(gguf, expected_sha)
+            log("✅ sha256 verified")
+        else:
+            log(f"⚠️ mirror source used ({how}) — size-checked only, sha256 not comparable")
+        source = "download"
+        boot_state["download_skipped"] = False
+    else:
+        boot_state["download_skipped"] = True
+        log(f"⏭️  Download skipped — reusing {source} model")
+
+    notify_workspace("CACHE_HIT" if boot_state["download_skipped"] else "MODEL_DOWNLOADED",
+                     extra={"gpu": gpu_out, "source": source})
+
+    # ---- collect the parallel installs (only the missing ones were touched) ----
+    try:
+        deps_future.result(timeout=420)
+        cloudflared_bin = cloudflared_future.result(timeout=420)
+        ollama_bin = ollama_future.result(timeout=420)
+    except Exception as exc:
+        fail("BOOT_FAILED", f"dependency install failed: {exc}")
+        return
+    finally:
+        install_pool.shutdown(wait=False)
+    log("✅ Parallel install stage complete")
+
+    # ---- engine should already be serving (it was started during the download) ----
+    notify_workspace("STARTING_OLLAMA", extra={"gpu": gpu_out})
+    start_ollama_daemon(ollama_bin)   # no-op when already up
+
+    # ---- register + load the model on the GPU ----
+    notify_workspace("LOADING_MODEL", extra={"gpu": gpu_out})
+    if source == "ollama-pull" or gguf == "ollama-registry":
+        log("Model already in ollama store via pull — skip create")
+        if not ollama_model_present():
+            # ensure pull once more
+            ollama_pull_model(ollama_bin)
+    else:
+        register_model(ollama_bin, gguf)
+
+    boot_state["cache_source"] = source
+    boot_state["boot_seconds"] = round(time.time() - started, 1)
+    with open("/tmp/boot_state.json", "w") as fh:
+        json.dump(boot_state, fh)
+    notify_workspace("STARTING_GATEWAY", extra={"gpu": gpu_out})
+    start_gateway()
+
+    cf_proc, tunnel_url = launch_cloudflared(cloudflared_bin)
+    if not tunnel_url:
+        fail("TUNNEL_ERROR", "Could not obtain a Cloudflare Quick Tunnel URL")
+        return
+    notify_workspace("TUNNEL_ONLINE", tunnel_url=tunnel_url, extra={"gpu": gpu_out})
+
+    notify_workspace("WARMING_GPU", tunnel_url=tunnel_url, extra={"gpu": gpu_out})
+    warmup_ok = False
+    for attempt in range(3):
+        try:
+            warm_req = urllib.request.Request(
+                f"http://127.0.0.1:{GATEWAY_PORT}/v1/chat/completions",
+                data=json.dumps({
+                    "model": MODEL_ALIAS,
+                    "messages": [{"role": "user", "content": "Ping. Reply with PONG."}],
+                    "max_tokens": 24,
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {API_KEY}"},
+            )
+            urllib.request.urlopen(warm_req, timeout=300)
+            warmup_ok = True
+            break
+        except Exception as exc:
+            log(f"⚠️ Warmup attempt {attempt + 1} note: {exc}")
+            time.sleep(5)
+
+    boot_state["warmup_ok"] = warmup_ok
+    boot_state["boot_seconds"] = round(time.time() - started, 1)
+    with open("/tmp/boot_state.json", "w") as fh:
+        json.dump(boot_state, fh)
+    log(f"🚀 Boot complete in {boot_state['boot_seconds']}s (source={source}, download_skipped={boot_state['download_skipped']})")
+
+    notify_workspace(
+        "MODEL_READY_AND_WARMED" if warmup_ok else "MODEL_READY_COLD",
+        tunnel_url=tunnel_url,
+        extra={"gpu": gpu_out, "source": source, "boot_seconds": boot_state["boot_seconds"]},
+    )
+
+    # ---- one-time: make the verified model persistent for every future run ----
+    if source == "download":
+        if cache_dataset_is_ready():
+            log("✅ Cache dataset already holds the model — skipping republish")
+            notify_workspace("CACHE_DATASET_READY", extra={"dataset": CACHE_DATASET_SLUG, "gpu": gpu_out})
+        else:
+            publish_cache_dataset(gguf)
+
+    log(f"⏳ Server loop active for up to {MAX_RUNTIME_SECONDS // 3600}h")
+    loop_start = time.time()
+    _last_heartbeat = 0.0
+    _tunnel_fail_streak = 0
+    while time.time() - loop_start < MAX_RUNTIME_SECONDS:
+        time.sleep(15)
+        # 1) Process dead → always restart cloudflared and publish new URL
+        if cf_proc.poll() is not None:
+            log("⚠️ cloudflared exited; restarting tunnel")
+            cf_proc, new_url = launch_cloudflared(cloudflared_bin)
+            if new_url:
+                tunnel_url = new_url
+                _tunnel_fail_streak = 0
+                notify_workspace("MODEL_READY_AND_WARMED", tunnel_url=tunnel_url,
+                                 extra={"gpu": gpu_out, "source": source, "tunnel_restart": True})
+            else:
+                _tunnel_fail_streak += 1
+                log(f"⚠️ cloudflared restart produced no URL (streak={_tunnel_fail_streak})")
+                continue
+        # 2) External URL may go stale while process still runs (quick-tunnel edge case).
+        #    Probe /health through the public URL; on repeated failure, force restart.
+        if tunnel_url:
+            try:
+                req = urllib.request.Request(
+                    f"{tunnel_url.rstrip('/')}/health",
+                    headers={"User-Agent": "BlackthornTunnelSelfCheck/1.0"},
+                )
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    body = resp.read()
+                    if resp.status == 200:
+                        _tunnel_fail_streak = 0
+                    else:
+                        _tunnel_fail_streak += 1
+            except Exception as _te:
+                _tunnel_fail_streak += 1
+                log(f"⚠️ public tunnel health fail streak={_tunnel_fail_streak}: {type(_te).__name__}")
+            if _tunnel_fail_streak >= 3:
+                log("⚠️ public tunnel unhealthy 3× — forcing cloudflared restart")
+                try:
+                    cf_proc.terminate()
+                except Exception:
+                    pass
+                time.sleep(1)
+                try:
+                    if cf_proc.poll() is None:
+                        cf_proc.kill()
+                except Exception:
+                    pass
+                cf_proc, new_url = launch_cloudflared(cloudflared_bin)
+                if new_url:
+                    tunnel_url = new_url
+                    _tunnel_fail_streak = 0
+                    notify_workspace(
+                        "MODEL_READY_AND_WARMED",
+                        tunnel_url=tunnel_url,
+                        extra={"gpu": gpu_out, "source": source, "tunnel_restart": True, "reason": "self-heal"},
+                    )
+        # 3) Heartbeat to D1 so Render always has a fresh URL + ONLINE status
+        now = time.time()
+        if now - _last_heartbeat >= 90:
+            _last_heartbeat = now
+            notify_workspace(
+                "HEARTBEAT_ONLINE",
+                tunnel_url=tunnel_url,
+                extra={"gpu": gpu_out, "source": source},
+            )
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:  # never leave the dashboard stuck on "starting"
+        import traceback
+        traceback.print_exc()
+        fail("BOOT_FAILED", f"{type(exc).__name__}: {exc}")
+        raise

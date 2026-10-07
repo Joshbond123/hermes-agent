@@ -160,7 +160,7 @@ class TurnRequest:
     message: str = ""
     regenerate: bool = False
     thinking: bool = False
-    attachments: List[Dict[str, Any]] = field(default_factory=list)
+    attachments: List[Dict[str, Any]] = field(default_factory=list)  # resolved: {name, path, text, note, ...}
     max_steps: Optional[int] = None
     temperature: Optional[float] = None
 
@@ -259,7 +259,6 @@ class Engine:
         registry: ToolRegistry,
         store: Store,
         client_factory: Callable[[], httpx.AsyncClient],
-        attachment_loader: Optional[Callable[[List[Dict[str, Any]]], Awaitable[List[Dict[str, Any]]]]] = None,
         on_activity: Optional[Callable[[bool], None]] = None,
         on_tunnel_failure: Optional[Callable[[str], Any]] = None,
         config: Optional[EngineConfig] = None,
@@ -269,7 +268,6 @@ class Engine:
         self.registry = registry
         self.store = store
         self.client_factory = client_factory
-        self.attachment_loader = attachment_loader
         self.on_activity = on_activity or (lambda busy: None)
         self.on_tunnel_failure = on_tunnel_failure
         self.cfg = config or EngineConfig()
@@ -505,9 +503,7 @@ class Engine:
         started_wall = time.time()
         session_id = turn.session_id
         route_task = asyncio.ensure_future(self.route_provider())
-        attachments: List[Dict[str, Any]] = []
-        if req.attachments and self.attachment_loader is not None:
-            attachments = await self.attachment_loader(req.attachments)
+        attachments: List[Dict[str, Any]] = list(req.attachments)  # already resolved by the API layer
 
         user_text = req.message.strip()
         before_id: Optional[int] = None

@@ -511,16 +511,13 @@ async def test_regenerate_reuses_the_last_user_message_without_duplicating_it(fa
 
 async def test_attachments_are_shown_to_the_model_and_recorded(fake_d1, upstream, http_client):
     upstream.script(say("It says hello."))
-    store = MemoryStore()
-
-    async def loader(items):
-        return [{"name": "note.txt", "path": "note.txt", "text": "HELLO FILE"}]
-
-    engine, _ = await build(upstream, http_client, store=store)
-    engine.attachment_loader = loader
-    await collect(await engine.start(TurnRequest(message="read it", attachments=[{"path": "note.txt"}])))
-    assert "HELLO FILE" in upstream.requests[0]["messages"][-1]["content"]
+    engine, store = await build(upstream, http_client)
+    resolved = [{"name": "note.txt", "path": "note.txt", "text": "HELLO FILE"}]
+    await collect(await engine.start(TurnRequest(message="read it", attachments=resolved)))
+    last = upstream.requests[0]["messages"][-1]["content"]
+    assert last.startswith("read it") and "HELLO FILE" in last
     assert store.began[0]["user_meta"] == {"attachments": ["note.txt"]}
+    assert store.began[0]["user_text"] == "read it", "the stored user message is the plain text"
 
 
 async def test_new_turn_in_a_session_cancels_the_previous_one(fake_d1, upstream, http_client):
