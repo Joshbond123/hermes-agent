@@ -86,6 +86,7 @@ class FakeBackend:
         self.computer_calls: List[Dict[str, Any]] = []
         self.exec_output = "hello from the remote computer\n"
         self.exec_code = 0
+        self.exec_delay = 0.0
         self.fetch_text = "Example Domain. This domain is for use in illustrative examples."
         self.files: Dict[str, str] = {}
         self.app = self._build()
@@ -152,6 +153,8 @@ class FakeBackend:
             body = await request.json() if request.method == "POST" else {}
             self.computer_calls.append({"name": name, "body": body})
             if name == "exec":
+                if self.exec_delay:
+                    await asyncio.sleep(self.exec_delay)
                 return {"ok": True, "exit_code": self.exec_code, "output": self.exec_output, "cwd": "/w"}
             if name == "list_files":
                 return {"ok": True, "path": "/w", "listing": "FILE a.txt  3 B\nDIR sub"}

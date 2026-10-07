@@ -384,8 +384,8 @@ class AgentRun:
             except ValueError as exc:
                 parse_error = str(exc)
             summary = self.deps.registry.describe(name, args) if not parse_error else ""
-            part: Dict[str, Any] = {"type": "tool", "id": call_id, "name": name, "status": "running", "summary": summary,
-                                    "step": self.steps}
+            part: Dict[str, Any] = {"type": "tool", "id": call_id, "name": name, "status": "running", "args": summary,
+                                    "summary": "", "step": self.steps}
             self.parts.append(part)
             self.run.emit("tool.start", id=call_id, name=name, summary=summary, step=self.steps)
             started = time.monotonic()
@@ -412,8 +412,7 @@ class AgentRun:
                     result = await self.deps.registry.run(name, args, ctx)
             duration = int((time.monotonic() - started) * 1000)
             ui_out = redact(str(result.data.get("output") or ""))[: s.ui_result_chars] if result.data.get("output") else ""
-            part.update(status="ok" if result.ok else "error", summary=redact(result.summary or summary)[:200],
-                        duration_ms=duration)
+            part.update(status="ok" if result.ok else "error", summary=redact(result.summary)[:200], duration_ms=duration)
             if not result.ok:
                 part["error"] = redact(result.error)[:300]
             if ui_out:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import json
 import time
 from pathlib import Path
@@ -116,3 +117,132 @@ async def stack(tmp_path) -> AsyncIterator[Stack]:
     finally:
         app_srv.stop()
         backend_srv.stop()
+
+
+# ======================================================================================================
+# Real-browser fixtures: the production UI build served by the real app, a scripted GPU controller.
+# ======================================================================================================
+class FakeD1:
+    """Stand-in for ``cloudflare_d1_client`` with a deterministic boot sequence (one stage per status poll)."""
+
+    SEQUENCE = ["BOOTING_KAGGLE_GPU", "CHECKING_ENVIRONMENT", "CHECKING_CACHE", "CACHE_HIT", "STARTING_OLLAMA", "LOADING_MODEL", "WARMING_GPU"]
+
+    def __init__(self, status: str = "GPU_STOPPED_SAVING_QUOTA"):
+        self.status = status
+        self.stage = 0
+        self.calls: list = []
+        self.auto_off = 0
+        self.boot_started = None
+
+    def _state(self) -> dict:
+        s = self.status
+        booting = s in self.SEQUENCE
+        ready = s == "HEARTBEAT_ONLINE"
+        return {"active": ready, "booting": booting, "status": s, "tunnel_url": "https://hidden.example" if (ready or booting) else "",
+                "api_key": "must-not-leak", "display_status": "Kaggle Ready" if ready else ("Starting Kaggle" if booting else "Kaggle Offline"),
+                "engine_state": "ready" if ready else ("starting" if booting else "off"), "model": "Fake-Model", "model_loaded": True if ready else None,
+                "gpu_info": "Tesla T4 + Tesla T4" if (ready or booting) else ("FAILED: Kaggle refused the kernel push" if s == "BOOT_FAILED" else ""), "progress_step": s.replace("_", " ").title() if booting else "",
+                "quota": {"used_hours": 19.8, "total_hours": 30.0, "remaining_hours": 10.2, "used_pct": 66.0, "refresh_time": "2026-10-10T00:00:00Z"},
+                "cloudflare_d1": {"account_id": "acct", "database_id": "db"}, "busy": False, "worker_status": "RUNNING" if ready else "OFF"}
+
+    def get_kaggle_gpu_status(self, refresh=False):
+        if self.status in self.SEQUENCE:
+            self.stage += 1
+            self.status = self.SEQUENCE[self.stage] if self.stage < len(self.SEQUENCE) else "HEARTBEAT_ONLINE"
+        return self._state()
+
+    def public_gpu_status(self, state):
+        import cloudflare_d1_client as real
+        return real.public_gpu_status(state)
+
+    def turn_on_kaggle_gpu(self, blocking=False):
+        self.calls.append("on")
+        self.status, self.stage = self.SEQUENCE[0], 0
+        self.boot_started = time.time()
+        return self._state()
+
+    def turn_off_kaggle_gpu(self):
+        self.calls.append("off")
+        self.status = "GPU_STOPPED_SAVING_QUOTA"
+        return self._state()
+
+    def activity_snapshot(self): return {"idle_seconds": 3.0, "active_tasks": 0, "busy": False}
+    def auto_off_decision(self): return {"enabled": self.auto_off > 0, "minutes": self.auto_off, "should_stop": False}
+    def get_auto_off_minutes(self): return self.auto_off
+    def set_auto_off_minutes(self, m):
+        if m not in (0, 5, 10, 15, 30, 60):
+            raise ValueError("bad choice")
+        self.auto_off = m
+        return m
+    def _gateway_api_key(self): return "test-key"
+
+
+UI_DIR = Path(__file__).resolve().parents[1] / "static"
+
+
+@pytest_asyncio.fixture
+async def ui_stack() -> AsyncIterator[Stack]:
+    from blackthorn.gpu import GpuService
+    backend = FakeBackend()
+    backend_srv = ServerThread(backend.app).start()
+    executor = SqliteExecutor(":memory:")
+    settings = Settings(store="sqlite", heartbeat_s=0.5, tool_timeout_s=5.0)
+    services = build_services(settings, executor=executor, static_dir=UI_DIR)
+    fake_d1 = FakeD1("HEARTBEAT_ONLINE")
+    services.gpu = GpuService(services.store, fake_d1)
+    app = create_app(settings, services=services, gpu_daemon=False)
+    app_srv = ServerThread(app).start()
+    s = Stack(backend, backend_srv, app_srv, services, executor)
+    s.d1 = fake_d1  # type: ignore[attr-defined]
+    await services.store.ensure_schema()
+    await s.set_gpu()
+    try:
+        yield s
+    finally:
+        app_srv.stop()
+        backend_srv.stop()
+
+
+@pytest_asyncio.fixture
+async def browser():
+    from playwright.async_api import async_playwright
+    async with async_playwright() as p:
+        b = await p.chromium.launch(args=["--no-sandbox"])
+        try:
+            yield b
+        finally:
+            await b.close()
+
+
+class Pages:
+    def __init__(self, browser, url):
+        self.browser, self.url = browser, url
+        self.contexts = []
+
+    async def new(self, *, mobile: bool = False, width: int | None = None, height: int | None = None, scheme: str = "dark", clipboard: bool = False):
+        vp = {"width": width or (390 if mobile else 1280), "height": height or (844 if mobile else 800)}
+        ctx = await self.browser.new_context(viewport=vp, is_mobile=mobile, has_touch=mobile, color_scheme=scheme,
+                                             permissions=["clipboard-read", "clipboard-write"] if clipboard else [])
+        self.contexts.append(ctx)
+        page = await ctx.new_page()
+        page.problems = []  # console errors + page errors collected for assertions
+        page.requests = []
+        page.on("console", lambda m: page.problems.append(f"{m.type}: {m.text}") if m.type == "error" else None)
+        page.on("pageerror", lambda e: page.problems.append(f"pageerror: {e}"))
+        page.on("request", lambda r: page.requests.append(r.url))
+        await page.goto(self.url)
+        await page.get_by_test_id("composer-input").wait_for(timeout=15000)
+        return page
+
+    async def close(self):
+        for c in self.contexts:
+            await c.close()
+
+
+@pytest_asyncio.fixture
+async def pages(browser, ui_stack):
+    p = Pages(browser, ui_stack.url)
+    try:
+        yield p
+    finally:
+        await p.close()

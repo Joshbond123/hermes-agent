@@ -1,8 +1,8 @@
 # Blackthorn Agent Workspace Architecture
 
 ## Rule
-Hermes Agent tools (terminal, files, browser, packages, builds) execute **only** on Kaggle Computer.
-Render is the control/API plane only.
+The agent's tools (terminal, files, web page fetch, packages, builds) execute **only** on Kaggle Computer.
+Render is the control/API plane only. (`web_search` calls Tavily from Render; memory lives in Cloudflare D1.)
 
 ## Paths
 - Workspace: `/kaggle/working/blackthorn_workspace`
@@ -25,4 +25,6 @@ Closest supported lab:
 - Never target real external systems
 
 ## Flow
-UI → Hermes agent loop (Render) → tool calls → HTTP to Kaggle Computer API → real results → stream to UI
+UI → `blackthorn.agent` loop (Render) → model chooses tools via native `tool_calls` → HTTP to the Kaggle Computer API →
+real results go back as `role: tool` messages → text and tool events stream to the UI over SSE.
+See `blackthorn/README.md`.
