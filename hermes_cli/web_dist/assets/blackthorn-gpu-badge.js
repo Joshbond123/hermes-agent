@@ -1,6 +1,6 @@
 (function () {
   "use strict";
-  // blackthorn-ui v2026-10-07c gpu-panel
+  // blackthorn-ui v2026-10-07d history-nav
 
   var TOKEN = (window.__HERMES_SESSION_TOKEN__ || "");
   var MOCK_TITLES = [
@@ -446,7 +446,9 @@
   /** Load a session instantly via HermesStudio's real loader — no full page reload. */
   function openSessionFast(sessionId, title) {
     if (!sessionId) return;
-    // Close drawer immediately for snappy UX
+    console.info("[blackthorn] openSessionFast", sessionId, title || "");
+
+    // Close history drawer
     document.body.classList.remove("bt-history-open");
     var _p = document.getElementById("bt-history-panel");
     var _b = document.getElementById("bt-history-backdrop");
@@ -454,55 +456,51 @@
     if (_b) { _b.style.display = "none"; _b.style.pointerEvents = "none"; }
     clearBlockingOverlays();
 
-    var onChat = /\/chat(\/|$|\?)/.test(location.pathname) || location.pathname === "/";
-    // If not on the chat route, go there with session query (HermesStudio will pick it up)
-    if (!onChat && !location.pathname.startsWith("/chat")) {
-      window.location.href = "/chat?session=" + encodeURIComponent(sessionId);
-      return;
-    }
-
-    // Update URL without reload
-    try {
-      var u = new URL(window.location.href);
-      u.pathname = "/chat";
-      u.searchParams.set("session", sessionId);
-      history.pushState({ session: sessionId }, "", u.toString());
-    } catch (e) {}
-
-    function tryLoad() {
+    // Prefer in-app loader (HermesStudio exposes window.__btLoadSession)
+    function callLoader() {
       if (typeof window.__btLoadSession === "function") {
         try {
-          window.__btLoadSession(sessionId);
+          var ret = window.__btLoadSession(sessionId);
+          if (ret && typeof ret.then === "function") {
+            ret.catch(function (err) {
+              console.warn("[blackthorn] __btLoadSession rejected", err);
+            });
+          }
           return true;
         } catch (e) {
-          console.warn("btLoadSession failed", e);
+          console.warn("[blackthorn] __btLoadSession threw", e);
         }
-      }
-      var match =
-        document.querySelector('button[data-session-id="' + CSS.escape(sessionId) + '"]') ||
-        Array.from(document.querySelectorAll("button[data-session-id]")).find(function (b) {
-          return b.getAttribute("data-session-id") === sessionId;
-        });
-      if (match) {
-        match.click();
-        return true;
       }
       return false;
     }
 
-    if (tryLoad()) return;
+    // Update URL so refresh keeps the session
+    try {
+      var u = new URL(window.location.href);
+      u.pathname = "/chat";
+      u.searchParams.set("session", sessionId);
+      if (title) u.searchParams.set("title", title);
+      history.pushState({ session: sessionId }, "", u.toString());
+    } catch (e) {}
 
-    // Wait briefly for HermesStudio to mount and expose the loader
+    if (callLoader()) {
+      // Retry once shortly after in case Studio was mid-render
+      setTimeout(function () { callLoader(); }, 200);
+      setTimeout(function () { callLoader(); }, 600);
+      return;
+    }
+
+    // Wait for Studio to mount and expose the loader
     var tries = 0;
     (function waitLoader() {
       tries += 1;
-      if (tryLoad()) return;
-      if (tries < 25) {
-        setTimeout(waitLoader, 80);
+      if (callLoader()) return;
+      if (tries < 40) {
+        setTimeout(waitLoader, 100);
         return;
       }
-      // Hard navigation as last resort
-      window.location.href = "/chat?session=" + encodeURIComponent(sessionId);
+      // Hard navigation last resort — full reload with session id
+      window.location.href = "/chat?session=" + encodeURIComponent(sessionId) + "&profile=default";
     })();
   }
 
@@ -572,6 +570,11 @@
 
           row.appendChild(left);
           row.appendChild(menuBtn);
+          row.style.cursor = "pointer";
+          row.addEventListener("click", function (ev) {
+            if (ev.target && ev.target.closest && ev.target.closest(".bt-menu-btn, .bt-ctx-menu")) return;
+            openSessionFast(s.id, displayTitle || s.title);
+          });
           list.appendChild(row);
         });
       })
@@ -1009,6 +1012,23 @@
         }, true);
       }
     });
+  }
+
+  
+  function resumeSessionFromUrl() {
+    try {
+      var u = new URL(window.location.href);
+      var sid = u.searchParams.get("session") || u.searchParams.get("resume");
+      if (!sid) return;
+      var tries = 0;
+      (function attempt() {
+        tries += 1;
+        if (typeof window.__btLoadSession === "function") {
+          try { window.__btLoadSession(sid); return; } catch (e) {}
+        }
+        if (tries < 50) setTimeout(attempt, 120);
+      })();
+    } catch (e) {}
   }
 
   function boot() {

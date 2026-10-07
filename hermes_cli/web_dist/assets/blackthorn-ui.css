@@ -201,3 +201,6 @@ body.bt-chat-mode textarea{background:var(--bt-elevated)!important;border:1px so
   background:var(--bt-accent-soft)!important; border-color:rgba(249,115,22,.45)!important; color:#fdba74!important;
 }
 .bt-gpu-btn{ cursor:pointer!important; }
+
+.bt-hist-item.is-active{ background: rgba(249,115,22,.12)!important; border: 1px solid rgba(249,115,22,.25); }
+.bt-hist-item{ cursor: pointer; }
