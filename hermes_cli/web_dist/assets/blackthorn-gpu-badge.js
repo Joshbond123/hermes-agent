@@ -1,6 +1,6 @@
 (function () {
   "use strict";
-  // blackthorn-ui v2026-10-07f product-ui
+  // blackthorn-ui v2026-10-07g grok-layout
 
   var TOKEN = (window.__HERMES_SESSION_TOKEN__ || "");
   var MOCK_TITLES = [
@@ -51,105 +51,129 @@
   /** Upgrade plain <pre><code> into professional blocks + highlight.js */
   function enhanceCodeBlocks(root) {
     root = root || document;
-    var blocks = root.querySelectorAll("pre > code");
+    var blocks = root.querySelectorAll("pre > code, pre code");
     for (var i = 0; i < blocks.length; i++) {
       var code = blocks[i];
-      var pre = code.parentElement;
-      if (!pre || pre.closest(".bt-code-block")) continue;
+      var pre = code.closest("pre") || code.parentElement;
+      if (!pre) continue;
+      if (pre.dataset.btEnhanced === "1" && pre.closest(".bt-code-block")) {
+        // still re-apply highlight if missing
+        try {
+          if (window.hljs && !code.classList.contains("hljs")) {
+            window.hljs.highlightElement(code);
+          }
+        } catch (e) {}
+        continue;
+      }
       if (pre.dataset.btEnhanced === "1") continue;
       pre.dataset.btEnhanced = "1";
       var lang = "";
       var cls = code.className || "";
       var m = cls.match(/language-([\w+-]+)/) || cls.match(/lang-([\w+-]+)/);
       if (m) lang = m[1];
-      // Try highlight
       try {
         if (window.hljs) {
           if (lang && window.hljs.getLanguage && window.hljs.getLanguage(lang)) {
-            code.innerHTML = window.hljs.highlight(code.textContent, { language: lang, ignoreIllegals: true }).value;
+            code.innerHTML = window.hljs.highlight(code.textContent, { language: lang }).value;
             code.classList.add("hljs", "language-" + lang);
           } else {
-            var r = window.hljs.highlightAuto(code.textContent);
-            code.innerHTML = r.value;
-            code.classList.add("hljs");
-            if (r.language) lang = r.language;
+            window.hljs.highlightElement(code);
           }
         }
       } catch (e) {}
-      // Wrap
       var wrap = document.createElement("div");
       wrap.className = "bt-code-block";
+      wrap.setAttribute("data-lang", lang || "code");
       var header = document.createElement("div");
       header.className = "bt-code-header";
       var label = document.createElement("span");
-      label.textContent = (lang || "text").toLowerCase();
-      var copyBtn = document.createElement("button");
-      copyBtn.type = "button";
-      copyBtn.textContent = "Copy";
-      copyBtn.addEventListener("click", function (txt) {
-        return function () {
-          try { navigator.clipboard.writeText(txt); copyBtn.textContent = "Copied"; setTimeout(function(){ copyBtn.textContent = "Copy"; }, 1200); } catch (e) {}
-        };
-      }(code.textContent));
+      label.textContent = lang || "code";
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "bt-code-copy";
+      btn.textContent = "Copy";
+      btn.addEventListener("click", function (ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        var text = code.textContent || "";
+        function ok() {
+          btn.textContent = "Copied";
+          setTimeout(function () { btn.textContent = "Copy"; }, 1200);
+        }
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(ok).catch(function () {
+            try {
+              var ta = document.createElement("textarea");
+              ta.value = text;
+              document.body.appendChild(ta);
+              ta.select();
+              document.execCommand("copy");
+              document.body.removeChild(ta);
+              ok();
+            } catch (e2) {}
+          });
+        }
+      });
       header.appendChild(label);
-      header.appendChild(copyBtn);
-      var body = document.createElement("div");
-      body.className = "bt-code-body";
-      pre.parentNode.insertBefore(wrap, pre);
+      header.appendChild(btn);
+      var parent = pre.parentNode;
+      if (!parent) continue;
+      parent.insertBefore(wrap, pre);
       wrap.appendChild(header);
-      body.appendChild(pre);
-      wrap.appendChild(body);
+      wrap.appendChild(pre);
+      pre.style.setProperty("margin", "0", "important");
+      pre.style.setProperty("overflow-x", "auto", "important");
+      code.style.setProperty("font-family", "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace", "important");
+      code.style.setProperty("font-size", "13px", "important");
+      code.style.setProperty("line-height", "1.55", "important");
+      code.style.setProperty("tab-size", "2", "important");
+      code.style.setProperty("white-space", "pre", "important");
     }
   }
 
-  /** Hide expanded thinking / mock activity rows that still slip through */
+
   function collapseThinking() {
-    // Mark and collapse thinking/reasoning activity panels (Replit-style).
-    // Never leave private chain-of-thought expanded by default.
+    // Replit-style: collapse thinking / tool activity by default.
+    // Never expose private chain-of-thought as open prose.
     var panels = document.querySelectorAll(
-      ".mb-2.min-w-0.overflow-hidden.rounded-xl.border, [class*='activity'], details, [data-kind]"
+      "[data-kind], [class*='activity' i], [class*='Activity'], details, " +
+      ".mb-2.min-w-0.overflow-hidden.rounded-xl.border, [data-bt-activity]"
     );
     for (var i = 0; i < panels.length; i++) {
       var panel = panels[i];
+      if (panel.dataset.btActivityWired === "1") continue;
       var text = (panel.textContent || "").toLowerCase();
-      var titleEl = panel.querySelector("button span, summary, [data-title], .bt-activity-header");
-      var title = titleEl ? (titleEl.textContent || "").toLowerCase() : text.slice(0, 80);
-      var isThink = title.indexOf("reasoning") >= 0 || title.indexOf("thinking") >= 0
-        || title.indexOf("thought") >= 0 || title.indexOf("chain of thought") >= 0;
-      var isTool = panel.getAttribute("data-kind") === "tool"
-        || title.indexOf("running") >= 0 || title.indexOf("tool") >= 0
-        || title.indexOf("command") >= 0 || title.indexOf("search") >= 0;
-      if (isThink) {
-        panel.setAttribute("data-bt-activity", "thinking");
-        if (!panel.getAttribute("data-bt-open")) panel.setAttribute("data-bt-open", "0");
-        // Collapse <details>
-        if (panel.tagName === "DETAILS") panel.open = false;
-        // Click-to-expand header if expanded body visible
-        var btn = panel.querySelector("button");
-        var body = panel.querySelector("[class*='content'], [class*='body'], pre, code");
-        if (btn && body && !panel.__btWired) {
-          panel.__btWired = true;
-          btn.addEventListener("click", function (p) {
-            return function () {
-              var open = p.getAttribute("data-bt-open") === "1";
-              p.setAttribute("data-bt-open", open ? "0" : "1");
-            };
-          }(panel));
-        }
-        // Hide long monologue blocks that look like CoT dumps
-        var blocks = panel.querySelectorAll("p, div, pre");
-        for (var j = 0; j < blocks.length; j++) {
-          var bt = (blocks[j].textContent || "").trim();
-          if (bt.length > 400 && /i need to|let me think|my reasoning|chain-of-thought/i.test(bt)) {
-            blocks[j].classList.add("bt-cot-hidden");
-          }
-        }
-      } else if (isTool) {
-        panel.setAttribute("data-bt-activity", "tool");
-        if (!panel.getAttribute("data-bt-open")) panel.setAttribute("data-bt-open", "0");
+      var titleEl = panel.querySelector("button, summary, [data-title], .bt-activity-header, span");
+      var title = titleEl ? (titleEl.textContent || "").toLowerCase() : text.slice(0, 100);
+      var isThink =
+        /reasoning|thinking|thought|chain.of.thought|private/.test(title) ||
+        /reasoning|thinking|thought/.test(text.slice(0, 120));
+      var isTool =
+        panel.getAttribute("data-kind") === "tool" ||
+        /terminal|tool|search|web|file|command|running|executed/.test(title);
+      if (!isThink && !isTool) continue;
+      panel.dataset.btActivityWired = "1";
+      panel.setAttribute("data-bt-activity", isTool ? "tool" : "think");
+      panel.setAttribute("data-bt-open", "0");
+      // Build collapsible header if missing
+      if (!panel.querySelector(".bt-activity-toggle")) {
+        var bar = document.createElement("button");
+        bar.type = "button";
+        bar.className = "bt-activity-toggle";
+        bar.textContent = isTool ? "▸ Activity" : "▸ Details";
+        bar.addEventListener("click", function (ev) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          var p = ev.currentTarget.parentElement;
+          var open = p.getAttribute("data-bt-open") === "1";
+          p.setAttribute("data-bt-open", open ? "0" : "1");
+          ev.currentTarget.textContent = (open ? "▸ " : "▾ ") + (p.getAttribute("data-bt-activity") === "tool" ? "Activity" : "Details");
+        });
+        panel.insertBefore(bar, panel.firstChild);
       }
     }
   }
+
 
   function stripMockActivity() {
     document.querySelectorAll("[data-kind], [class*='activity'], [class*='Activity']").forEach(function (el) {
@@ -870,30 +894,56 @@
 
   function forceLayout() {
     if (!document.body.classList.contains("bt-chat-mode")) return;
-    // Hide React history asides (we use custom panel)
+
+    // Hide non-blackthorn asides (history is our panel)
     document.querySelectorAll("aside").forEach(function (a) {
       if (a.id === "app-sidebar" || a.id === "bt-history-panel") return;
       a.style.setProperty("display", "none", "important");
       a.style.pointerEvents = "none";
     });
-    var nav = document.getElementById("app-sidebar");
-    if (nav && window.innerWidth >= 1024) {
-      if (document.body.classList.contains("bt-nav-open")) {
-        nav.style.setProperty("width", "260px", "important");
-        nav.style.setProperty("min-width", "260px", "important");
-      } else {
-        nav.style.setProperty("width", "56px", "important");
-        nav.style.setProperty("min-width", "56px", "important");
-        nav.style.setProperty("transform", "none", "important");
+
+    // Grok-style: remove decorative avatars / letter circles next to messages
+    document.querySelectorAll(
+      'img[alt*="avatar" i], img[alt*="user" i], img[alt*="assistant" i], ' +
+      '[class*="avatar" i], [class*="Avatar"]'
+    ).forEach(function (el) {
+      if (el.closest("#app-sidebar, #bt-history-panel, header, nav")) return;
+      el.style.setProperty("display", "none", "important");
+    });
+    // Letter badge circles (e.g. "B") sitting beside message rows
+    document.querySelectorAll("div, span").forEach(function (el) {
+      if (el.closest("#app-sidebar, #bt-history-panel, header, form, #bt-gpu-panel")) return;
+      if (el.children.length > 0) return;
+      var t = (el.textContent || "").trim();
+      if (t.length === 1 && /[A-Za-z0-9]/.test(t)) {
+        var cs = window.getComputedStyle(el);
+        var w = parseFloat(cs.width) || 0;
+        var h = parseFloat(cs.height) || 0;
+        if (w >= 20 && w <= 48 && h >= 20 && h <= 48 && cs.borderRadius && parseFloat(cs.borderRadius) >= 8) {
+          el.style.setProperty("display", "none", "important");
+        }
       }
-    }
-    mergeHeaderControls();
-    wireGpuButton();
-    stripMockActivity(); enhanceCodeBlocks(document); collapseThinking();
-    if (!document.body.classList.contains("bt-history-open") &&
-        !document.body.classList.contains("bt-nav-open")) {
-      clearBlockingOverlays();
-    }
+    });
+
+    // Widen conversation column — Grok uses near full content width
+    var candidates = document.querySelectorAll(
+      "main, [class*='chat'], [class*='Chat'], [class*='message'], [class*='Message'], " +
+      "[class*='prose'], [class*='markdown'], [class*='Markdown'], [class*='transcript']"
+    );
+    candidates.forEach(function (el) {
+      if (el.closest("#app-sidebar, #bt-history-panel, form")) return;
+      var mw = el.style.maxWidth || window.getComputedStyle(el).maxWidth;
+      if (mw && mw !== "none" && parseFloat(mw) > 0 && parseFloat(mw) < 900) {
+        el.style.setProperty("max-width", "52rem", "important");
+      }
+    });
+    // Message rows: full usable width inside main
+    document.querySelectorAll("[data-role], [class*='message-row'], [class*='MessageRow']").forEach(function (el) {
+      el.style.setProperty("max-width", "52rem", "important");
+      el.style.setProperty("margin-left", "auto", "important");
+      el.style.setProperty("margin-right", "auto", "important");
+      el.style.setProperty("width", "100%", "important");
+    });
   }
 
   function wireSidebar() {

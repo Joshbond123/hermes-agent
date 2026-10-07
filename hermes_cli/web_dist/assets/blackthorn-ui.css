@@ -259,3 +259,155 @@ body.bt-chat-mode .bt-code-header span {
   text-transform: uppercase;
   font-size: 10.5px !important;
 }
+
+
+/* ===== Grok-inspired layout v2 (high specificity overrides) ===== */
+body.bt-chat-mode {
+  --bt-max: 52rem;
+  --bt-fg: #e7e9ea;
+  --bt-muted: #8b98a5;
+  --bt-border: #2f3336;
+  --bt-surface: #16181c;
+  --bt-bg: #000000;
+}
+body.bt-chat-mode #root,
+body.bt-chat-mode main {
+  background: var(--bt-bg) !important;
+}
+/* Text-first messages — hide avatars */
+body.bt-chat-mode [class*="avatar" i],
+body.bt-chat-mode [class*="Avatar"],
+body.bt-chat-mode img[alt*="avatar" i] {
+  display: none !important;
+}
+/* Widen content */
+body.bt-chat-mode main > div,
+body.bt-chat-mode [class*="prose"],
+body.bt-chat-mode [class*="markdown"] {
+  max-width: var(--bt-max) !important;
+  width: 100% !important;
+  margin-left: auto !important;
+  margin-right: auto !important;
+}
+body.bt-chat-mode [data-role="assistant"],
+body.bt-chat-mode [data-role="user"] {
+  max-width: var(--bt-max) !important;
+  width: 100% !important;
+  margin-left: auto !important;
+  margin-right: auto !important;
+  padding-left: 1rem !important;
+  padding-right: 1rem !important;
+}
+/* User: subtle bubble; Assistant: plain text on canvas (Grok) */
+body.bt-chat-mode [data-role="user"] {
+  background: var(--bt-surface) !important;
+  border-radius: 1.1rem !important;
+  padding: 0.75rem 1rem !important;
+  border: 0.5px solid var(--bt-border) !important;
+}
+body.bt-chat-mode [data-role="assistant"] {
+  background: transparent !important;
+  border: none !important;
+}
+body.bt-chat-mode {
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif !important;
+  color: var(--bt-fg) !important;
+  line-height: 1.55 !important;
+}
+/* Activity collapsed by default */
+body.bt-chat-mode [data-bt-activity][data-bt-open="0"] > :not(.bt-activity-toggle) {
+  display: none !important;
+}
+body.bt-chat-mode .bt-activity-toggle {
+  display: flex !important;
+  width: 100%;
+  align-items: center;
+  gap: 0.4rem;
+  background: transparent !important;
+  border: 0.5px solid var(--bt-border) !important;
+  border-radius: 0.65rem !important;
+  color: var(--bt-muted) !important;
+  font-size: 12.5px !important;
+  padding: 0.35rem 0.65rem !important;
+  cursor: pointer !important;
+  margin: 0.35rem 0 !important;
+}
+body.bt-chat-mode [data-bt-activity][data-bt-open="1"] {
+  border: 0.5px solid var(--bt-border);
+  border-radius: 0.75rem;
+  padding: 0.35rem;
+  background: rgba(22, 24, 28, 0.8);
+}
+/* Professional code blocks */
+body.bt-chat-mode .bt-code-block {
+  border: 0.5px solid var(--bt-border) !important;
+  border-radius: 12px !important;
+  background: var(--bt-surface) !important;
+  overflow: hidden !important;
+  margin: 0.75rem 0 !important;
+  max-width: 100% !important;
+}
+body.bt-chat-mode .bt-code-header {
+  display: flex !important;
+  justify-content: space-between !important;
+  align-items: center !important;
+  padding: 0.4rem 0.75rem !important;
+  border-bottom: 0.5px solid var(--bt-border) !important;
+  background: rgba(0,0,0,0.35) !important;
+  color: var(--bt-muted) !important;
+  font-size: 11px !important;
+  text-transform: uppercase !important;
+  letter-spacing: 0.04em !important;
+  font-weight: 600 !important;
+}
+body.bt-chat-mode .bt-code-copy {
+  background: transparent !important;
+  border: 0.5px solid var(--bt-border) !important;
+  color: var(--bt-fg) !important;
+  border-radius: 6px !important;
+  font-size: 11px !important;
+  padding: 0.15rem 0.5rem !important;
+  cursor: pointer !important;
+  text-transform: none !important;
+  letter-spacing: 0 !important;
+}
+body.bt-chat-mode .bt-code-copy:hover {
+  border-color: #71767b !important;
+}
+body.bt-chat-mode .bt-code-block pre {
+  margin: 0 !important;
+  padding: 0.85rem 1rem !important;
+  overflow-x: auto !important;
+  background: transparent !important;
+}
+body.bt-chat-mode .bt-code-block code,
+body.bt-chat-mode .bt-code-block .hljs {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace !important;
+  font-size: 13px !important;
+  line-height: 1.55 !important;
+  tab-size: 2 !important;
+  white-space: pre !important;
+  background: transparent !important;
+}
+/* Composer */
+body.bt-chat-mode form:has(textarea) {
+  max-width: var(--bt-max) !important;
+  margin-left: auto !important;
+  margin-right: auto !important;
+}
+body.bt-chat-mode textarea {
+  border-radius: 1.25rem !important;
+  border-color: var(--bt-border) !important;
+  background: var(--bt-surface) !important;
+}
+/* Mobile */
+@media (max-width: 768px) {
+  body.bt-chat-mode {
+    --bt-max: 100%;
+  }
+  body.bt-chat-mode [data-role="assistant"],
+  body.bt-chat-mode [data-role="user"] {
+    padding-left: 0.75rem !important;
+    padding-right: 0.75rem !important;
+  }
+}
