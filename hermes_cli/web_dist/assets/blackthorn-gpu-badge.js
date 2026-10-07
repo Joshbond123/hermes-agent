@@ -1,6 +1,6 @@
 (function () {
   "use strict";
-  // blackthorn-ui v2026-10-07d history-nav
+  // blackthorn-ui v2026-10-07e history-nav-single
 
   var TOKEN = (window.__HERMES_SESSION_TOKEN__ || "");
   var MOCK_TITLES = [
@@ -446,9 +446,7 @@
   /** Load a session instantly via HermesStudio's real loader — no full page reload. */
   function openSessionFast(sessionId, title) {
     if (!sessionId) return;
-    console.info("[blackthorn] openSessionFast", sessionId, title || "");
 
-    // Close history drawer
     document.body.classList.remove("bt-history-open");
     var _p = document.getElementById("bt-history-panel");
     var _b = document.getElementById("bt-history-backdrop");
@@ -456,25 +454,6 @@
     if (_b) { _b.style.display = "none"; _b.style.pointerEvents = "none"; }
     clearBlockingOverlays();
 
-    // Prefer in-app loader (HermesStudio exposes window.__btLoadSession)
-    function callLoader() {
-      if (typeof window.__btLoadSession === "function") {
-        try {
-          var ret = window.__btLoadSession(sessionId);
-          if (ret && typeof ret.then === "function") {
-            ret.catch(function (err) {
-              console.warn("[blackthorn] __btLoadSession rejected", err);
-            });
-          }
-          return true;
-        } catch (e) {
-          console.warn("[blackthorn] __btLoadSession threw", e);
-        }
-      }
-      return false;
-    }
-
-    // Update URL so refresh keeps the session
     try {
       var u = new URL(window.location.href);
       u.pathname = "/chat";
@@ -483,23 +462,33 @@
       history.pushState({ session: sessionId }, "", u.toString());
     } catch (e) {}
 
-    if (callLoader()) {
-      // Retry once shortly after in case Studio was mid-render
-      setTimeout(function () { callLoader(); }, 200);
-      setTimeout(function () { callLoader(); }, 600);
-      return;
+    // Mark active row
+    document.querySelectorAll(".bt-hist-item.is-active").forEach(function (el) {
+      el.classList.remove("is-active");
+    });
+    var active = document.querySelector('.bt-hist-item[data-sid="' + sessionId + '"]');
+    if (active) active.classList.add("is-active");
+
+    if (typeof window.__btLoadSession === "function") {
+      try {
+        window.__btLoadSession(sessionId);
+        return;
+      } catch (e) {
+        console.warn("[blackthorn] __btLoadSession failed", e);
+      }
     }
 
-    // Wait for Studio to mount and expose the loader
+    // Loader not ready yet — wait once, then hard navigate
     var tries = 0;
     (function waitLoader() {
       tries += 1;
-      if (callLoader()) return;
-      if (tries < 40) {
+      if (typeof window.__btLoadSession === "function") {
+        try { window.__btLoadSession(sessionId); return; } catch (e) {}
+      }
+      if (tries < 30) {
         setTimeout(waitLoader, 100);
         return;
       }
-      // Hard navigation last resort — full reload with session id
       window.location.href = "/chat?session=" + encodeURIComponent(sessionId) + "&profile=default";
     })();
   }
