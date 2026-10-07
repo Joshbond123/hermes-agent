@@ -81,7 +81,7 @@ export type Tone = 'ok' | 'warn' | 'bad' | 'off' | 'idle'
 
 export function summarize(g: GpuView): { label: string; tone: Tone; detail: string } {
   const s = g.status
-  if (!s) return g.error ? { label: 'GPU unavailable', tone: 'bad', detail: g.error } : { label: 'GPU…', tone: 'idle', detail: 'Checking the GPU' }
+  if (!s) return g.error ? { label: 'GPU unavailable', tone: 'bad', detail: g.error } : { label: 'Checking GPU', tone: 'idle', detail: 'Checking the GPU' }
   if (g.busy === 'off' || s.status === 'STOPPING_KAGGLE_GPU') return { label: 'GPU stopping', tone: 'warn', detail: 'Stopping the Kaggle session' }
   if (s.booting || g.busy === 'on') {
     const step = s.progress_stage && s.progress_total_stages ? ` ${s.progress_stage}/${s.progress_total_stages}` : ''
