@@ -1,6 +1,6 @@
 (function () {
   "use strict";
-  // blackthorn-ui v2026-10-07j two-headers-mobile
+  // blackthorn-ui v2026-10-07k design-v4
 
   var TOKEN = (window.__HERMES_SESSION_TOKEN__ || "");
   var MOCK_TITLES = [
@@ -894,110 +894,91 @@
 
   function forceLayout() {
     if (!document.body.classList.contains("bt-chat-mode")) return;
+    document.documentElement.setAttribute("data-bt-design", "grok-v4");
+    document.body.setAttribute("data-bt-design", "grok-v4");
 
-    // ============================================================
-    // TWO HEADERS ONLY (all viewports)
-    //  1) data-bt-header="app"  — brand + Chat + GPU controls
-    //  2) data-bt-header="chat" — New chat / history / Export / Files
-    // Everything else that looks like a top bar is hidden.
-    // ============================================================
+    // --- Two headers only ---
     var headers = Array.prototype.slice.call(document.querySelectorAll("header"));
-    var foundApp = false;
-    var foundChat = false;
-
     headers.forEach(function (h) {
       var cls = String(h.className || "");
       var text = (h.textContent || "").replace(/\s+/g, " ").trim();
-
-      // Chat context bar first (New chat + Export/Files)
-      var isChat =
-        /New chat/i.test(text) &&
-        (/Export/i.test(text) || /Files/i.test(text) || /☰/.test(text) || /History/i.test(text));
+      var isChat = /New chat/i.test(text) && (/Export/i.test(text) || /Files/i.test(text) || /☰/.test(text));
       if (isChat) {
         h.setAttribute("data-bt-header", "chat");
         h.style.setProperty("display", "flex", "important");
-        h.style.setProperty("position", "relative", "important");
-        h.style.setProperty("top", "auto", "important");
-        foundChat = true;
         return;
       }
-
-      // App chrome (Chat label + GPU) — not the chat context bar
-      var isApp =
-        (/\bChat\b/i.test(text) && /GPU/i.test(text) && !/New chat/i.test(text)) ||
+      var isApp = (/\bChat\b/i.test(text) && /GPU/i.test(text) && !/New chat/i.test(text)) ||
         (/GPU\s*(ON|OFF)/i.test(text) && !/New chat/i.test(text));
       if (isApp) {
         h.setAttribute("data-bt-header", "app");
         h.style.setProperty("display", "flex", "important");
-        foundApp = true;
         return;
       }
-
-      // Mobile "Hermes Agent" title bar — always suppress (duplicates app chrome)
-      var isMobileTitle =
-        cls.indexOf("lg:hidden") >= 0 ||
+      var isMobileTitle = cls.indexOf("lg:hidden") >= 0 ||
         (/Hermes Agent/i.test(text) && text.length < 48 && !/GPU/i.test(text) && !/New chat/i.test(text));
       if (isMobileTitle) {
         h.style.setProperty("display", "none", "important");
-        h.style.setProperty("height", "0", "important");
-        h.style.setProperty("min-height", "0", "important");
-        h.style.setProperty("overflow", "hidden", "important");
-        h.style.setProperty("padding", "0", "important");
-        h.style.setProperty("border", "none", "important");
         h.setAttribute("data-bt-header", "mobile-hidden");
         return;
       }
-
-      // Any other header — hide to enforce the two-bar rule
       h.style.setProperty("display", "none", "important");
       h.setAttribute("data-bt-header", "suppressed");
     });
 
-    // Metrics / consent strip
-    document.querySelectorAll("div, section").forEach(function (el) {
+    // Metrics + offline banners
+    document.querySelectorAll("div, section, p").forEach(function (el) {
       if (el.closest("header, form, #app-sidebar, #bt-history-panel, #bt-gpu-panel, main")) return;
       var t = (el.textContent || "").replace(/\s+/g, " ").trim();
       if (/Help improve Hermes/i.test(t) && /Send to Nous|Local only|No thanks/i.test(t) && t.length < 400) {
         el.style.setProperty("display", "none", "important");
         el.setAttribute("data-bt-metrics-banner", "1");
       }
-    });
-
-    // Full-width offline banner
-    document.querySelectorAll("div, section, p").forEach(function (el) {
-      if (el.closest("header, form, #app-sidebar, #bt-history-panel, #bt-gpu-panel")) return;
-      var t = (el.textContent || "").replace(/\s+/g, " ").trim();
       if (/^Kaggle GPU is offline/i.test(t) && t.length < 220) {
         el.style.setProperty("display", "none", "important");
         el.setAttribute("data-bt-offline-banner", "1");
       }
     });
 
-    // Non-blackthorn asides
-    document.querySelectorAll("aside").forEach(function (a) {
-      if (a.id === "app-sidebar" || a.id === "bt-history-panel") return;
-      a.style.setProperty("display", "none", "important");
-      a.style.pointerEvents = "none";
-    });
+    // Hide left icon rail on chat (Grok has no dense tool rail)
+    var side = document.getElementById("app-sidebar");
+    if (side && window.innerWidth >= 768) {
+      side.setAttribute("data-bt-rail", "collapsed");
+      side.style.setProperty("width", "0", "important");
+      side.style.setProperty("min-width", "0", "important");
+      side.style.setProperty("overflow", "hidden", "important");
+      side.style.setProperty("opacity", "0", "important");
+      side.style.setProperty("pointer-events", "none", "important");
+    }
 
-    // Avatars / letter badges in transcript
-    document.querySelectorAll(
-      'img[alt*="avatar" i], img[alt*="user" i], img[alt*="assistant" i], [class*="avatar" i], [class*="Avatar"]'
-    ).forEach(function (el) {
-      if (el.closest("#app-sidebar, #bt-history-panel, header, nav")) return;
+    // Hide empty-state letter badge "B" and any avatar circles in main
+    document.querySelectorAll("main div, main span, [class*='empty'] div, [class*='Empty'] div").forEach(function (el) {
+      if (el.children.length > 0) return;
+      var t = (el.textContent || "").trim();
+      if (t.length === 1 && /[A-Za-z]/.test(t)) {
+        var cs = window.getComputedStyle(el);
+        var w = parseFloat(cs.width) || el.offsetWidth || 0;
+        var h = parseFloat(cs.height) || el.offsetHeight || 0;
+        if (w >= 28 && w <= 72 && h >= 28 && h <= 72) {
+          el.style.setProperty("display", "none", "important");
+          el.setAttribute("data-bt-empty-avatar", "1");
+        }
+      }
+    });
+    document.querySelectorAll('img[alt*="avatar" i], [class*="avatar" i], [class*="Avatar"]').forEach(function (el) {
+      if (el.closest("#bt-history-panel, header")) return;
       el.style.setProperty("display", "none", "important");
     });
 
-    // Widen transcript on larger screens
-    if (window.innerWidth >= 768) {
-      document.querySelectorAll("main, [class*='prose'], [class*='markdown']").forEach(function (el) {
-        if (el.closest("#app-sidebar, #bt-history-panel, form")) return;
-        var mw = window.getComputedStyle(el).maxWidth;
-        if (mw && mw !== "none" && parseFloat(mw) > 0 && parseFloat(mw) < 900) {
-          el.style.setProperty("max-width", "52rem", "important");
-        }
-      });
-    }
+    // Other asides
+    document.querySelectorAll("aside").forEach(function (a) {
+      if (a.id === "app-sidebar" || a.id === "bt-history-panel") return;
+      a.style.setProperty("display", "none", "important");
+    });
+
+    // Mark main chat shell for CSS
+    var main = document.querySelector("main");
+    if (main) main.setAttribute("data-bt-main", "1");
   }
 
 
