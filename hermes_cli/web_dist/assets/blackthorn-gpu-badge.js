@@ -1,6 +1,6 @@
 (function () {
   "use strict";
-  // blackthorn-ui v2026-10-07i two-headers-v2
+  // blackthorn-ui v2026-10-07j two-headers-mobile
 
   var TOKEN = (window.__HERMES_SESSION_TOKEN__ || "");
   var MOCK_TITLES = [
@@ -895,53 +895,65 @@
   function forceLayout() {
     if (!document.body.classList.contains("bt-chat-mode")) return;
 
-    // ----- Exactly TWO headers: app chrome + chat context -----
-    // Hide: mobile duplicate, metrics/consent top strip, offline full banner
+    // ============================================================
+    // TWO HEADERS ONLY (all viewports)
+    //  1) data-bt-header="app"  — brand + Chat + GPU controls
+    //  2) data-bt-header="chat" — New chat / history / Export / Files
+    // Everything else that looks like a top bar is hidden.
+    // ============================================================
     var headers = Array.prototype.slice.call(document.querySelectorAll("header"));
-    var appHdr = null;
-    var chatHdr = null;
+    var foundApp = false;
+    var foundChat = false;
 
     headers.forEach(function (h) {
       var cls = String(h.className || "");
       var text = (h.textContent || "").replace(/\s+/g, " ").trim();
 
-      // Mobile-only chrome — always hide when desktop layout is active (≥768)
-      var isMobileHdr =
-        cls.indexOf("lg:hidden") >= 0 ||
-        (cls.indexOf("fixed") >= 0 && /Hermes Agent/i.test(text) && text.length < 48);
-      if (isMobileHdr) {
-        if (window.innerWidth >= 768) {
-          h.style.setProperty("display", "none", "important");
-          h.setAttribute("data-bt-header", "mobile-hidden");
-        } else {
-          h.setAttribute("data-bt-header", "mobile");
-        }
-        return;
-      }
-
-      // Chat context bar (New chat / Export / Files) — check BEFORE generic GPU
+      // Chat context bar first (New chat + Export/Files)
       var isChat =
-        /New chat/i.test(text) && (/Export/i.test(text) || /Files/i.test(text) || /☰|History/i.test(text));
+        /New chat/i.test(text) &&
+        (/Export/i.test(text) || /Files/i.test(text) || /☰/.test(text) || /History/i.test(text));
       if (isChat) {
         h.setAttribute("data-bt-header", "chat");
         h.style.setProperty("display", "flex", "important");
-        chatHdr = h;
+        h.style.setProperty("position", "relative", "important");
+        h.style.setProperty("top", "auto", "important");
+        foundChat = true;
         return;
       }
 
-      // App chrome (brand row with Chat label + GPU controls)
+      // App chrome (Chat label + GPU) — not the chat context bar
       var isApp =
-        (/\bChat\b/i.test(text) && /GPU/i.test(text)) ||
+        (/\bChat\b/i.test(text) && /GPU/i.test(text) && !/New chat/i.test(text)) ||
         (/GPU\s*(ON|OFF)/i.test(text) && !/New chat/i.test(text));
       if (isApp) {
         h.setAttribute("data-bt-header", "app");
         h.style.setProperty("display", "flex", "important");
-        appHdr = h;
+        foundApp = true;
         return;
       }
+
+      // Mobile "Hermes Agent" title bar — always suppress (duplicates app chrome)
+      var isMobileTitle =
+        cls.indexOf("lg:hidden") >= 0 ||
+        (/Hermes Agent/i.test(text) && text.length < 48 && !/GPU/i.test(text) && !/New chat/i.test(text));
+      if (isMobileTitle) {
+        h.style.setProperty("display", "none", "important");
+        h.style.setProperty("height", "0", "important");
+        h.style.setProperty("min-height", "0", "important");
+        h.style.setProperty("overflow", "hidden", "important");
+        h.style.setProperty("padding", "0", "important");
+        h.style.setProperty("border", "none", "important");
+        h.setAttribute("data-bt-header", "mobile-hidden");
+        return;
+      }
+
+      // Any other header — hide to enforce the two-bar rule
+      h.style.setProperty("display", "none", "important");
+      h.setAttribute("data-bt-header", "suppressed");
     });
 
-    // Metrics / "Help improve Hermes?" consent strip — hide on chat (not a product header)
+    // Metrics / consent strip
     document.querySelectorAll("div, section").forEach(function (el) {
       if (el.closest("header, form, #app-sidebar, #bt-history-panel, #bt-gpu-panel, main")) return;
       var t = (el.textContent || "").replace(/\s+/g, " ").trim();
@@ -951,7 +963,7 @@
       }
     });
 
-    // Full-width offline banner → hidden (GPU chip already shows status)
+    // Full-width offline banner
     document.querySelectorAll("div, section, p").forEach(function (el) {
       if (el.closest("header, form, #app-sidebar, #bt-history-panel, #bt-gpu-panel")) return;
       var t = (el.textContent || "").replace(/\s+/g, " ").trim();
@@ -968,35 +980,24 @@
       a.style.pointerEvents = "none";
     });
 
-    // Hide avatars / letter badges in transcript
+    // Avatars / letter badges in transcript
     document.querySelectorAll(
       'img[alt*="avatar" i], img[alt*="user" i], img[alt*="assistant" i], [class*="avatar" i], [class*="Avatar"]'
     ).forEach(function (el) {
       if (el.closest("#app-sidebar, #bt-history-panel, header, nav")) return;
       el.style.setProperty("display", "none", "important");
     });
-    document.querySelectorAll("div, span").forEach(function (el) {
-      if (el.closest("#app-sidebar, #bt-history-panel, header, form, #bt-gpu-panel")) return;
-      if (el.children.length > 0) return;
-      var t = (el.textContent || "").trim();
-      if (t.length === 1 && /[A-Za-z0-9]/.test(t)) {
-        var cs = window.getComputedStyle(el);
-        var w = parseFloat(cs.width) || 0;
-        var hgt = parseFloat(cs.height) || 0;
-        if (w >= 20 && w <= 48 && hgt >= 20 && hgt <= 48 && cs.borderRadius && parseFloat(cs.borderRadius) >= 8) {
-          el.style.setProperty("display", "none", "important");
-        }
-      }
-    });
 
-    // Widen transcript
-    document.querySelectorAll("main, [class*='prose'], [class*='markdown'], [class*='Markdown']").forEach(function (el) {
-      if (el.closest("#app-sidebar, #bt-history-panel, form")) return;
-      var mw = window.getComputedStyle(el).maxWidth;
-      if (mw && mw !== "none" && parseFloat(mw) > 0 && parseFloat(mw) < 900) {
-        el.style.setProperty("max-width", "52rem", "important");
-      }
-    });
+    // Widen transcript on larger screens
+    if (window.innerWidth >= 768) {
+      document.querySelectorAll("main, [class*='prose'], [class*='markdown']").forEach(function (el) {
+        if (el.closest("#app-sidebar, #bt-history-panel, form")) return;
+        var mw = window.getComputedStyle(el).maxWidth;
+        if (mw && mw !== "none" && parseFloat(mw) > 0 && parseFloat(mw) < 900) {
+          el.style.setProperty("max-width", "52rem", "important");
+        }
+      });
+    }
   }
 
 

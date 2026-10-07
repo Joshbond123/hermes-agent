@@ -454,3 +454,37 @@ body.bt-chat-mode .bt-activity-toggle {
 
 body.bt-chat-mode [data-bt-metrics-banner="1"] { display: none !important; height: 0 !important; overflow: hidden !important; }
 body.bt-chat-mode header[data-bt-header="mobile-hidden"] { display: none !important; height: 0 !important; min-height: 0 !important; padding: 0 !important; border: none !important; overflow: hidden !important; }
+
+/* Force two-header on ALL viewports */
+body.bt-chat-mode header[data-bt-header="mobile-hidden"],
+body.bt-chat-mode header[data-bt-header="suppressed"] {
+  display: none !important;
+  height: 0 !important;
+  min-height: 0 !important;
+  max-height: 0 !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  border: none !important;
+  overflow: hidden !important;
+  visibility: hidden !important;
+}
+body.bt-chat-mode [data-bt-metrics-banner="1"],
+body.bt-chat-mode [data-bt-offline-banner="1"] {
+  display: none !important;
+  height: 0 !important;
+  overflow: hidden !important;
+}
+/* Compact the two remaining headers on mobile */
+@media (max-width: 767px) {
+  body.bt-chat-mode header[data-bt-header="app"],
+  body.bt-chat-mode header[data-bt-header="chat"] {
+    height: 48px !important;
+    min-height: 48px !important;
+    max-height: 48px !important;
+    padding-left: 0.5rem !important;
+    padding-right: 0.5rem !important;
+  }
+  body.bt-chat-mode header[data-bt-header="app"] {
+    border-bottom: 0.5px solid #2f3336 !important;
+  }
+}
