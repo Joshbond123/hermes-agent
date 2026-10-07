@@ -819,6 +819,8 @@ include = [
   "pm.*",
   "tools",
   "tools.*",
+  "blackthorn",
+  "blackthorn.*",
 ]
 
 [tool.setuptools.package-data]
