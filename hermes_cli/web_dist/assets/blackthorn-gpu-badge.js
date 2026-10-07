@@ -1,6 +1,6 @@
 (function () {
   "use strict";
-  // blackthorn-ui v2026-10-07 activity+code redesign
+  // blackthorn-ui v2026-10-07b modals+history+pin
 
   var TOKEN = (window.__HERMES_SESSION_TOKEN__ || "");
   var MOCK_TITLES = [
@@ -432,14 +432,36 @@
           return;
         }
         list.innerHTML = "";
+        var pinIds = [];
+        try { pinIds = JSON.parse(localStorage.getItem("bt_pinned_sessions") || "[]"); } catch (e) {}
+        var titleMap = {};
+        try { titleMap = JSON.parse(localStorage.getItem("bt_session_titles") || "{}"); } catch (e) {}
+        sessions.sort(function (a, b) {
+          var ap = pinIds.indexOf(a.id); var bp = pinIds.indexOf(b.id);
+          var aPinned = ap >= 0; var bPinned = bp >= 0;
+          if (aPinned !== bPinned) return aPinned ? -1 : 1;
+          if (aPinned && bPinned) return ap - bp;
+          return (b.last_at || 0) - (a.last_at || 0);
+        });
+        var pinnedRendered = false; var restRendered = false;
         sessions.forEach(function (s) {
+          var isPinned = pinIds.indexOf(s.id) >= 0;
+          if (isPinned && !pinnedRendered) {
+            var sec = document.createElement("div"); sec.className = "bt-hist-section"; sec.textContent = "Pinned";
+            list.appendChild(sec); pinnedRendered = true;
+          }
+          if (!isPinned && !restRendered) {
+            var sec2 = document.createElement("div"); sec2.className = "bt-hist-section"; sec2.textContent = "Recent";
+            list.appendChild(sec2); restRendered = true;
+          }
           var row = document.createElement("div");
-          row.className = "bt-hist-item";
+          row.className = "bt-hist-item" + (isPinned ? " is-pinned" : "");
           row.dataset.sid = s.id;
           var titleBtn = document.createElement("button");
           titleBtn.type = "button";
           titleBtn.className = "bt-hist-title";
-          titleBtn.textContent = s.title || "New chat";
+          var displayTitle = titleMap[s.id] || s.title || "New chat";
+          titleBtn.textContent = (isPinned ? "📌 " : "") + displayTitle;
           titleBtn.addEventListener("click", function () {
             openSessionFast(s.id, s.title);
           });
@@ -482,6 +504,59 @@
     menu.className = "bt-ctx-menu";
     menu.setAttribute("role", "menu");
 
+    function pins() {
+      try { return JSON.parse(localStorage.getItem("bt_pinned_sessions") || "[]"); } catch (e) { return []; }
+    }
+    function savePins(arr) {
+      localStorage.setItem("bt_pinned_sessions", JSON.stringify(arr));
+    }
+    var pinned = pins().indexOf(session.id) >= 0;
+
+    var pinBtn = document.createElement("button");
+    pinBtn.type = "button";
+    pinBtn.innerHTML = "<span>" + (pinned ? "Unpin" : "Pin") + "</span>";
+    pinBtn.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      closeAllMenus();
+      var arr = pins().filter(function (id) { return id !== session.id; });
+      if (!pinned) arr.unshift(session.id);
+      savePins(arr);
+      loadHistory();
+    });
+
+    var ren = document.createElement("button");
+    ren.type = "button";
+    ren.innerHTML = "<span>Rename</span>";
+    ren.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      closeAllMenus();
+      var next = window.prompt("Rename chat", session.title || "New chat");
+      if (next == null) return;
+      next = String(next).trim();
+      if (!next) return;
+      fetch("/api/studio/sessions/" + encodeURIComponent(session.id), {
+        method: "PATCH", credentials: "include", headers: authHeaders(),
+        body: JSON.stringify({ title: next })
+      }).then(function (r) {
+        if (!r.ok) {
+          // local fallback map
+          try {
+            var map = JSON.parse(localStorage.getItem("bt_session_titles") || "{}");
+            map[session.id] = next;
+            localStorage.setItem("bt_session_titles", JSON.stringify(map));
+          } catch (e) {}
+        }
+        loadHistory();
+      }).catch(function () {
+        try {
+          var map = JSON.parse(localStorage.getItem("bt_session_titles") || "{}");
+          map[session.id] = next;
+          localStorage.setItem("bt_session_titles", JSON.stringify(map));
+        } catch (e) {}
+        loadHistory();
+      });
+    });
+
     var arch = document.createElement("button");
     arch.type = "button";
     arch.innerHTML = ICONS.archive + "<span>Archive</span>";
@@ -503,9 +578,22 @@
       confirmDelete(session);
     });
 
+    menu.appendChild(pinBtn);
+    menu.appendChild(ren);
     menu.appendChild(arch);
     menu.appendChild(del);
+    row.style.position = "relative";
     row.appendChild(menu);
+    // close on outside click
+    setTimeout(function () {
+      function onDoc(ev) {
+        if (!menu.contains(ev.target) && ev.target !== row.querySelector(".bt-menu-btn")) {
+          closeAllMenus();
+          document.removeEventListener("click", onDoc, true);
+        }
+      }
+      document.addEventListener("click", onDoc, true);
+    }, 0);
   }
 
   function confirmDelete(session) {
@@ -807,6 +895,36 @@
     });
   }
 
+  
+  function forceWireHeaderButtons() {
+    // System Prompt — bind any visible matching control
+    document.querySelectorAll("button, a").forEach(function (el) {
+      var t = (el.textContent || "").replace(/\s+/g, " ").trim();
+      if (/^System Prompt$/i.test(t) && !el.__btSpWired) {
+        el.__btSpWired = true;
+        el.addEventListener("click", function (ev) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          openSystemPrompt();
+        }, true);
+      }
+      if ((el.id === "bt-hist-btn" || /Open chat history/i.test(el.getAttribute("aria-label") || "")) && !el.__btHistWired) {
+        el.__btHistWired = true;
+        el.addEventListener("click", function (ev) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          ensureHistoryPanel();
+          document.body.classList.add("bt-history-open");
+          var panel = document.getElementById("bt-history-panel");
+          var bd = document.getElementById("bt-history-backdrop");
+          if (panel) panel.style.transform = "translateX(0)";
+          if (bd) { bd.style.display = "block"; bd.style.pointerEvents = "auto"; }
+          loadHistory();
+        }, true);
+      }
+    });
+  }
+
   function boot() {
     syncChatMode();
     ensureHistoryPanel();
@@ -816,6 +934,8 @@
     wireMobileEnter();
     watchRoute();
     tick();
+    forceWireHeaderButtons();
+    setInterval(forceWireHeaderButtons, 1500);
     var _btMoTimer = null;
     var mo = new MutationObserver(function () {
       if (_btMoTimer) return;
