@@ -1323,7 +1323,9 @@ function ChatBoot() {
   );
 }
 
-function ChatResumeRedirect() {
+/** The element of the single chat route: it must keep the same identity when the URL gains `/:sessionId`,
+ *  otherwise React Router would remount the chat and drop the live stream. */
+function ChatEntry() {
   const { search } = useLocation();
   const q = new URLSearchParams(search);
   const id = q.get("resume") || q.get("session");
@@ -1339,8 +1341,7 @@ export default function App() {
       <Suspense fallback={<ChatBoot />}>
         <Routes>
           <Route path="/" element={<Navigate to="/chat" replace />} />
-          <Route path="/chat" element={<ChatResumeRedirect />} />
-          <Route path="/chat/:sessionId" element={<ChatApp />} />
+          <Route path="/chat/:sessionId?" element={<ChatEntry />} />
           <Route path="*" element={<Navigate to="/chat" replace />} />
         </Routes>
       </Suspense>

@@ -248,14 +248,14 @@ export function Welcome({
       ) : (
         <p className="bt-welcome-gpu bt-ok">The GPU is ready.</p>
       )}
-      <div className="bt-suggestions" role="list">
+      <div className="bt-suggestions" role="group" aria-label="Suggested prompts">
         {[
           "Explain how TCP congestion control works, with a short example.",
           "Write a Python function that merges overlapping intervals, and test it.",
           "What are the latest developments in open-weight language models?",
           "Check how much disk space and GPU memory this machine has.",
         ].map((t) => (
-          <button key={t} type="button" role="listitem" className="bt-suggestion" onClick={() => onPick(t)}>
+          <button key={t} type="button" className="bt-suggestion" onClick={() => onPick(t)}>
             {t}
           </button>
         ))}

@@ -116,10 +116,13 @@ export const btApi = {
 
   version: () => request<VersionInfo>("GET", "/api/blackthorn/version"),
 
-  /** Upload to the managed files area and return the path the chat should reference. */
+  /** Upload into the managed files area (the stock endpoint needs an absolute path under its root). */
   uploadAttachment: async (file: File): Promise<{ path: string; name: string }> => {
     const safe = file.name.replace(/[^A-Za-z0-9._-]+/g, "_").slice(-80) || "file";
-    const target = `uploads/${Date.now().toString(36)}-${safe}`;
+    const listing = await stockApi.listFiles("");
+    const root = String(listing.path || "").replace(/\/+$/, "");
+    if (!root) throw new Error("the server did not report a files folder to upload into");
+    const target = `${root}/uploads/${Date.now().toString(36)}-${safe}`;
     const res = await stockApi.uploadFile(target, file, true);
     return { path: res.path || target, name: file.name };
   },
