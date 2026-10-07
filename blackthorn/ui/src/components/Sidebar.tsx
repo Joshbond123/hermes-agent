@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { Session, VersionInfo } from '../types'
 import { groupLabel } from '../util'
-import { ChevronIcon, CloseIcon, DotsIcon, PlusIcon } from './Icons'
+import { ChevronIcon, CloseIcon, DotsIcon, PlusIcon, SettingsIcon } from './Icons'
 import { Menu } from './Menu'
 
 export interface SidebarProps {
@@ -23,8 +23,7 @@ export interface SidebarProps {
   onDelete: (session: Session) => void
   onLoadArchived: () => void
   onRetry: () => void
-  theme: 'system' | 'light' | 'dark'
-  onTheme: (t: 'system' | 'light' | 'dark') => void
+  onSettings: () => void
   version: VersionInfo | null
 }
 
@@ -124,19 +123,16 @@ export function Sidebar(props: SidebarProps) {
           )}
         </nav>
         <div className="sidebar-foot" data-testid="sidebar-foot">
-          <label className="field row">
-            <span>Theme</span>
-            <select value={props.theme} onChange={(e) => props.onTheme(e.target.value as 'system' | 'light' | 'dark')} data-testid="theme-select" aria-label="Theme">
-              <option value="system">System</option><option value="dark">Dark</option><option value="light">Light</option>
-            </select>
-          </label>
-          {props.version && (
-            <div className="muted tiny" data-testid="version-foot" title={`UI build ${props.version.ui?.hash ?? 'unknown'}`}>
-              Blackthorn v{props.version.version} · {props.version.commit.slice(0, 7)}
-              {props.version.integrity?.drift?.length ? <span className="integrity" role="alert" data-testid="integrity-warning"> · deployed files differ from the commit</span> : null}
-              {props.version.overlay?.active ? <span className="integrity" role="alert" data-testid="overlay-warning"> · a code overlay is active (running code may differ from Git)</span> : null}
-            </div>
-          )}
+          <div className="sidebar-foot-row">
+            <button type="button" className="icon-btn" onClick={props.onSettings} aria-label="Settings" data-testid="settings-open">
+              <SettingsIcon />
+            </button>
+            {props.version && (
+              <div className="muted tiny" data-testid="version-foot" title={`UI build ${props.version.ui?.hash ?? 'unknown'}`}>
+                Blackthorn v{props.version.version} · {props.version.commit.slice(0, 7)}
+              </div>
+            )}
+          </div>
         </div>
       </aside>
       {narrow && open && <div className="scrim" onClick={props.onClose} data-testid="scrim" />}

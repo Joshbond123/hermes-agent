@@ -361,7 +361,7 @@ async def test_layout_has_no_horizontal_overflow_and_controls_fit(pages, ui_stac
     await page.wait_for_selector(DONE, timeout=15000)
     overflow = await page.evaluate("() => [document.documentElement.scrollWidth, innerWidth, document.body.scrollWidth]")
     assert overflow[0] <= overflow[1] and overflow[2] <= overflow[1], overflow          # the page itself never scrolls sideways
-    for tid in ("sidebar-toggle", "prompt-button", "gpu-button", "composer-input", "send"):
+    for tid in ("sidebar-toggle", "gpu-button", "composer-input", "send"):
         box = await page.get_by_test_id(tid).bounding_box()
         assert box is not None and box["x"] >= -1 and box["x"] + box["width"] <= width + 1, (tid, box)
         assert box["y"] >= 0 and box["y"] + box["height"] <= height + 1, (tid, box)
@@ -372,7 +372,9 @@ async def test_layout_has_no_horizontal_overflow_and_controls_fit(pages, ui_stac
 # ====================================================================================================== header controls
 async def test_system_prompt_button_loads_saves_and_applies(pages, ui_stack):
     page = await pages.new()
-    await page.get_by_test_id("prompt-button").click()
+    await page.get_by_test_id("settings-open").click()
+    await page.get_by_test_id("settings-dialog").wait_for()
+    await page.get_by_test_id("open-system-prompt").click()
     dlg = page.get_by_test_id("prompt-dialog")
     await dlg.wait_for()
     box = page.get_by_test_id("prompt-input")
@@ -384,7 +386,8 @@ async def test_system_prompt_button_loads_saves_and_applies(pages, ui_stack):
     await page.keyboard.press("Escape")
     assert await page.get_by_test_id("prompt-dialog").count() == 0
     await page.reload()
-    await page.get_by_test_id("prompt-button").click()
+    await page.get_by_test_id("settings-open").click()
+    await page.get_by_test_id("open-system-prompt").click()
     await page.wait_for_function("() => document.querySelector('[data-testid=prompt-input]').value.includes('pirate')")
     await page.keyboard.press("Escape")
     await chat(ui_stack, page, "ahoy", "Arr!")
@@ -393,7 +396,10 @@ async def test_system_prompt_button_loads_saves_and_applies(pages, ui_stack):
 
 async def test_prompt_and_gpu_buttons_work_on_mobile_too(pages, ui_stack):
     page = await pages.new(mobile=True)
-    await page.get_by_test_id("prompt-button").tap()
+    await page.get_by_test_id("sidebar-toggle").tap()
+    await page.get_by_test_id("settings-open").tap()
+    await page.get_by_test_id("settings-dialog").wait_for()
+    await page.get_by_test_id("open-system-prompt").tap()
     await page.get_by_test_id("prompt-dialog").wait_for()
     box = await page.get_by_test_id("prompt-dialog").bounding_box()
     assert box["x"] >= 0 and box["x"] + box["width"] <= 390
@@ -525,6 +531,8 @@ async def test_text_attachment_is_uploaded_and_listed(pages, ui_stack, tmp_path)
 async def test_theme_selector_switches_and_remembers(pages, ui_stack):
     page = await pages.new(scheme="dark")
     bg_dark = await page.evaluate("() => getComputedStyle(document.body).backgroundColor")
+    await page.get_by_test_id("settings-open").click()
+    await page.get_by_test_id("settings-dialog").wait_for()
     await page.get_by_test_id("theme-select").select_option("light")
     bg_light = await page.evaluate("() => getComputedStyle(document.body).backgroundColor")
     assert bg_dark != bg_light

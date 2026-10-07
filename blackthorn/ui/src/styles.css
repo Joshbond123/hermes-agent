@@ -242,3 +242,10 @@ select { height: 32px; padding: 0 8px; border-radius: 8px; border: 1px solid var
 .sidebar-foot { flex: none; display: flex; flex-direction: column; gap: 8px; padding: 10px 12px calc(10px + env(safe-area-inset-bottom)); border-top: 1px solid var(--line); font-size: 12px; }
 .sidebar-foot .field.row { font-size: 12px; } .sidebar-foot select { height: 28px; }
 .integrity { color: var(--bad); font-weight: 600; }
+
+/* settings + sidebar foot */
+.sidebar-foot-row { display: flex; align-items: center; gap: 10px; }
+.sidebar-foot-row .muted { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.settings-body { display: flex; flex-direction: column; gap: 18px; padding: 4px 0 8px; min-width: min(420px, 86vw); }
+.settings-section { display: flex; flex-direction: column; gap: 10px; }
+.settings-h { margin: 0; font-size: 13px; font-weight: 600; letter-spacing: 0.02em; text-transform: uppercase; color: var(--muted); }

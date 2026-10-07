@@ -5,7 +5,7 @@ import { Composer, type AttachedFile } from './components/Composer'
 import { Confirm } from './components/Dialog'
 import { Header } from './components/Header'
 import { Sidebar } from './components/Sidebar'
-import { SystemPromptDialog } from './components/SystemPrompt'
+import { SettingsDialog } from './components/Settings'
 import { Toasts, type Toast } from './components/Toasts'
 import { summarize, useGpu } from './gpu'
 import { attachRun, startRun, type Outcome, type RunHandle } from './sse'
@@ -36,7 +36,7 @@ export default function App() {
   const [drawer, setDrawer] = useState(false)
   const sidebarOpen = narrow ? drawer : sidebarPref
   const [gpuOpen, setGpuOpen] = useState(false)
-  const [promptOpen, setPromptOpen] = useState(false)
+  const [settingsOpen, setSettingsOpen] = useState(false)
   const [deleting, setDeleting] = useState<Session | null>(null)
   const [deleteBusy, setDeleteBusy] = useState(false)
   const [query, setQuery] = useState('')
@@ -289,15 +289,15 @@ export default function App() {
         loaded={state.sessionsLoaded} error={state.sessionsError} currentId={chat.sessionId} query={query} onQuery={setQuery}
         onSelect={(id) => void openSession(id)} onNew={() => goNew()} onRename={onRename} onPin={onPin} onArchive={onArchive}
         onDelete={setDeleting} onLoadArchived={() => void loadArchived()} onRetry={() => void loadSessions(query.trim())}
-        theme={theme} onTheme={setTheme} version={version} />
+        onSettings={() => setSettingsOpen(true)} version={version} />
       <div className="main">
         <Header title={chat.title} sidebarOpen={sidebarOpen} onToggleSidebar={toggleSidebar} onNew={() => goNew()} gpu={gpu}
-          gpuOpen={gpuOpen} onToggleGpu={() => setGpuOpen((v) => !v)} onCloseGpu={() => setGpuOpen(false)} onPrompt={() => setPromptOpen(true)} />
+          gpuOpen={gpuOpen} onToggleGpu={() => setGpuOpen((v) => !v)} onCloseGpu={() => setGpuOpen(false)} />
         <Chat chat={chat} onRegenerate={() => void regenerate()} onRetryLoad={() => chat.sessionId && void openSession(chat.sessionId, false)} />
         <Composer busy={chat.run !== null} stopping={chat.run?.stopping ?? false} onSend={send} onStop={() => void stop()}
           onError={(t) => notify('error', t)} focusKey={chat.sessionId ?? 'new'} banner={banner} />
       </div>
-      {promptOpen && <SystemPromptDialog onClose={() => setPromptOpen(false)} onSaved={() => notify('info', 'System prompt saved.')} />}
+      {settingsOpen && <SettingsDialog theme={theme} onTheme={setTheme} onClose={() => setSettingsOpen(false)} onPromptSaved={() => notify('info', 'System prompt saved.')} />}
       {deleting && <Confirm title="Delete this chat?" danger confirmLabel="Delete" busy={deleteBusy}
         message={`“${deleting.title}” and all of its messages will be permanently deleted. This cannot be undone.`}
         onCancel={() => setDeleting(null)} onConfirm={() => void confirmDelete()} />}
