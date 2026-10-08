@@ -16,7 +16,7 @@ DEAD = {404, 410, 502, 503, 504, 521, 522, 523, 524, 530}
 DENY_PATTERNS = (
     r"rm\s+-rf\s+/(\s|$)", r"rm\s+-rf\s+/\*", r"\bmkfs", r"\bdd\s+if=", r"\bshutdown\b", r"\breboot\b",
     r":\(\)\s*\{", r">\s*/dev/sd", r"chmod\s+-R\s+777\s+/(\s|$)", r"\bmv\s+/(\s|$)", r"kill\s+-9\s+1\b", r"\bkillall5\b",
-    r"\bsudo\s+rm\b",
+    r"(sudo\s+)?rm\s+(-[a-zA-Z]*\s+)*\/(\s|$)",  # wiping the root filesystem, with or without sudo
 )
 
 
@@ -77,7 +77,7 @@ async def run_command(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
                                       data={"kind": "denied"})
     timeout = int(args.get("timeout_seconds") or 60)
     data = await ctx.computer.call("/computer/exec", {"command": cmd, "timeout_seconds": timeout, "cwd": args.get("cwd") or "."},
-                                   timeout=timeout + 25.0)
+                                   timeout=timeout + 30.0)
     out = str(data.get("output") or "")
     code = data.get("exit_code", -1)
     body, cut = clip(out, ctx.settings.tool_result_chars, "ends")
@@ -140,7 +140,7 @@ async def computer_info(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
 SCHEMAS = {
     "run_command": {"type": "object", "properties": {
         "command": {"type": "string", "minLength": 1, "maxLength": 6000, "description": "bash command"},
-        "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 300, "default": 60}}, "required": ["command"]},
+        "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 3600, "default": 60}}, "required": ["command"]},
     "list_files": {"type": "object", "properties": {"path": {"type": "string", "default": ".", "description": "directory"}}},
     "read_file": {"type": "object", "properties": {
         "path": {"type": "string", "minLength": 1}, "offset": {"type": "integer", "minimum": 0, "default": 0},
@@ -158,7 +158,7 @@ SCHEMAS = {
 def specs() -> list[ToolSpec]:
     return [
         ToolSpec("run_command", "Run a bash command on the remote Linux computer (Python, GPU). Time-limited.",
-                 SCHEMAS["run_command"], run_command, timeout=330.0, kind="exec", describe=lambda a: f"$ {a.get('command', '')}"),
+                 SCHEMAS["run_command"], run_command, timeout=3660.0, kind="exec", describe=lambda a: f"$ {a.get('command', '')}"),
         ToolSpec("list_files", "List a remote workspace directory.", SCHEMAS["list_files"], list_files,
                  timeout=45.0, describe=lambda a: str(a.get("path") or ".")),
         ToolSpec("read_file", "Read a remote text file (offset to page).", SCHEMAS["read_file"], read_file,

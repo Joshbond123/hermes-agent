@@ -2,7 +2,7 @@ import { memo, useEffect, useRef, useState } from 'react'
 import type { Phase } from '../state'
 import type { Message, Part, ToolPart } from '../types'
 import { Markdown } from '../Markdown'
-import { copyText, formatDuration } from '../util'
+import { copyText, formatDuration, formatElapsed } from '../util'
 import { ChevronIcon } from './Icons'
 
 const LABELS: Record<string, string> = {
@@ -11,21 +11,39 @@ const LABELS: Record<string, string> = {
 }
 const label = (name: string) => LABELS[name] ?? name.replace(/_/g, ' ')
 
+/** Re-render every second while `active` so live elapsed timers tick. */
+function useTick(active: boolean) {
+  const [, setN] = useState(0)
+  useEffect(() => {
+    if (!active) return
+    const id = setInterval(() => setN((n) => n + 1), 1000)
+    return () => clearInterval(id)
+  }, [active])
+}
+
 function Tool({ t }: { t: ToolPart }) {
   const [more, setMore] = useState(false)
-  const hasDetail = Boolean(t.output || t.sources?.length || t.error)
+  const running = t.status === 'running'
+  useTick(running)
+  const liveMs = running && t.startedAt ? Date.now() - t.startedAt : null
+  const hasDetail = Boolean(t.output || t.sources?.length || t.error || t.answer)
   return (
     <li className={`tool tool-${t.status}`} data-testid="tool-row" data-tool={t.name} data-status={t.status}>
       <div className="tool-line">
         <span className="tool-dot" aria-label={t.status} />
         <span className="tool-name">{label(t.name)}</span>
         {t.args && <code className="tool-args" title={t.args}>{t.args}</code>}
-        <span className="tool-result">{t.status === 'running' ? 'running…' : t.error ? t.error : t.summary}</span>
-        {t.duration_ms != null && t.status !== 'running' && <span className="tool-time">{formatDuration(t.duration_ms)}</span>}
+        <span className="tool-result">{running ? (liveMs != null ? `running… ${formatElapsed(liveMs / 1000)}` : 'running…') : t.error ? t.error : t.summary}</span>
+        {t.duration_ms != null && !running && <span className="tool-time">{formatDuration(t.duration_ms)}</span>}
         {hasDetail && <button type="button" className="link tiny" aria-expanded={more} onClick={() => setMore((v) => !v)}>{more ? 'Hide' : 'Details'}</button>}
       </div>
       {more && (
         <div className="tool-detail">
+          {t.answer && (
+            <div className="tool-answer" data-testid="tool-answer">
+              <span className="tool-answer-label">Found</span> {t.answer}
+            </div>
+          )}
           {t.sources && t.sources.length > 0 && (
             <ul className="sources">{t.sources.map((s) => (
               <li key={s.url}>
@@ -63,13 +81,30 @@ function Activity({ tools, live }: { tools: ToolPart[]; live: boolean }) {
   )
 }
 
-function Thinking({ since }: { since: number }) {
-  const [, tick] = useState(0)
-  useEffect(() => { const id = setInterval(() => tick((n) => n + 1), 500); return () => clearInterval(id) }, [])
-  return <div className="waiting" data-testid="thinking" role="status">Thinking <span className="muted">{Math.max(0, Math.round((Date.now() - since) / 1000))}s</span></div>
+/**
+ * The always-visible progress line for a live run: what the agent is doing right now and
+ * for how long. Serious agent UIs never leave a blank idle state while work is happening.
+ */
+function StatusLine({ phase, since, tools, steps }: { phase: Phase | null; since: number; tools: ToolPart[]; steps: number }) {
+  useTick(true)
+  const elapsed = Math.max(0, (Date.now() - since) / 1000)
+  const running = tools.filter((t) => t.status === 'running')
+  let text: string
+  if (phase === 'connecting') text = 'Connecting to the agent…'
+  else if (running.length > 0) {
+    const names = running.map((t) => label(t.name)).join(', ')
+    const oldest = running.reduce((n, t) => Math.max(n, t.startedAt ?? since * 1000), 0)
+    text = `Working — ${names} · ${formatElapsed((Date.now() - oldest) / 1000)}`
+  } else if (phase === 'thinking') text = `Thinking · ${formatElapsed(elapsed)}`
+  else text = `Working · ${formatElapsed(elapsed)}`
+  return (
+    <div className="status-line" data-testid="status-line" role="status" data-phase={phase ?? ''}>
+      <span className="status-pulse" aria-hidden="true" />
+      <span className="status-text">{text}</span>
+      {steps > 0 && <span className="muted tiny">step {steps}{tools.length ? ` · ${tools.length} tool call${tools.length > 1 ? 's' : ''}` : ''}</span>}
+    </div>
+  )
 }
-
-const Dots = () => <div className="waiting dots" data-testid="waiting" role="status" aria-label="Waiting for the model"><i /><i /><i /></div>
 
 function renderParts(parts: Part[], live: boolean) {
   const out: React.ReactNode[] = []
@@ -112,7 +147,6 @@ export const MessageView = memo(function MessageView({ m, live, phase, isLast, b
   }
 
   const hasText = m.parts.some((p) => p.type === 'text' && p.text.trim())
-  const lastIsTool = m.parts.length > 0 && m.parts[m.parts.length - 1].type === 'tool'
   const err = m.error ?? m.meta?.error
   const retryable = m.status === 'error' || m.status === 'interrupted'
   return (
@@ -120,8 +154,20 @@ export const MessageView = memo(function MessageView({ m, live, phase, isLast, b
       <div className="msg-label">Blackthorn</div>
       <div className="msg-body">
         {renderParts(m.parts, live)}
-        {live && m.thinkingSince ? <Thinking since={m.thinkingSince} /> : null}
-        {live && !m.thinkingSince && (phase === 'connecting' || phase === 'waiting') && (!m.parts.length || lastIsTool) ? <Dots /> : null}
+        {live ? (
+          m.thinkingSince ? (
+            <div className="waiting" data-testid="thinking" role="status">
+              Thinking <span className="muted">{Math.max(0, Math.round((Date.now() - m.thinkingSince) / 1000))}s</span>
+            </div>
+          ) : (
+            <StatusLine
+              phase={phase}
+              since={(m.created_at ?? Date.now() / 1000) * 1000}
+              tools={m.parts.filter((p): p is ToolPart => p.type === 'tool')}
+              steps={m.parts.filter((p): p is ToolPart => p.type === 'tool').reduce((n, t) => Math.max(n, t.step ?? 0), 0)}
+            />
+          )
+        ) : null}
         {m.notices?.map((n, i) => <div key={i} className={`notice ${n.level}`} data-testid="notice">{n.text}</div>)}
         {m.status === 'cancelled' && <div className="status-note" data-testid="stopped-note">{hasText ? 'Stopped.' : 'Stopped before anything was written.'}</div>}
         {m.status === 'length' && <div className="notice warn">The answer reached the model's length limit and was cut off.</div>}

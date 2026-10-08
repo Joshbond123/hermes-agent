@@ -15,7 +15,8 @@ from pathlib import Path
 from typing import Mapping, Optional
 
 REQUIRED_ENV = ("CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_D1_DATABASE_ID", "KAGGLE_USERNAME", "KAGGLE_API_TOKEN")
-OPTIONAL_ENV = ("QWEN38_NUM_CTX", "QWEN38_QUANT", "QWEN38_CACHE_DATASET")
+OPTIONAL_ENV = ("QWEN38_NUM_CTX", "QWEN38_QUANT", "QWEN38_CACHE_DATASET",
+                "CLOUDFLARED_TUNNEL_TOKEN", "BLACKTHORN_TUNNEL_HOSTNAME", "PREFER_LLAMA")
 SERVER_SOURCE = Path(__file__).resolve().parent.parent / "kaggle_cyber_ornith" / "cyber_ornith_server.py"
 
 

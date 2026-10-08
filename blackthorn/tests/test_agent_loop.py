@@ -249,15 +249,27 @@ async def test_gpu_off_is_a_clear_409_and_nothing_is_persisted(stack):
     assert listing["sessions"] == []
 
 
-async def test_midstream_connection_drop_keeps_partial_and_reports_error(stack):
-    stack.backend.queue([*say("Part one of the answer, ", 2), pause(0.05), {"drop": 1}])
+async def test_midstream_connection_drop_keeps_partial_and_continues(stack):
+    """A dropped transport never kills the run: the partial is kept and the model continues from the cut point."""
+    stack.backend.queue([*say("Part one of the answer, ", 2), pause(0.05), {"drop": 1}],
+                        [*say("and part two finishes it."), finish("stop")])
     out = await stack.stream({"message": "hello"})
-    assert out.end["status"] == "error"
-    assert out.of("error")[0]["code"] == "gpu_dropped"
+    assert out.end["status"] == "stop"
+    assert "Part one of the answer, " in out.text and "and part two finishes it." in out.text
+    assert any("dropped mid-answer" in n["text"] for n in out.of("notice"))
     data = await session_messages(stack, out.session_id)
     last = data["messages"][-1]
-    assert last["status"] == "error" and last["content"].startswith("Part one")
-    assert "error" in last["meta"]
+    assert last["status"] == "stop" and last["content"].startswith("Part one")
+
+
+async def test_repeated_drops_beyond_the_recovery_budget_end_in_honest_error(stack):
+    for _ in range(4):                                                                    # one per attempt: the 4th exhausts the budget
+        stack.backend.queue([*say("partial "), {"drop": 1}])
+    out = await stack.stream({"message": "hello"})
+    assert out.end["status"] == "error" and out.of("error")[0]["code"] == "gpu_dropped"
+    data = await session_messages(stack, out.session_id)
+    last = data["messages"][-1]
+    assert last["status"] == "error" and last["content"].startswith("partial")
 
 
 async def test_retryable_upstream_failure_recovers_once(stack):
@@ -449,7 +461,7 @@ async def test_regenerate_replaces_the_last_answer(stack):
 
 
 async def test_failed_answer_can_be_retried(stack):
-    stack.backend.queue([*say("partial "), {"drop": 1}])
+    stack.backend.queue({"http_error": 503, "message": "down"}, {"http_error": 503, "message": "down"})
     a = await stack.stream({"message": "question"})
     assert a.end["status"] == "error"
     stack.backend.queue([*say("full answer"), finish("stop")])
@@ -508,7 +520,7 @@ async def test_every_run_marks_the_gpu_busy_and_always_releases_it(stack):
     out = await stack.stream({"message": "run something"})
     assert out.end["status"] == "stop" and rec.events == ["start", "touch", "finish"]
     rec.events.clear()
-    stack.backend.queue([{"drop": 1}])
+    stack.backend.queue({"http_error": 503, "message": "down"}, {"http_error": 503, "message": "down"})
     bad = await stack.stream({"message": "this one fails"})
     assert bad.end["status"] == "error" and rec.events == ["start", "finish"]            # released even on failure
     rec.events.clear()
@@ -535,3 +547,39 @@ async def test_chat_activity_resets_the_real_controllers_idle_clock(stack):
     await stack.stream({"message": "hi"})
     after = ctl.activity_snapshot()
     assert after["idle_seconds"] < 10 and after["active_tasks"] == 0                        # clock reset, nothing left "running"
+
+
+# ---------------------------------------------------------------------------------------------------- autonomy (critical fixes)
+async def test_many_tool_calls_in_one_step_are_all_executed_none_skipped(stack):
+    """A step may legitimately fan out past any per-step cap: no call is ever dropped or marked skipped."""
+    calls = [sh(f"echo {i}", cid=f"p{i}", index=i) for i in range(20)]
+    stack.backend.queue([*calls, finish("tool_calls")], [*say("all done"), finish("stop")])
+    out = await stack.stream({"message": "run everything"})
+    ends = out.of("tool.end")
+    assert len(ends) == 20
+    assert all(e["status"] == "ok" for e in ends)
+    assert [e["id"] for e in ends] == [f"p{i}" for i in range(20)]       # transcript keeps call order
+    assert "skipped" not in json.dumps(out.events)
+    assert out.end["tool_calls"] == 20 and out.end["status"] == "stop"
+    assert len(stack.backend.computer_calls) == 20
+
+
+async def test_tool_rows_report_real_durations_not_zero(stack):
+    stack.backend.exec_delay = 0.25
+    stack.backend.queue([sh("sleep-ish", cid="d1"), finish("tool_calls")], [*say("done"), finish("stop")])
+    out = await stack.stream({"message": "time it"})
+    end = out.of("tool.end")[0]
+    assert (end.get("duration_ms") or 0) >= 200
+
+
+async def test_dropped_stream_mid_answer_is_continued_not_killed(stack):
+    """One dropped packet after 40 minutes of work must not kill the run: keep the partial and continue."""
+    stack.backend.queue(
+        [*say("The first half of the ", 2), {"drop": True}],
+        [*say("answer completes here."), finish("stop")],
+    )
+    out = await stack.stream({"message": "go"})
+    assert out.end["status"] == "stop"
+    assert "The first half of the " in out.text and "answer completes here." in out.text
+    assert any("dropped mid-answer" in n["text"] for n in out.of("notice"))
+    assert out.end["duration_ms"] > 0

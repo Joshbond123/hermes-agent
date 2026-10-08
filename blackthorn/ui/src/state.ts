@@ -77,13 +77,13 @@ export function applyToMessage(msg: Message, ev: ServerEvent): Message {
     }
     case 'tool.start': {
       if (msg.parts.some((p) => p.type === 'tool' && p.id === ev.id)) return msg
-      const part: ToolPart = { type: 'tool', id: ev.id, name: ev.name, status: 'running', args: ev.summary, summary: '', step: ev.step }
+      const part: ToolPart = { type: 'tool', id: ev.id, name: ev.name, status: 'running', args: ev.summary, summary: '', step: ev.step, startedAt: Date.now() }
       return { ...msg, parts: [...msg.parts, part], thinkingSince: null }
     }
     case 'tool.end': {
       const parts: Part[] = msg.parts.map((p) =>
         p.type === 'tool' && p.id === ev.id
-          ? { ...p, status: ev.status, summary: ev.summary, duration_ms: ev.duration_ms, error: ev.error ?? undefined, output: ev.output ?? undefined, sources: ev.sources ?? undefined, exit_code: ev.exit_code ?? undefined }
+          ? { ...p, status: ev.status, summary: ev.summary, duration_ms: ev.duration_ms, error: ev.error ?? undefined, output: ev.output ?? undefined, sources: ev.sources ?? undefined, answer: ev.answer ?? undefined, exit_code: ev.exit_code ?? undefined }
           : p,
       )
       return { ...msg, parts }

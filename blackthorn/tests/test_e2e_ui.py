@@ -203,9 +203,10 @@ async def test_completed_response_survives_refresh_and_reopening_from_history(pa
 
 async def test_failed_response_keeps_partial_text_and_retry_replaces_it(pages, ui_stack):
     page = await pages.new()
-    ui_stack.backend.queue([*say("Partial answer so far ", 1), pause(0.05), {"drop": 1}])
+    for _ in range(4):                                                                    # exactly the recovery budget: must end honest, partial kept
+        ui_stack.backend.queue([*say("Partial answer so far ", 1), pause(0.05), {"drop": 1}])
     await send(page, "question")
-    await page.wait_for_selector("[data-role=assistant][data-status=error]", timeout=15000)
+    await page.wait_for_selector("[data-role=assistant][data-status=error]", timeout=30000)
     assert "Partial answer so far" in await last_assistant_text(page)
     assert await page.get_by_test_id("error-note").count() == 1
     ui_stack.backend.queue([*say("The full answer.", 1), finish("stop")])

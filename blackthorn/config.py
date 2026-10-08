@@ -27,8 +27,10 @@ class Settings:
     sqlite_path: str = field(default_factory=lambda: os.environ.get("BLACKTHORN_SQLITE_PATH", "blackthorn-dev.sqlite3"))
     session_source: str = "blackthorn-studio"  # value of sessions.source for chats created here
 
-    # ---- model context budget (llama-server -c should match; default 16k for agent tool loops) --------
-    context_tokens: int = field(default_factory=lambda: _int("BLACKTHORN_CONTEXT_TOKENS", 16384))
+    # ---- model context budget (MUST match the Kaggle engine window: QWEN38_NUM_CTX, default 8192) ----
+    # When these disagree the engine rejects long steps (ContextOverflow) and the run
+    # thrashes on trimming — one of the real causes of mid-task interruptions.
+    context_tokens: int = field(default_factory=lambda: _int("BLACKTHORN_CONTEXT_TOKENS", 8192))
     completion_reserve_tokens: int = field(default_factory=lambda: _int("BLACKTHORN_COMPLETION_RESERVE", 2048))
     chars_per_token: float = 3.2  # conservative for English + code
 
@@ -38,7 +40,7 @@ class Settings:
     # a single model response exploding into dozens of calls.
     max_steps: int = field(default_factory=lambda: _int("BLACKTHORN_MAX_STEPS", 160))
     max_tool_calls: int = field(default_factory=lambda: _int("BLACKTHORN_MAX_TOOL_CALLS", 400))
-    max_calls_per_step: int = field(default_factory=lambda: _int("BLACKTHORN_MAX_CALLS_PER_STEP", 16))
+    max_calls_per_step: int = field(default_factory=lambda: _int("BLACKTHORN_MAX_CALLS_PER_STEP", 16))  # concurrency
     max_repeat_calls: int = 2          # identical (tool, args) executions allowed per run
     max_malformed_calls: int = 8
     run_timeout_s: float = field(default_factory=lambda: _float("BLACKTHORN_RUN_TIMEOUT", 14400.0))

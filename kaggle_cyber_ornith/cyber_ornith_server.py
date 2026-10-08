@@ -2,10 +2,11 @@
 # 🛡️ Qwen3.8-27B-Uncensored — Kaggle dual-T4 API Server (cache-aware fast start)
 # ==============================================================================
 # Model : ressl/Qwen3.8-27B-uncensored-GGUF (Q4_K_M ~16.8 GB)
-# Engine: llama.cpp CUDA (built on-device) with layer split across dual T4
-# Tunnel: Cloudflare Quick Tunnel
+# Engine: llama.cpp CUDA (built on-device) pinned to GPU 0 (split-mode none, layers that
+#         do not fit spill to system RAM — never onto GPU 1)
+# Tunnel: stable Cloudflare named tunnel on blacktornagent.ing.ng (quick tunnel only as fallback)
 # Auth  : Bearer API key
-# GPUs  : T4 #0 hosts the model; T4 #1 reserved for agent computer tasks
+# GPUs  : T4 #0 hosts the model ONLY; T4 #1 is the agent computer (commands, files, GPU tasks)
 #
 # Boot order (cache first, never re-download if possible):
 #   1. Persistent /kaggle/working GGUF or ollama store
@@ -66,7 +67,7 @@ OLLAMA_PORT = 11434
 OLLAMA_NUM_PARALLEL = int(os.environ.get("OLLAMA_NUM_PARALLEL", "1"))
 OLLAMA_MAX_LOADED_MODELS = "1"
 OLLAMA_FLASH_ATTENTION = "1"
-DEFAULT_NUM_CTX = int(os.environ.get("QWEN38_NUM_CTX", "4096"))
+DEFAULT_NUM_CTX = int(os.environ.get("QWEN38_NUM_CTX", "8192"))
 DEFAULT_NUM_GPU_LAYERS = int(os.environ.get("QWEN38_NUM_GPU_LAYERS", "999"))  # offload all layers to GPU
 TELEMETRY_TOPIC = "qwen38_kaggle_blackthorn_8492"
 MAX_RUNTIME_SECONDS = int(os.environ.get("MAX_RUNTIME_SECONDS", str(11 * 3600)))
@@ -707,6 +708,8 @@ def start_ollama_daemon(ollama_bin: str) -> None:
     env["OLLAMA_ORIGINS"] = "*"
     env["OLLAMA_KEEP_ALIVE"] = "-1"
     env["OLLAMA_MODELS"] = PERSIST_MODELS_DIR
+    # GPU split: the model engine may never touch GPU 1 — that card belongs to the agent computer.
+    env["CUDA_VISIBLE_DEVICES"] = "0"
     subprocess.Popen([ollama_bin, "serve"], env=env,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for _ in range(60):
@@ -814,47 +817,70 @@ def start_llama_server(gguf_path: str) -> None:
     binary = ensure_llama_server_bin()
     # Context window: prefer env, default 16384 so multi-step agent turns fit.
     try:
-        n_ctx = int(os.environ.get("QWEN38_NUM_CTX") or os.environ.get("BLACKTHORN_CONTEXT_TOKENS") or "16384")
+        n_ctx = int(os.environ.get("QWEN38_NUM_CTX") or os.environ.get("BLACKTHORN_CONTEXT_TOKENS") or "8192")
     except ValueError:
-        n_ctx = 16384
+        n_ctx = 8192
     n_ctx = max(4096, min(n_ctx, 32768))
     log(f"Starting CUDA llama-server on :{OLLAMA_PORT} with {gguf_path} (GPU0 only, ctx={n_ctx})")
-    logf = open("/tmp/llama_server.log", "w")
+    logf_path = "/tmp/llama_server.log"
     # Pin the process to GPU 0 so GPU 1 stays available for agent tasks.
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = "0"
-    cmd = [
-        binary,
-        "-m", gguf_path,
-        "-ngl", "99",
-        "-c", str(n_ctx),
-        "--host", "0.0.0.0",
-        "--port", str(OLLAMA_PORT),
-        "-np", "1",
-        "--main-gpu", "0",
-        "--split-mode", "none",
-        "--flash-attn", "on",
-        "-b", "512",
-        "-ub", "256",
-        "--no-mmap",
-    ]
-    subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, env=env)
-    # Model load can take 60-180 s on first start
-    for i in range(240):
-        try:
-            urllib.request.urlopen(f"http://127.0.0.1:{OLLAMA_PORT}/health", timeout=3)
-            log("llama-server healthy")
-            # mark engine mode for gateway
+
+    def _launch(ngl: str):
+        cmd = [
+            binary,
+            "-m", gguf_path,
+            "-ngl", ngl,
+            "-c", str(n_ctx),
+            "--host", "0.0.0.0",
+            "--port", str(OLLAMA_PORT),
+            "-np", "1",
+            "--main-gpu", "0",
+            "--split-mode", "none",
+            "--flash-attn", "on",
+            "-b", "512",
+            "-ub", "256",
+            "--no-mmap",
+        ]
+        logf = open(logf_path, "w")
+        return subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, env=env)
+
+    def _wait(proc, seconds: int) -> bool:
+        for i in range(seconds // 2):
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{OLLAMA_PORT}/health", timeout=3)
+                return True
+            except Exception:
+                if proc.poll() is not None:
+                    return False  # crashed (e.g. CUDA OOM) — caller may retry with fewer layers
+                if i % 15 == 0:
+                    log(f"  waiting for llama-server... ({i*2}s)")
+                time.sleep(2)
+        return False
+
+    # The 27B Q4 weights (~15.7 GiB) can exceed one T4 once the KV cache is reserved.
+    # Ask for full offload first; if the engine cannot start, retry with fewer GPU layers.
+    # Every attempt is pinned to GPU 0: weights never land on GPU 1, no matter the fallback.
+    for ngl in ("99", "56", "40"):
+        proc = _launch(ngl)
+        if _wait(proc, 240):
+            log("llama-server healthy (ngl=" + ngl + ")")
             with open("/tmp/engine_mode.txt", "w") as fh:
                 fh.write("llama")
             return
+        log(f"llama-server did not come up with -ngl {ngl}; stopping it and retrying")
+        try:
+            proc.terminate()
+            proc.wait(timeout=10)
         except Exception:
-            if i % 15 == 0:
-                log(f"  waiting for llama-server... ({i*2}s)")
-            time.sleep(2)
-    # dump last log lines for diagnosis
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        time.sleep(2)
     try:
-        with open("/tmp/llama_server.log") as lf:
+        with open(logf_path) as lf:
             tail = lf.read()[-800:]
         log("llama-server log tail: " + tail)
     except Exception:
@@ -928,7 +954,7 @@ def register_model(ollama_bin: str, gguf_path: str) -> None:
     modelfile = "/tmp/Modelfile"
     with open(modelfile, "w") as fh:
         fh.write(f"FROM {gguf_path}\n")
-        fh.write(f"PARAMETER num_ctx 4096\n")
+        fh.write(f"PARAMETER num_ctx {DEFAULT_NUM_CTX}\n")
         fh.write(f"PARAMETER num_gpu 99\n")
         fh.write("PARAMETER temperature 0.6\n")
         fh.write("PARAMETER num_batch 256\n")
@@ -1062,27 +1088,49 @@ async def chat_completions(request: Request, dependencies=[Depends(verify_api_ke
     body["messages"] = messages
     if body.get("stream"):
         async def event_generator():
-            # Cloudflare quick tunnels return HTTP 524 if the origin is silent for ~100s.
-            # A comment frame starts the response immediately and repeats while the model thinks.
+            # Cloudflare edges cut an origin that stays silent for ~100s (HTTP 524).
+            # A comment frame opens the response immediately and repeats while the model thinks.
+            # Forwarder design: a reader task feeds a queue; the generator only *waits* on the
+            # queue, so a 15s timeout never cancels the in-flight upstream read (the previous
+            # asyncio.wait_for(agen.__anext__()) corrupted the stream on every ping).
             yield b": blackthorn-open\\n\\n"
             timeout = httpx.Timeout(connect=10.0, read=900.0, write=60.0, pool=10.0)
+            q = asyncio.Queue(maxsize=64)
+            DONE = object()
+
+            async def pump(resp):
+                try:
+                    async for chunk in resp.aiter_bytes():
+                        await q.put(chunk)
+                except Exception as exc:
+                    await q.put(("error", repr(exc)))
+                finally:
+                    await q.put(DONE)
+
             async with httpx.AsyncClient(timeout=timeout) as client:
                 async with client.stream("POST", f"{OLLAMA_URL}/v1/chat/completions", json=body) as resp:
                     if resp.status_code != 200:
                         err = await resp.aread()
                         yield b"data: " + err + b"\\n\\n"
                         return
-                    agen = resp.aiter_bytes().__aiter__()
-                    while True:
-                        try:
-                            chunk = await asyncio.wait_for(agen.__anext__(), timeout=15)
-                        except StopAsyncIteration:
-                            break
-                        except asyncio.TimeoutError:
-                            yield b": ping\\n\\n"
-                            continue
-                        if chunk:
-                            yield chunk
+                    reader = asyncio.create_task(pump(resp))
+                    try:
+                        while True:
+                            try:
+                                item = await asyncio.wait_for(q.get(), timeout=15)
+                            except asyncio.TimeoutError:
+                                yield b": ping\\n\\n"
+                                continue
+                            if item is DONE:
+                                break
+                            if isinstance(item, tuple) and item and item[0] == "error":
+                                yield ('data: {"error": {"message": "upstream: " + item[1][:200] + "}}\\n\\n').encode()
+                                break
+                            if item:
+                                yield item
+                    finally:
+                        if not reader.done():
+                            reader.cancel()
         return StreamingResponse(event_generator(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
     timeout = httpx.Timeout(connect=10.0, read=900.0, write=60.0, pool=10.0)
@@ -1125,12 +1173,17 @@ COMPUTER_ROOT = "/kaggle/working/blackthorn_workspace"
 _pathlib.Path(COMPUTER_ROOT).mkdir(parents=True, exist_ok=True)
 
 def _csafe(rel: str):
-    rel = (rel or ".").lstrip("/")
-    target = (_pathlib.Path(COMPUTER_ROOT) / rel).resolve()
-    root = _pathlib.Path(COMPUTER_ROOT).resolve()
-    if root not in target.parents and target != root:
-        raise HTTPException(status_code=400, detail="path escapes workspace: " + rel)
-    return target
+    # The agent computer is a real root machine: relative paths start in the workspace,
+    # absolute paths are used as given. No jail - legitimate agent work (system files,
+    # installs, /kaggle/input datasets) must not be blocked. Destructive commands are
+    # still refused at the tool layer.
+    rel = (rel or ".").strip()
+    if not rel:
+        rel = "."
+    path = _pathlib.Path(rel).expanduser()
+    if not path.is_absolute():
+        path = _pathlib.Path(COMPUTER_ROOT) / path
+    return path.resolve()
 
 @app.get("/computer/info")
 async def computer_info(_=Depends(verify_api_key)):
@@ -1143,9 +1196,17 @@ async def computer_info(_=Depends(verify_api_key)):
     except Exception:
         gpu = "unavailable"
     du = shutil.disk_usage(COMPUTER_ROOT)
+    try:
+        import getpass, os as _os
+        who = {"user": getpass.getuser(), "uid": _os.getuid(), "euid": _os.geteuid()}
+    except Exception:
+        who = {}
     return {
         "workspace": COMPUTER_ROOT,
         "hostname": platform.node(),
+        "identity": who,
+        "root_access": bool(who.get("euid") == 0),
+        "gpu_roles": {"0": "model", "1": "computer"},
         "platform": platform.platform(),
         "python": platform.python_version(),
         "gpu": gpu,
@@ -1161,7 +1222,8 @@ async def computer_exec(request: Request, _=Depends(verify_api_key)):
     cmd = str(body.get("command") or "").strip()
     if not cmd:
         raise HTTPException(status_code=400, detail="command required")
-    timeout = min(int(body.get("timeout_seconds") or 60), 600)
+    # Long jobs are legitimate: a build or a test suite must be allowed to finish.
+    timeout = min(int(body.get("timeout_seconds") or 60), 3600)
     cwd = COMPUTER_ROOT
     if body.get("cwd"):
         try:
@@ -1169,7 +1231,7 @@ async def computer_exec(request: Request, _=Depends(verify_api_key)):
         except Exception:
             cwd = COMPUTER_ROOT
     env = dict(os.environ)
-    env["HOME"] = COMPUTER_ROOT
+    env["HOME"] = cwd if os.path.isdir(cwd) else COMPUTER_ROOT
     env["PWD"] = cwd
     env["BLACKTHORN_WORKSPACE"] = COMPUTER_ROOT
     # GPU 0 hosts llama-server. Computer work is pinned to physical GPU 1 only.
@@ -1180,16 +1242,38 @@ async def computer_exec(request: Request, _=Depends(verify_api_key)):
             cmd, shell=True, cwd=cwd, env=env,
             capture_output=True, text=True, timeout=timeout,
         )
-    try:
-        proc = await _asyncio.to_thread(_run)
+    loop = _asyncio.get_running_loop()
+    fut = loop.run_in_executor(None, _run)
+
+    async def paced():
+        # A Cloudflare edge cuts an origin silent for ~100s (HTTP 524), and commands may
+        # run for minutes. Lead with whitespace (JSON parsers ignore it) and keep one
+        # heartbeat while the command works; the real JSON comes as the final chunk.
+        yield b" "
+        while not fut.done():
+            try:
+                await _asyncio.wait_for(_asyncio.shield(fut), timeout=15)
+            except _asyncio.TimeoutError:
+                yield b" "
+            except Exception:
+                break
+        try:
+            proc = fut.result()
+        except Exception as exc:
+            payload = {"ok": False, "exit_code": -1,
+                       "output": "error: " + type(exc).__name__ + ": " + str(exc),
+                       "cwd": cwd, "workspace": COMPUTER_ROOT, "host": "kaggle-computer"}
+            yield __import__("json").dumps(payload).encode("utf-8")
+            return
         out = (proc.stdout or "") + (proc.stderr or "")
         if len(out) > 120000:
             out = out[:100000] + "\\n... [truncated]"
-        return {"ok": True, "exit_code": proc.returncode, "output": out or "(no output)",
-                "cwd": cwd, "workspace": COMPUTER_ROOT, "host": "kaggle-computer"}
-    except Exception as exc:
-        return {"ok": False, "exit_code": -1, "output": "error: " + type(exc).__name__ + ": " + str(exc),
-                "cwd": cwd, "workspace": COMPUTER_ROOT, "host": "kaggle-computer"}
+        payload = {"ok": True, "exit_code": proc.returncode, "output": out or "(no output)",
+                   "cwd": cwd, "workspace": COMPUTER_ROOT, "host": "kaggle-computer"}
+        yield __import__("json").dumps(payload).encode("utf-8")
+
+    return StreamingResponse(paced(), media_type="application/json",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 @app.post("/computer/list_files")
 async def computer_list(request: Request, _=Depends(verify_api_key)):
@@ -1301,9 +1385,28 @@ def start_gateway() -> None:
     raise RuntimeError("Gateway did not come up on port 8000")
 
 
+TUNNEL_HOSTNAME = (os.environ.get("BLACKTHORN_TUNNEL_HOSTNAME") or "blacktornagent.ing.ng").strip()
+
+
 def launch_cloudflared(cloudflared_bin: str):
+    """Start the tunnel and return (proc, public_url).
+
+    Preferred: the stable named tunnel (remotely managed, token auth) fronted by
+    blacktornagent.ing.ng. The URL never changes across reboots/restarts, so the
+    Render side keeps a permanent endpoint instead of chasing quick-tunnel URLs.
+    Fallback: the ephemeral quick tunnel, only when no token is configured.
+    """
     cf_log_path = "/tmp/cloudflared.log"
     handle = open(cf_log_path, "w")
+    token = (os.environ.get("CLOUDFLARED_TUNNEL_TOKEN") or "").strip()
+    if token:
+        proc = subprocess.Popen(
+            [cloudflared_bin, "tunnel", "run", "--token", token,
+             "--no-autoupdate", "--protocol", "http2"],
+            stdout=handle, stderr=subprocess.STDOUT, text=True,
+        )
+        log(f"Stable tunnel: https://{TUNNEL_HOSTNAME} (named tunnel)")
+        return proc, f"https://{TUNNEL_HOSTNAME}"
     proc = subprocess.Popen(
         [cloudflared_bin, "tunnel", "--url", f"http://127.0.0.1:{GATEWAY_PORT}",
          "--no-autoupdate", "--protocol", "http2"],
@@ -1322,6 +1425,62 @@ def launch_cloudflared(cloudflared_bin: str):
             pass
         time.sleep(0.3)
     return proc, found
+
+
+
+def cleanup_model_downloads() -> int:
+    """Delete model weight downloads from the Kaggle computer disk (/kaggle/working).
+
+    The computer workspace lives under /kaggle/working; duplicate 16 GB model copies
+    there (ollama blobs, dataset-upload staging, loose GGUFs) starve the agent's own
+    work. The engine keeps exactly one runtime copy (the mounted cache dataset or the
+    /kaggle/tmp model_cache), so these working-disk copies are pure duplicates.
+    Returns the number of bytes freed. Never touches the agent workspace.
+    """
+    freed = 0
+
+    def _rm(path: str) -> None:
+        nonlocal freed
+        try:
+            if os.path.isfile(path) or os.path.islink(path):
+                freed += os.path.getsize(path) or 0
+                os.remove(path)
+            elif os.path.isdir(path):
+                for root, _dirs, files in os.walk(path):
+                    for name in files:
+                        try:
+                            freed += os.path.getsize(os.path.join(root, name)) or 0
+                        except OSError:
+                            pass
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            pass
+
+    # staging copy for dataset upload
+    _rm(UPLOAD_DIR)
+    # partial / corrupt downloads anywhere on the working disk
+    for root, _dirs, files in os.walk(WORK_ROOT):
+        for name in files:
+            low = name.lower()
+            if low.endswith((".part", ".partial", ".download")) or ".gguf.part" in low:
+                _rm(os.path.join(root, name))
+    # duplicate weight stores on the computer disk (runtime copy exists elsewhere)
+    try:
+        local = find_local_store_model()
+        dataset = find_dataset_gguf()
+    except Exception:
+        local, dataset = "", ""
+    if (os.path.isfile(MARKER_PATH) or dataset) and local and not str(local).startswith(UPLOAD_DIR):
+        # the persistent store blob is a duplicate of the mounted/runtime copy
+        _rm(PERSIST_MODELS_DIR)
+    for name in os.listdir(WORK_ROOT):
+        if name.lower().endswith(".gguf"):
+            path = os.path.join(WORK_ROOT, name)
+            if path != local and path != dataset:
+                _rm(path)
+    if freed:
+        log(f"🧹 Removed {freed / 1e9:.1f} GB of model downloads from the computer disk")
+    return freed
 
 
 def main() -> None:
@@ -1471,9 +1630,14 @@ def main() -> None:
     notify_workspace("STARTING_GATEWAY", extra={"gpu": gpu_out})
     start_gateway()
 
+    try:
+        cleanup_model_downloads()
+    except Exception as exc:
+        log(f"model-download cleanup note: {exc}")
+
     cf_proc, tunnel_url = launch_cloudflared(cloudflared_bin)
     if not tunnel_url:
-        fail("TUNNEL_ERROR", "Could not obtain a Cloudflare Quick Tunnel URL")
+        fail("TUNNEL_ERROR", "Could not bring up the Cloudflare tunnel (no URL and no configured hostname)")
         return
     notify_workspace("TUNNEL_ONLINE", tunnel_url=tunnel_url, extra={"gpu": gpu_out})
 

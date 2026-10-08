@@ -29,6 +29,9 @@ log = logging.getLogger("blackthorn.agent")
 FINALIZE_NOTE = ("Tool use is finished for this turn. Using only the information gathered above, write the final answer "
                  "now. If something could not be done or found, say so plainly.")
 
+CONTINUE_NOTE = ("Your previous reply was cut off by a network error before it finished. Continue exactly from the "
+                 "end of that reply: do not repeat any text that was already written, just finish the thought.")
+
 
 class ThinkFilter:
     """Split streamed content into visible text and ``<think>…</think>`` text without ever swallowing normal text.
@@ -120,6 +123,7 @@ class AgentRun:
         self._produced = False
         self._history_len = 0
         self._last_step_text = ""
+        self._recoveries = 0
         s = deps.settings
         self._budget = prompts.prompt_budget(s.context_tokens, s.completion_reserve_tokens)
         self._schemas = deps.registry.schemas()
@@ -303,6 +307,11 @@ class AgentRun:
             route = await self.deps.resolver.get()
             self.model = route.model
             self._produced = False
+
+            def _text_len() -> int:
+                return sum(len(part["text"]) for part in self.parts if part["type"] == "text")
+
+            before = _text_len()
             try:
                 return await self._consume(route, messages, tools)
             except ContextOverflow:
@@ -319,15 +328,31 @@ class AgentRun:
                 self.run.emit("notice", level="info", text="The conversation was too long for the model window; trimmed it and retried.")
                 continue
             except LLMError as exc:
-                # Cloudflare 524 means the edge gave up before the first byte. Retry more than
-                # a normal 5xx; other tunnel errors stay at one retry so a dead GPU fails fast.
-                limit = 4 if exc.status == 524 else 2
-                if exc.retryable and attempt < limit and not self._produced:
-                    self.deps.resolver.invalidate()
+                # Transport faults (edge timeout 524, dropped tunnel, stalled stream) are not
+                # the model failing: recover instead of killing a long run mid-task. A dead GPU
+                # still fails fast (retryable=False on auth/protocol errors).
+                transient = (exc.retryable or
+                             exc.code in ("gpu_unreachable", "gpu_dropped", "gpu_stalled") or
+                             (exc.status is not None and exc.status in (502, 503, 521, 522, 523, 524)))
+                limit = 4 if (exc.status == 524 or exc.code == "gpu_dropped") else 2
+                if not transient or attempt >= limit:
+                    raise
+                self.deps.resolver.invalidate()
+                partial = "".join(part["text"] for part in self.parts if part["type"] == "text")[before:]
+                if partial.strip():
+                    # Text already reached the user; keep it and let the model continue from the
+                    # cut point instead of failing the run over one dropped packet.
+                    if self._recoveries >= 3:
+                        raise
+                    self._recoveries += 1
+                    self.run.emit("notice", level="info",
+                                  text="The link to the GPU dropped mid-answer; continuing from where it stopped.")
+                    messages.append({"role": "assistant", "content": partial})
+                    messages.append({"role": "user", "content": CONTINUE_NOTE})
+                else:
                     self.run.emit("notice", level="info", text="GPU connection hiccup — retrying.")
-                    await asyncio.sleep(min(4.0, 0.8 * attempt))
-                    continue
-                raise
+                await asyncio.sleep(min(4.0, 0.8 * attempt))
+                continue
 
     async def _consume(self, route: Any, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]]) -> StepResult:
         s = self.deps.settings
@@ -418,9 +443,14 @@ class AgentRun:
 
         ctx = ToolContext(settings=s, store=self.deps.store, computer=self.deps.computer, http=self.deps.http,
                           tavily=self.deps.tavily, session_id=self.run.session_id, run_id=self.run.id)
-        # Execute every call the model asked for (up to max_calls_per_step). Independent
-        # calls run together so a multi-tool step is not serialized behind the slowest one.
-        async def _execute(index: int, call: Dict[str, str]) -> ToolResult:
+        # Every call the model asked for is executed — none are ever dropped or skipped.
+        # max_calls_per_step bounds *concurrency* (protects the GPU computer from a stampede),
+        # not how much work a step may do. Each call reports its result the moment it finishes
+        # so the UI shows live progress instead of one late batch.
+        sem = asyncio.Semaphore(max(1, int(s.max_calls_per_step)))
+        seen_lock = asyncio.Lock()
+
+        async def _execute(call: Dict[str, str]) -> ToolResult:
             name = call["name"]
             parse_error: Optional[str] = None
             args: Dict[str, Any] = {}
@@ -428,24 +458,23 @@ class AgentRun:
                 args = loads_args(call["args"])
             except ValueError as exc:
                 parse_error = str(exc)
-            if index >= s.max_calls_per_step:
-                return ToolResult.failure("skipped: too many tool calls in one step",
-                                           hint="Call it again in the next step if it is still needed.")
             if parse_error:
                 return ToolResult.failure(f"invalid arguments for {name}: {parse_error}", hint="Send valid JSON arguments.")
             if self.deps.registry.get(name) is None:
                 return await self.deps.registry.run(name, args, ctx)
             key = (name, json.dumps(args, sort_keys=True, default=str))
-            count = self.seen.get(key, 0)
-            if count >= s.max_repeat_calls:
-                return ToolResult.failure(
-                    f"duplicate call suppressed: {name} was already run with these exact arguments {count} times",
-                    hint="Use the earlier result in the conversation to answer, or try different arguments.")
-            self.seen[key] = count + 1
-            return await self.deps.registry.run(name, args, ctx)
+            async with seen_lock:
+                count = self.seen.get(key, 0)
+                if count >= s.max_repeat_calls:
+                    return ToolResult.failure(
+                        f"duplicate call suppressed: {name} was already run with these exact arguments {count} times",
+                        hint="Use the earlier result in the conversation to answer, or try different arguments.")
+                self.seen[key] = count + 1
+            async with sem:
+                return await self.deps.registry.run(name, args, ctx)
 
         pending: List[tuple] = []
-        for index, call in enumerate(step.calls):
+        for call in step.calls:
             self._check()
             name, call_id = call["name"], call["id"]
             try:
@@ -454,37 +483,61 @@ class AgentRun:
                 preview_args = {}
             summary = self.deps.registry.describe(name, preview_args) if preview_args or not call["args"] else ""
             part: Dict[str, Any] = {"type": "tool", "id": call_id, "name": name, "status": "running", "args": summary,
-                                    "summary": "", "step": self.steps}
+                                    "summary": "", "step": self.steps, "started_at": time.time()}
             self.parts.append(part)
             self._activity("run_touched", "tool")
             self.run.emit("tool.start", id=call_id, name=name, summary=summary, step=self.steps)
-            pending.append((index, call, part, time.monotonic()))
+            pending.append((call, part, time.monotonic()))
 
-        results = await asyncio.gather(*(_execute(i, c) for i, c, _p, _t in pending), return_exceptions=True)
-        for (index, call, part, started), result in zip(pending, results):
-            name, call_id = call["name"], call["id"]
-            if isinstance(result, Exception):
-                result = ToolResult.failure(f"{type(result).__name__}: {result}")
+        contents: Dict[str, str] = {}
+        finished: Dict[int, tuple] = {}
+        emit_next = 0
+
+        def _publish(index: int) -> None:
+            """Emit tool.end events in the model's call order, as soon as each prefix is done."""
+            nonlocal emit_next
+            while emit_next in finished:
+                part, result, duration = finished[emit_next]
+                call_id, name = part["id"], part["name"]
+                ui_out = redact(str(result.data.get("output") or ""))[: s.ui_result_chars] if result.data.get("output") else ""
+                part.update(status="ok" if result.ok else "error", summary=redact(result.summary)[:240], duration_ms=duration)
+                if not result.ok:
+                    part["error"] = redact(result.error)[:300]
+                if ui_out:
+                    part["output"] = ui_out
+                if result.data.get("sources"):
+                    part["sources"] = result.data["sources"][:6]
+                if result.data.get("answer"):
+                    part["answer"] = str(result.data["answer"])[:500]
+                if result.data.get("exit_code") is not None:
+                    part["exit_code"] = result.data["exit_code"]
+                self.run.emit("tool.end", id=call_id, name=name, status=part["status"], summary=part["summary"],
+                              duration_ms=duration, error=part.get("error"), output=ui_out or None,
+                              sources=part.get("sources"), answer=part.get("answer"),
+                              exit_code=part.get("exit_code"), truncated=result.truncated)
+                contents[call_id] = result.content
+                self._maybe_flush()
+                emit_next += 1
+
+        async def _run_one(index: int, call: Dict[str, str], part: Dict[str, Any], started: float) -> None:
+            try:
+                result = await _execute(call)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # a tool bug must never kill the run
+                result = ToolResult.failure(f"{type(exc).__name__}: {exc}")
             err = str(result.error or "")
             if err.startswith("invalid arguments") or err.startswith("unknown tool"):
                 self.malformed += 1
             elif err.startswith("duplicate call"):
                 self.strikes += 1
-            elif index < s.max_calls_per_step and self.deps.registry.get(name) is not None and not err.startswith("skipped:"):
+            else:
                 self.tool_calls_total += 1
-            duration = int((time.monotonic() - started) * 1000)
-            ui_out = redact(str(result.data.get("output") or ""))[: s.ui_result_chars] if result.data.get("output") else ""
-            part.update(status="ok" if result.ok else "error", summary=redact(result.summary)[:240], duration_ms=duration)
-            if not result.ok:
-                part["error"] = redact(result.error)[:300]
-            if ui_out:
-                part["output"] = ui_out
-            if result.data.get("sources"):
-                part["sources"] = result.data["sources"][:6]
-            if result.data.get("exit_code") is not None:
-                part["exit_code"] = result.data["exit_code"]
-            self.run.emit("tool.end", id=call_id, name=name, status=part["status"], summary=part["summary"], duration_ms=duration,
-                          error=part.get("error"), output=ui_out or None, sources=part.get("sources"),
-                          exit_code=part.get("exit_code"), truncated=result.truncated)
-            messages.append({"role": "tool", "tool_call_id": call_id, "content": result.content})
-            self._maybe_flush()
+            finished[index] = (part, result, max(1, int((time.monotonic() - started) * 1000)))
+            _publish(index)
+
+        await asyncio.gather(*(_run_one(i, c, p, t) for i, (c, p, t) in enumerate(pending)))
+        # tool messages are appended in the model's call order
+        for call, _part, _t in pending:
+            messages.append({"role": "tool", "tool_call_id": call["id"],
+                             "content": contents.get(call["id"], "ERROR: tool produced no result")})

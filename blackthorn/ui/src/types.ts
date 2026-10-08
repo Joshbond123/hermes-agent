@@ -15,8 +15,12 @@ export interface ToolPart {
   duration_ms?: number
   output?: string
   sources?: Source[]
+  /** short human summary of what a web search found (not just URLs) */
+  answer?: string
   error?: string
   exit_code?: number
+  /** epoch ms when the run started this tool (live elapsed display) */
+  startedAt?: number
 }
 export type Part = TextPart | ToolPart
 
@@ -102,7 +106,7 @@ export type ServerEvent =
   | (Base & { type: 'thinking'; state: 'start' | 'end'; ms?: number })
   | (Base & { type: 'text.delta'; text: string })
   | (Base & { type: 'tool.start'; id: string; name: string; summary: string; step?: number })
-  | (Base & { type: 'tool.end'; id: string; name: string; status: 'ok' | 'error'; summary: string; duration_ms: number; error?: string | null; output?: string | null; sources?: Source[] | null; exit_code?: number | null; truncated?: boolean })
+  | (Base & { type: 'tool.end'; id: string; name: string; status: 'ok' | 'error'; summary: string; duration_ms: number; error?: string | null; output?: string | null; sources?: Source[] | null; answer?: string | null; exit_code?: number | null; truncated?: boolean })
   | (Base & { type: 'notice'; level: 'info' | 'warn' | 'error'; text: string })
   | (Base & ({ type: 'error' } & RunError))
   | (Base & { type: 'run.end'; status: Status; finish_reason?: string | null; duration_ms: number; first_token_ms?: number | null; message_id: string; session_id: string; steps: number; tool_calls: number; usage?: { prompt: number; completion: number }; saved?: boolean })
