@@ -2,7 +2,7 @@
  "files": {
   "blackthorn/README.md": "1e131377eab78a706b9185ceddcbaf2c3d61fca5d3dddb470176fa5ff709f21e",
   "blackthorn/__init__.py": "bf89103f65d60974dcd3e4bb1948b34f1839c7b9eef13cf3ce3d039e38a1d63c",
-  "blackthorn/agent.py": "060bdeb0ac58f1a7519575b72a405c39e22011eca011bb20c7b72a0800b11e1d",
+  "blackthorn/agent.py": "b49eff095b9a643d0d7c2b85cb746d9d042e9e00d50aee1e7beed423cf2e684f",
   "blackthorn/api.py": "15775491aa42d553cf02fdd4da710683bc4a25a5325368af817d1678ed615ed3",
   "blackthorn/app.py": "bc5c1751e81b680fda06a4f437ea67273ef1cdf6c6b457226289bb80b6885096",
   "blackthorn/config.py": "e1057e2f9251e20cb599a167a1f3905944be2fb84209c6dc562cdfa35e976224",

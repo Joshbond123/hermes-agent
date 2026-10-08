@@ -262,6 +262,28 @@ async def test_midstream_connection_drop_keeps_partial_and_continues(stack):
     assert last["status"] == "stop" and last["content"].startswith("Part one")
 
 
+async def test_length_cut_mid_answer_is_continued_not_killed(stack):
+    """A reply that runs out of output tokens mid-answer resumes instead of ending the run."""
+    stack.backend.queue([*say("Part one of the answer, ", 2), finish("length")],
+                        [*say("and part two finishes it."), finish("stop")])
+    out = await stack.stream({"message": "hello"})
+    assert out.end["status"] == "stop"
+    assert "Part one of the answer, " in out.text and "and part two finishes it." in out.text
+    assert any("token ceiling" in n["text"] for n in out.of("notice"))
+    data = await session_messages(stack, out.session_id)
+    assert data["messages"][-1]["status"] == "stop"
+    assert "Part one of the answer, " in data["messages"][-1]["content"]
+
+
+async def test_repeated_length_cuts_end_honestly_after_the_budget(stack):
+    for _ in range(4):
+        stack.backend.queue([*say("cut "), finish("length")])
+    out = await stack.stream({"message": "hello"})
+    assert out.end["status"] == "length"
+    assert any("cut off by the model" in n["text"] for n in out.of("notice"))
+    assert len(stack.backend.requests) == 3                                   # 1 + 2 continuations, never a loop
+
+
 async def test_repeated_drops_beyond_the_recovery_budget_end_in_honest_error(stack):
     for _ in range(4):                                                                    # one per attempt: the 4th exhausts the budget
         stack.backend.queue([*say("partial "), {"drop": 1}])

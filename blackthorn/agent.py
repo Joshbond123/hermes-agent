@@ -29,6 +29,10 @@ log = logging.getLogger("blackthorn.agent")
 FINALIZE_NOTE = ("Tool use is finished for this turn. Using only the information gathered above, write the final answer "
                  "now. If something could not be done or found, say so plainly.")
 
+LENGTH_CONTINUE_NOTE = ("Your reply was cut off by the model's output token limit. Continue from exactly "
+                        "where it stopped, without repeating anything already said. If you were about to call "
+                        "tools, call them now and keep working until every item is complete. Keep updates brief.")
+
 CONTINUE_NOTE = ("Your previous reply was cut off by a network error before it finished. Continue exactly from the "
                  "end of that reply: do not repeat any text that was already written, just finish the thought.")
 
@@ -244,6 +248,7 @@ class AgentRun:
 
         force_final = False
         empty_retries = 0
+        length_continues = 0
         while True:
             self._check()
             self.steps += 1
@@ -263,6 +268,16 @@ class AgentRun:
                 # saved for this step, so asking once more is invisible apart from the extra wait.
                 empty_retries += 1
                 self.run.emit("notice", level="info", text="The model returned an empty answer; asking once more.")
+                continue
+            if result.finish == "length" and length_continues < 2:
+                # Generation hit the output ceiling mid-answer. Keep the partial and resume: a long
+                # task must not die because the reply itself ran out of room.
+                length_continues += 1
+                self.run.emit("notice", level="info",
+                              text="The reply hit the model's token ceiling mid-answer; continuing where it stopped.")
+                if result.text.strip():
+                    messages.append({"role": "assistant", "content": result.text})
+                messages.append({"role": "user", "content": LENGTH_CONTINUE_NOTE})
                 continue
             self.finish_reason = result.finish or "stop"
             self._last_step_text = result.text
