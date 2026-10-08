@@ -113,6 +113,12 @@ async def test_relay_proxy_times_out_if_the_notebook_never_pushes(stack, monkeyp
     assert resp.json()["detail"]["code"] == "gpu_unreachable"
 
 
+async def test_relay_data_plane_rejects_control_paths(stack):
+    async with httpx.AsyncClient(timeout=30) as c:
+        r = await c.get(f"{stack.url}/gpu-relay/api/kaggle-relay/pull", headers={"X-Blackthorn-Key": KEY})
+        assert r.status_code == 404
+
+
 async def test_relay_quiet_poll_returns_204(stack, monkeypatch):
     monkeypatch.setattr(relay_mod, "PULL_WAIT_S", 0.2)
     nb = Notebook(stack)

@@ -24,7 +24,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 PULL_WAIT_S = 25.0             # notebook long-poll window (below every proxy timeout)
 HEADERS_TIMEOUT_S = 240.0      # a warm model answers far faster; queued jobs start instantly
-IDLE_FAST_FAIL_S = 30.0        # no notebook seen for this long -> fail fast instead of hanging
+IDLE_FAST_FAIL_S = 75.0        # no notebook seen for this long -> fail fast instead of hanging
+KEY_CACHE_TTL_S = 30.0          # ride out D1 blips without 401ing a healthy notebook
 DROP_HEADERS = {"host", "content-length", "connection", "accept-encoding", "transfer-encoding",
                 "x-blackthorn-key", "x-relay-status", "x-relay-content-type"}
 
@@ -75,13 +76,26 @@ def _hub(request: Request) -> RelayHub:
     return hub
 
 
+_KEY_CACHE = {"t": 0.0, "v": ""}
+
+
 async def _row_key(request: Request) -> str:
-    """The per-boot key the notebook publishes to D1; pull/push must present it."""
+    """The per-boot key the notebook publishes to D1; pull/push must present it.
+
+    Cached briefly: a D1 read blip must not 401 a healthy notebook (and must not
+    break auth either - a stale key expires with the cache).
+    """
+    now = time.monotonic()
+    if _KEY_CACHE["v"] and now - _KEY_CACHE["t"] < KEY_CACHE_TTL_S:
+        return str(_KEY_CACHE["v"])
     try:
         row = await request.app.state.bt.store.gpu_row()
-        return str(row.get("api_key") or "")
+        value = str(row.get("api_key") or "")
+        if value:
+            _KEY_CACHE.update(t=now, v=value)
+        return value
     except Exception:
-        return ""
+        return str(_KEY_CACHE["v"] or "")
 
 
 def _authed(request: Request, expected: str) -> bool:
