@@ -140,6 +140,10 @@ async def relay_push(request: Request, job_id: str):
 # --------------------------------------------------------------------------- data plane (agent side)
 async def relay_proxy(request: Request, path: str = ""):
     """Any method, any path under /gpu-relay/: pipe it to the notebook gateway and stream back."""
+    if path.startswith("api/kaggle-relay"):
+        # the control plane lives on the app origin; asking for it through the data plane
+        # would queue a request for the very client that is asking
+        raise HTTPException(status_code=404, detail={"code": "relay_path", "message": "control plane is /api/kaggle-relay/*"})
     hub = _hub(request)
     if not hub.alive():
         raise HTTPException(status_code=502,
