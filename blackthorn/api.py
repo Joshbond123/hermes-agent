@@ -41,6 +41,7 @@ class Services:
     runs: RunManager
     gpu: Any
     static_dir: Path
+    relay_hub: Any = None
     _prompt_cache: tuple = field(default=(0.0, ""))
     _memory_cache: tuple = field(default=(0.0, ()))
 
@@ -375,3 +376,9 @@ async def gpu_auto_off(body: AutoOffBody, request: Request):
 @router.get("/api/kaggle-gpu/logs")
 async def gpu_logs(request: Request, limit: int = Query(120, ge=1, le=300)):
     return await svc(request).gpu.logs(limit)
+
+
+# --------------------------------------------------------------------------- durable GPU relay
+from . import relay as _relay  # noqa: E402  (registered last: owns /gpu-relay/* and /api/kaggle-relay/*)
+
+_relay.register(router)

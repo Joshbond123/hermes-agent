@@ -1388,16 +1388,22 @@ def start_gateway() -> None:
 TUNNEL_HOSTNAME = (os.environ.get("BLACKTHORN_TUNNEL_HOSTNAME") or "blacktornagent.ing.ng").strip()
 
 
+RELAY_CLIENT_CODE = '"""Render long-poll relay client for the Blackthorn Kaggle gateway.\n\nPulls queued requests from the stable endpoint, executes them against the local\ngateway and streams each response back. Never exits: every failure is a backoff.\n"""\nimport base64\nimport json\nimport sys\nimport time\n\nimport requests\n\nBASE = sys.argv[1].rstrip("/")\nKEY = sys.argv[2]\nTARGET = sys.argv[3].rstrip("/")\n\n\ndef log(msg):\n    try:\n        with open("/tmp/relay_client.log", "a") as fh:\n            fh.write("%.1f %s\\n" % (time.time(), msg))\n    except Exception:\n        pass\n\n\ndef push_fail(job_id, text):\n    try:\n        requests.post(BASE + "/api/kaggle-relay/push/" + job_id,\n                      headers={"X-Blackthorn-Key": KEY, "X-Relay-Status": "502",\n                               "X-Relay-Content-Type": "application/json"},\n                      data=json.dumps({"error": {"message": text}}), timeout=15)\n    except Exception:\n        pass\n\n\ndef run_once():\n    try:\n        r = requests.get(BASE + "/api/kaggle-relay/pull",\n                         headers={"X-Blackthorn-Key": KEY}, timeout=(6, 30))\n    except Exception as exc:\n        log("pull error " + type(exc).__name__)\n        time.sleep(2)\n        return\n    if r.status_code == 204:\n        return\n    if r.status_code != 200:\n        log("pull status " + str(r.status_code))\n        time.sleep(3)\n        return\n    job = r.json()\n    body = job.get("body_b64") or ""\n    data = base64.b64decode(body) if body else b""\n    path = (job.get("path") or "").lstrip("/")\n    target = TARGET + "/" + path if path else TARGET + "/"\n    job_id = job["id"]\n    try:\n        upstream = requests.request(job.get("method") or "GET", target,\n                                    headers=job.get("headers") or {}, data=data,\n                                    stream=True, timeout=(10, None))\n\n        def gen():\n            for chunk in upstream.iter_content(chunk_size=8192):\n                if chunk:\n                    yield chunk\n\n        requests.post(BASE + "/api/kaggle-relay/push/" + job_id,\n                      headers={"X-Blackthorn-Key": KEY,\n                               "X-Relay-Status": str(upstream.status_code),\n                               "X-Relay-Content-Type": upstream.headers.get("Content-Type") or "application/octet-stream"},\n                      data=gen(), timeout=(10, None))\n        upstream.close()\n    except Exception as exc:\n        log("exec error " + type(exc).__name__)\n        push_fail(job_id, "relay client failed: " + type(exc).__name__)\n\n\nlog("relay client started base=" + BASE + " target=" + TARGET)\nwhile True:\n    run_once()\n'
+
+
 def launch_cloudflared(cloudflared_bin: str):
     """Start the tunnel and return (proc, public_url).
 
     Preferred: the stable named tunnel (remotely managed, token auth) fronted by
     blacktornagent.ing.ng. The URL never changes across reboots/restarts, so the
     Render side keeps a permanent endpoint instead of chasing quick-tunnel URLs.
-    Fallback: the ephemeral quick tunnel, only when no token is configured.
+    Second: the durable Render relay (long-poll) at BLACKTHORN_RELAY_URL - also a
+    permanent URL, needs no tunnel service at all.
+    Fallback: the ephemeral quick tunnel, only when neither is configured.
     """
     cf_log_path = "/tmp/cloudflared.log"
     handle = open(cf_log_path, "w")
+    relay_base = (os.environ.get("BLACKTHORN_RELAY_URL") or "").strip().rstrip("/")
     token = (os.environ.get("CLOUDFLARED_TUNNEL_TOKEN") or "").strip()
     if token:
         proc = subprocess.Popen(
@@ -1407,6 +1413,16 @@ def launch_cloudflared(cloudflared_bin: str):
         )
         log(f"Stable tunnel: https://{TUNNEL_HOSTNAME} (named tunnel)")
         return proc, f"https://{TUNNEL_HOSTNAME}"
+    if relay_base:
+        relay_path = "/tmp/relay_client.py"
+        with open(relay_path, "w") as fh:
+            fh.write(RELAY_CLIENT_CODE)
+        proc = subprocess.Popen(
+            [sys.executable, relay_path, relay_base, API_KEY, f"http://127.0.0.1:{GATEWAY_PORT}"],
+            stdout=open("/tmp/relay_client.out", "w"), stderr=subprocess.STDOUT, text=True,
+        )
+        log(f"Stable relay: {relay_base} (Render long-poll relay)")
+        return proc, relay_base
     proc = subprocess.Popen(
         [cloudflared_bin, "tunnel", "--url", f"http://127.0.0.1:{GATEWAY_PORT}",
          "--no-autoupdate", "--protocol", "http2"],

@@ -1,0 +1,185 @@
+"""Durable GPU relay: a stable endpoint for the Kaggle gateway without any tunnel service.
+
+The notebook opens no inbound ports; instead its relay client long-polls ``/api/kaggle-relay/pull``
+for work, executes each request against the local gateway and streams the response back through
+``/api/kaggle-relay/push/{id}``. Agent traffic enters at ``/gpu-relay/{path}`` and is piped through,
+so the published GPU URL never changes and a dropped connection cannot orphan a request.
+
+This is the fallback path when no Cloudflare tunnel token is configured; a named tunnel
+(``CLOUDFLARED_TUNNEL_TOKEN``) still takes precedence on the notebook side.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import time
+import uuid
+from dataclasses import dataclass, field
+from typing import Any, AsyncIterator, Dict, Optional
+
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+
+PULL_WAIT_S = 25.0             # notebook long-poll window (below every proxy timeout)
+HEADERS_TIMEOUT_S = 240.0      # a warm model answers far faster; queued jobs start instantly
+IDLE_FAST_FAIL_S = 30.0        # no notebook seen for this long -> fail fast instead of hanging
+DROP_HEADERS = {"host", "content-length", "connection", "accept-encoding", "transfer-encoding",
+                "x-blackthorn-key", "x-relay-status", "x-relay-content-type"}
+
+
+@dataclass
+class _Job:
+    id: str
+    method: str
+    path: str
+    headers: Dict[str, str]
+    body: bytes
+    chunks: "asyncio.Queue[Optional[bytes]]" = field(default_factory=asyncio.Queue)
+    headers_ready: "asyncio.Event" = field(default_factory=asyncio.Event)
+    status: int = 200
+    content_type: str = "application/octet-stream"
+    pushed: bool = False
+
+
+class RelayHub:
+    """One GPU, one queue. Multiple notebooks are not a supported topology (and not needed)."""
+
+    def __init__(self) -> None:
+        self.pending: "asyncio.Queue[_Job]" = asyncio.Queue()
+        self.inflight: Dict[str, _Job] = {}
+        self.last_seen: float = time.monotonic()
+        self.waiting_pulls = 0
+
+    def alive(self) -> bool:
+        return self.waiting_pulls > 0 or (time.monotonic() - self.last_seen) < IDLE_FAST_FAIL_S
+
+    def submit(self, method: str, path: str, headers: Dict[str, str], body: bytes) -> _Job:
+        job = _Job(id=uuid.uuid4().hex, method=method, path=path, headers=headers, body=body)
+        self.inflight[job.id] = job
+        self.pending.put_nowait(job)
+        return job
+
+    def finish(self, job: _Job) -> None:
+        self.inflight.pop(job.id, None)
+        job.headers_ready.set()          # release any waiter even if the notebook vanished
+
+
+def _hub(request: Request) -> RelayHub:
+    services = request.app.state.bt
+    hub = getattr(services, "relay_hub", None)
+    if hub is None:
+        hub = RelayHub()
+        services.relay_hub = hub
+    return hub
+
+
+async def _row_key(request: Request) -> str:
+    """The per-boot key the notebook publishes to D1; pull/push must present it."""
+    try:
+        row = await request.app.state.bt.store.gpu_row()
+        return str(row.get("api_key") or "")
+    except Exception:
+        return ""
+
+
+def _authed(request: Request, expected: str) -> bool:
+    got = request.headers.get("x-blackthorn-key") or ""
+    return bool(got) and bool(expected) and got == expected
+
+
+# --------------------------------------------------------------------------- control plane (notebook side)
+async def relay_pull(request: Request):
+    """Long-poll: hand the next queued request to the notebook, or 204 when quiet."""
+    hub = _hub(request)
+    if not _authed(request, await _row_key(request)):
+        raise HTTPException(status_code=401, detail={"code": "relay_auth", "message": "unknown relay key"})
+    hub.last_seen = time.monotonic()
+    hub.waiting_pulls += 1
+    try:
+        job = await asyncio.wait_for(hub.pending.get(), timeout=PULL_WAIT_S)
+    except asyncio.TimeoutError:
+        return JSONResponse({"quiet": True}, status_code=204)
+    finally:
+        hub.waiting_pulls -= 1
+    hub.last_seen = time.monotonic()
+    return JSONResponse({
+        "id": job.id, "method": job.method, "path": job.path,
+        "headers": job.headers,
+        "body_b64": base64.b64encode(job.body).decode() if job.body else "",
+    })
+
+
+async def relay_push(request: Request, job_id: str):
+    """Stream the gateway's response back; the body is forwarded chunk for chunk."""
+    hub = _hub(request)
+    if not _authed(request, await _row_key(request)):
+        raise HTTPException(status_code=401, detail={"code": "relay_auth", "message": "unknown relay key"})
+    hub.last_seen = time.monotonic()
+    job = hub.inflight.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail={"code": "relay_gone", "message": "no such relay request"})
+    try:
+        job.status = int(request.headers.get("x-relay-status") or 200)
+        job.content_type = request.headers.get("x-relay-content-type") or "application/octet-stream"
+        job.pushed = True
+        job.headers_ready.set()
+        async for chunk in request.stream():
+            if chunk:
+                await job.chunks.put(chunk)
+    except Exception:
+        # network blip mid-push: end the stream so the agent sees a clean error instead of a hang
+        pass
+    finally:
+        await job.chunks.put(None)
+        hub.finish(job)
+    return JSONResponse({"ok": True})
+
+
+# --------------------------------------------------------------------------- data plane (agent side)
+async def relay_proxy(request: Request, path: str = ""):
+    """Any method, any path under /gpu-relay/: pipe it to the notebook gateway and stream back."""
+    hub = _hub(request)
+    if not hub.alive():
+        raise HTTPException(status_code=502,
+                            detail={"code": "gpu_unreachable",
+                                    "message": "The GPU relay is not connected. Wait for the GPU to finish starting, then try again."})
+    body = await request.body()
+    headers = {k.lower(): v for k, v in request.headers.items()
+               if k.lower() not in DROP_HEADERS and not k.lower().startswith("x-relay-")}
+    job = hub.submit(request.method.upper(), path, headers, body)
+
+    try:
+        await asyncio.wait_for(job.headers_ready.wait(), timeout=HEADERS_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        hub.finish(job)
+        raise HTTPException(status_code=502,
+                            detail={"code": "gpu_unreachable",
+                                    "message": "The GPU did not answer through the relay (timed out)."})
+    if not job.pushed:
+        hub.finish(job)
+        raise HTTPException(status_code=502,
+                            detail={"code": "gpu_unreachable",
+                                    "message": "The GPU relay lost the notebook before it answered."})
+
+    async def stream() -> AsyncIterator[bytes]:
+        try:
+            while True:
+                chunk = await job.chunks.get()
+                if chunk is None:
+                    break
+                yield chunk
+        finally:
+            hub.finish(job)
+
+    return StreamingResponse(stream(), status_code=job.status, media_type=job.content_type,
+                             headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"})
+
+
+def register(router: APIRouter) -> None:
+    router.add_api_route("/api/kaggle-relay/pull", relay_pull, methods=["GET"])
+    router.add_api_route("/api/kaggle-relay/push/{job_id}", relay_push, methods=["POST"])
+    router.add_api_route("/gpu-relay/{path:path}", relay_proxy,
+                         methods=["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
+    router.add_api_route("/gpu-relay", relay_proxy, methods=["GET", "HEAD", "POST"], include_in_schema=False)
