@@ -319,10 +319,13 @@ class AgentRun:
                 self.run.emit("notice", level="info", text="The conversation was too long for the model window; trimmed it and retried.")
                 continue
             except LLMError as exc:
-                if exc.retryable and attempt < 2 and not self._produced:
+                # Cloudflare 524 means the edge gave up before the first byte. Retry more than
+                # a normal 5xx; other tunnel errors stay at one retry so a dead GPU fails fast.
+                limit = 4 if exc.status == 524 else 2
+                if exc.retryable and attempt < limit and not self._produced:
                     self.deps.resolver.invalidate()
-                    self.run.emit("notice", level="info", text="GPU connection hiccup — retrying once.")
-                    await asyncio.sleep(1.2)
+                    self.run.emit("notice", level="info", text="GPU connection hiccup — retrying.")
+                    await asyncio.sleep(min(4.0, 0.8 * attempt))
                     continue
                 raise
 
@@ -415,46 +418,63 @@ class AgentRun:
 
         ctx = ToolContext(settings=s, store=self.deps.store, computer=self.deps.computer, http=self.deps.http,
                           tavily=self.deps.tavily, session_id=self.run.session_id, run_id=self.run.id)
-        for index, call in enumerate(step.calls):
-            self._check()
-            name, call_id = call["name"], call["id"]
+        # Execute every call the model asked for (up to max_calls_per_step). Independent
+        # calls run together so a multi-tool step is not serialized behind the slowest one.
+        async def _execute(index: int, call: Dict[str, str]) -> ToolResult:
+            name = call["name"]
             parse_error: Optional[str] = None
             args: Dict[str, Any] = {}
             try:
                 args = loads_args(call["args"])
             except ValueError as exc:
                 parse_error = str(exc)
-            summary = self.deps.registry.describe(name, args) if not parse_error else ""
+            if index >= s.max_calls_per_step:
+                return ToolResult.failure("skipped: too many tool calls in one step",
+                                           hint="Call it again in the next step if it is still needed.")
+            if parse_error:
+                return ToolResult.failure(f"invalid arguments for {name}: {parse_error}", hint="Send valid JSON arguments.")
+            if self.deps.registry.get(name) is None:
+                return await self.deps.registry.run(name, args, ctx)
+            key = (name, json.dumps(args, sort_keys=True, default=str))
+            count = self.seen.get(key, 0)
+            if count >= s.max_repeat_calls:
+                return ToolResult.failure(
+                    f"duplicate call suppressed: {name} was already run with these exact arguments {count} times",
+                    hint="Use the earlier result in the conversation to answer, or try different arguments.")
+            self.seen[key] = count + 1
+            return await self.deps.registry.run(name, args, ctx)
+
+        pending: List[tuple] = []
+        for index, call in enumerate(step.calls):
+            self._check()
+            name, call_id = call["name"], call["id"]
+            try:
+                preview_args = loads_args(call["args"])
+            except ValueError:
+                preview_args = {}
+            summary = self.deps.registry.describe(name, preview_args) if preview_args or not call["args"] else ""
             part: Dict[str, Any] = {"type": "tool", "id": call_id, "name": name, "status": "running", "args": summary,
                                     "summary": "", "step": self.steps}
             self.parts.append(part)
             self._activity("run_touched", "tool")
             self.run.emit("tool.start", id=call_id, name=name, summary=summary, step=self.steps)
-            started = time.monotonic()
-            if index >= s.max_calls_per_step:
-                result = ToolResult.failure("skipped: too many tool calls in one step",
-                                            hint="Call it again in the next step if it is still needed.")
-            elif parse_error:
+            pending.append((index, call, part, time.monotonic()))
+
+        results = await asyncio.gather(*(_execute(i, c) for i, c, _p, _t in pending), return_exceptions=True)
+        for (index, call, part, started), result in zip(pending, results):
+            name, call_id = call["name"], call["id"]
+            if isinstance(result, Exception):
+                result = ToolResult.failure(f"{type(result).__name__}: {result}")
+            err = str(result.error or "")
+            if err.startswith("invalid arguments") or err.startswith("unknown tool"):
                 self.malformed += 1
-                result = ToolResult.failure(f"invalid arguments for {name}: {parse_error}", hint="Send valid JSON arguments.")
-            elif self.deps.registry.get(name) is None:
-                self.malformed += 1
-                result = await self.deps.registry.run(name, args, ctx)
-            else:
-                key = (name, json.dumps(args, sort_keys=True, default=str))
-                count = self.seen.get(key, 0)
-                if count >= s.max_repeat_calls:
-                    self.strikes += 1
-                    result = ToolResult.failure(
-                        f"duplicate call suppressed: {name} was already run with these exact arguments {count} times",
-                        hint="Use the earlier result in the conversation to answer, or try different arguments.")
-                else:
-                    self.seen[key] = count + 1
-                    self.tool_calls_total += 1
-                    result = await self.deps.registry.run(name, args, ctx)
+            elif err.startswith("duplicate call"):
+                self.strikes += 1
+            elif index < s.max_calls_per_step and self.deps.registry.get(name) is not None and not err.startswith("skipped:"):
+                self.tool_calls_total += 1
             duration = int((time.monotonic() - started) * 1000)
             ui_out = redact(str(result.data.get("output") or ""))[: s.ui_result_chars] if result.data.get("output") else ""
-            part.update(status="ok" if result.ok else "error", summary=redact(result.summary)[:200], duration_ms=duration)
+            part.update(status="ok" if result.ok else "error", summary=redact(result.summary)[:240], duration_ms=duration)
             if not result.ok:
                 part["error"] = redact(result.error)[:300]
             if ui_out:

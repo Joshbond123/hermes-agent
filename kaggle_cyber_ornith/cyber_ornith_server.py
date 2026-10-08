@@ -832,6 +832,7 @@ def start_llama_server(gguf_path: str) -> None:
         "--port", str(OLLAMA_PORT),
         "-np", "1",
         "--main-gpu", "0",
+        "--split-mode", "none",
         "--flash-attn", "on",
         "-b", "512",
         "-ub", "256",
@@ -956,7 +957,7 @@ def register_model(ollama_bin: str, gguf_path: str) -> None:
 # --------------------- GATEWAY + TUNNEL ---------------------
 def gateway_code() -> str:
     return '''
-import json, time, os
+import json, time, os, asyncio
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -1016,6 +1017,7 @@ async def health():
         "backend_model": OLLAMA_MODEL,
         "model_loaded": model_loaded,
         "gpu": BOOT_STATE.get("gpu", ""),
+        "gpu_roles": {"0": "model", "1": "computer"},
         "uptime_seconds": round(time.time() - START_TIME, 1),
         "boot": {k: BOOT_STATE.get(k) for k in ("cache_source", "boot_seconds", "download_skipped", "warmup_ok")},
         "endpoints": ["/v1/models", "/v1/chat/completions", "/chat", "/logs", "/health", "/computer/info", "/computer/exec", "/computer/list_files", "/computer/read_file", "/computer/write_file", "/computer/fetch_url"],
@@ -1060,12 +1062,29 @@ async def chat_completions(request: Request, dependencies=[Depends(verify_api_ke
     body["messages"] = messages
     if body.get("stream"):
         async def event_generator():
+            # Cloudflare quick tunnels return HTTP 524 if the origin is silent for ~100s.
+            # A comment frame starts the response immediately and repeats while the model thinks.
+            yield b": blackthorn-open\\n\\n"
             timeout = httpx.Timeout(connect=10.0, read=900.0, write=60.0, pool=10.0)
             async with httpx.AsyncClient(timeout=timeout) as client:
                 async with client.stream("POST", f"{OLLAMA_URL}/v1/chat/completions", json=body) as resp:
-                    async for chunk in resp.aiter_bytes():
-                        yield chunk
-        return StreamingResponse(event_generator(), media_type="text/event-stream")
+                    if resp.status_code != 200:
+                        err = await resp.aread()
+                        yield b"data: " + err + b"\\n\\n"
+                        return
+                    agen = resp.aiter_bytes().__aiter__()
+                    while True:
+                        try:
+                            chunk = await asyncio.wait_for(agen.__anext__(), timeout=15)
+                        except StopAsyncIteration:
+                            break
+                        except asyncio.TimeoutError:
+                            yield b": ping\\n\\n"
+                            continue
+                        if chunk:
+                            yield chunk
+        return StreamingResponse(event_generator(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
     timeout = httpx.Timeout(connect=10.0, read=900.0, write=60.0, pool=10.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.post(f"{OLLAMA_URL}/v1/chat/completions", json=body)
@@ -1119,7 +1138,7 @@ async def computer_info(_=Depends(verify_api_key)):
     gpu = ""
     try:
         gpu = __import__("subprocess").check_output(
-            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
+            ["nvidia-smi", "--query-gpu=index,name,memory.used,memory.total", "--format=csv,noheader"],
             text=True, timeout=5).strip()
     except Exception:
         gpu = "unavailable"
@@ -1153,6 +1172,9 @@ async def computer_exec(request: Request, _=Depends(verify_api_key)):
     env["HOME"] = COMPUTER_ROOT
     env["PWD"] = cwd
     env["BLACKTHORN_WORKSPACE"] = COMPUTER_ROOT
+    # GPU 0 hosts llama-server. Computer work is pinned to physical GPU 1 only.
+    env["CUDA_VISIBLE_DEVICES"] = "1"
+    env["BLACKTHORN_GPU_ROLE"] = "computer"
     def _run():
         return __import__("subprocess").run(
             cmd, shell=True, cwd=cwd, env=env,
@@ -1283,7 +1305,8 @@ def launch_cloudflared(cloudflared_bin: str):
     cf_log_path = "/tmp/cloudflared.log"
     handle = open(cf_log_path, "w")
     proc = subprocess.Popen(
-        [cloudflared_bin, "tunnel", "--url", f"http://127.0.0.1:{GATEWAY_PORT}", "--no-autoupdate"],
+        [cloudflared_bin, "tunnel", "--url", f"http://127.0.0.1:{GATEWAY_PORT}",
+         "--no-autoupdate", "--protocol", "http2"],
         stdout=handle, stderr=subprocess.STDOUT, text=True,
     )
     found = None

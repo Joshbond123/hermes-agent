@@ -33,17 +33,20 @@ class Settings:
     chars_per_token: float = 3.2  # conservative for English + code
 
     # ---- agent loop limits ----------------------------------------------------------------
-    max_steps: int = field(default_factory=lambda: _int("BLACKTHORN_MAX_STEPS", 28))
-    max_tool_calls: int = field(default_factory=lambda: _int("BLACKTHORN_MAX_TOOL_CALLS", 48))
-    max_calls_per_step: int = 3
+    # Defaults are sized for multi-hour autonomous work, not a short chat turn.
+    # Env vars still override. Per-step cap exists only as a safety valve against
+    # a single model response exploding into dozens of calls.
+    max_steps: int = field(default_factory=lambda: _int("BLACKTHORN_MAX_STEPS", 160))
+    max_tool_calls: int = field(default_factory=lambda: _int("BLACKTHORN_MAX_TOOL_CALLS", 400))
+    max_calls_per_step: int = field(default_factory=lambda: _int("BLACKTHORN_MAX_CALLS_PER_STEP", 16))
     max_repeat_calls: int = 2          # identical (tool, args) executions allowed per run
-    max_malformed_calls: int = 3
-    run_timeout_s: float = field(default_factory=lambda: _float("BLACKTHORN_RUN_TIMEOUT", 900.0))
+    max_malformed_calls: int = 8
+    run_timeout_s: float = field(default_factory=lambda: _float("BLACKTHORN_RUN_TIMEOUT", 14400.0))
 
     # ---- network timeouts -----------------------------------------------------------------
     llm_connect_timeout_s: float = 20.0
-    llm_idle_timeout_s: float = field(default_factory=lambda: _float("BLACKTHORN_LLM_IDLE_TIMEOUT", 150.0))
-    tool_timeout_s: float = 90.0
+    llm_idle_timeout_s: float = field(default_factory=lambda: _float("BLACKTHORN_LLM_IDLE_TIMEOUT", 240.0))
+    tool_timeout_s: float = 180.0
     heartbeat_s: float = 12.0
 
     # ---- tool output budgets (characters handed back to the model) ---------------------------

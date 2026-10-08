@@ -27,7 +27,13 @@ function Tool({ t }: { t: ToolPart }) {
       {more && (
         <div className="tool-detail">
           {t.sources && t.sources.length > 0 && (
-            <ul className="sources">{t.sources.map((s) => <li key={s.url}><a href={s.url} target="_blank" rel="noopener noreferrer">{s.title}</a> <span className="muted">{s.domain}</span></li>)}</ul>
+            <ul className="sources">{t.sources.map((s) => (
+              <li key={s.url}>
+                <a href={s.url} target="_blank" rel="noopener noreferrer">{s.title}</a>
+                <span className="muted">{s.domain}</span>
+                {s.snippet && <div className="muted tiny">{s.snippet}</div>}
+              </li>
+            ))}</ul>
           )}
           {t.output && <pre className="tool-out">{t.output}</pre>}
         </div>

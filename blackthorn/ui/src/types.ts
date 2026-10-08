@@ -1,7 +1,7 @@
 export type Status = 'streaming' | 'stop' | 'length' | 'cancelled' | 'error' | 'interrupted' | ''
 
 export interface TextPart { type: 'text'; text: string }
-export interface Source { title: string; url: string; domain: string }
+export interface Source { title: string; url: string; domain: string; snippet?: string }
 export interface ToolPart {
   type: 'tool'
   id: string

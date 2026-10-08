@@ -168,6 +168,7 @@ async def test_unknown_tool_is_an_honest_error(stack):
 
 
 async def test_step_budget_forces_a_final_answer(stack):
+    object.__setattr__(stack.services.settings, "max_steps", 8)
     turns = [[sh(f"echo {i}", cid=f"s{i}"), finish("tool_calls")] for i in range(8)]   # max_steps=8 tool-capable steps
     turns.append([*say("Best answer from what I gathered."), finish("stop")])
     stack.backend.queue(*turns)

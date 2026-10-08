@@ -2,10 +2,10 @@
  "files": {
   "blackthorn/README.md": "1e131377eab78a706b9185ceddcbaf2c3d61fca5d3dddb470176fa5ff709f21e",
   "blackthorn/__init__.py": "bf89103f65d60974dcd3e4bb1948b34f1839c7b9eef13cf3ce3d039e38a1d63c",
-  "blackthorn/agent.py": "7aecc64693cf8a1392dbac57aea121eaa565f22ab8b6de98223aaeb25d6519ef",
+  "blackthorn/agent.py": "450d427c6d888486809a5d554729a7571cfab18bbea258834a1f4e0ffb5199d8",
   "blackthorn/api.py": "605c5971db6f5e112349f2853ae5b8eb8ccac3d73d35fc37cc92f0522d33318e",
   "blackthorn/app.py": "bc5c1751e81b680fda06a4f437ea67273ef1cdf6c6b457226289bb80b6885096",
-  "blackthorn/config.py": "abca443ad1f66ed89dd691bd7982b3a5ad7e4b08701cd4624393e738d789de40",
+  "blackthorn/config.py": "aaf8174a92d777ff95125fcc0ca5eb7198041b1abd06427bd49862db4f05b628",
   "blackthorn/gpu.py": "6feac2172b5577f69b241c2f0836db4c248444dfbd33b65997ee4f48371cdb3e",
   "blackthorn/kaggle_bundle.py": "2a7ab4150794ad67cee3b35ad5e48dbc8eae86208ad36ff596f38fa925b6f4cd",
   "blackthorn/llm.py": "8d7966e03b3889b3a9f096c04922d95ff26060340dc9278b1c30d38bfa32e593",
@@ -22,11 +22,11 @@
   "blackthorn/tools/base.py": "b20a737880826239da198aa5160e95f9a7f9d3878a0481ba5cf32c55da609610",
   "blackthorn/tools/computer.py": "63b80a9c6c08a9089efd6dafa62bb657f655e53ac7148310afd239f972be4575",
   "blackthorn/tools/memory.py": "956b22148dc181ccedfffa80276e94f538c49c273f0780a679d24ad8c4f1766a",
-  "blackthorn/tools/web.py": "35edd0004db14cf636095b7449e259dac750d635c658e84c1aee2aa12edd37e1",
+  "blackthorn/tools/web.py": "e98acbf8521a9cd1492aff0eb2a35e89bc97800d0bde5e2215b40df244f084fd",
   "blackthorn/version.py": "5d43f6378622c4ddeeec627755c2e98152f6077be9334b2770c3a8199018bf37",
   "blackthorn_start.py": "d8189febd25f393cc6b41cd17f7cc88d73ecaa44942fa52f51dd310602b108df",
   "cloudflare_d1_client.py": "9dd8487da5dc60f29c4615c3fa7a025cc01cf2e422370f3150baf168ac014385",
-  "kaggle_cyber_ornith/cyber_ornith_server.py": "4befb2c51e85c1fe0a53f7da737e3721cd07795408282288a56a699015862fa5"
+  "kaggle_cyber_ornith/cyber_ornith_server.py": "87d674fb46fc39a9df61f74cf6bf2f101b698f948e6e3414f79ad694e9083b8d"
  },
  "version": "5.0.0"
 }

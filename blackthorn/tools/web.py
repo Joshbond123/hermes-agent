@@ -85,7 +85,7 @@ async def web_search(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
     if not order:
         raise ToolError("config", "Web search is not configured (no Tavily API key).")
     body = {"query": query, "max_results": int(args.get("max_results") or 5), "search_depth": "basic",
-            "topic": args.get("topic") or "general", "include_answer": False}
+            "topic": args.get("topic") or "general", "include_answer": True}
     last = "no response"
     for key in order:
         try:
@@ -102,23 +102,30 @@ async def web_search(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
             last = f"HTTP {resp.status_code}"
             continue
         try:
-            results = (resp.json() or {}).get("results") or []
+            payload = resp.json() or {}
+            results = payload.get("results") or []
+            answer = str(payload.get("answer") or "").strip()
         except ValueError:
             last = "invalid response"
             continue
-        if not results:
+        if not results and not answer:
             return ToolResult(ok=True, content=f'No results for "{query}".', summary="no results", data={"sources": []})
         blocks, sources = [], []
+        if answer:
+            blocks.append(f"Summary: {answer}")
         for i, r in enumerate(results[: body["max_results"]], 1):
             title = (r.get("title") or "Untitled").strip()
             url = (r.get("url") or "").strip()
-            snippet, _ = clip(" ".join(str(r.get("content") or "").split()), 330)
+            snippet, _ = clip(" ".join(str(r.get("content") or "").split()), 420)
             blocks.append(f"[{i}] {title} — {_domain(url)}\n{url}\n{snippet}")
-            sources.append({"title": title[:120], "url": url, "domain": _domain(url)})
+            sources.append({"title": title[:120], "url": url, "domain": _domain(url), "snippet": snippet[:220]})
         text, cut = clip(f'Search results for "{query}":\n\n' + "\n\n".join(blocks), ctx.settings.tool_result_chars)
         names = ", ".join(dict.fromkeys(s["domain"] for s in sources[:3]))
-        return ToolResult(ok=True, content=text, summary=f"{len(sources)} results · {names}", truncated=cut,
-                          data={"sources": sources})
+        lead = (answer or (sources[0].get("snippet") if sources else "") or "no snippet")
+        lead = " ".join(str(lead).split())[:160]
+        summary = f"{len(sources)} results · {names}" + (f" — {lead}" if lead else "")
+        return ToolResult(ok=True, content=text, summary=summary[:240], truncated=cut,
+                          data={"sources": sources, "answer": answer[:500]})
     raise ToolError("search_failed", f"Web search failed on every configured key ({last}).",
                     hint="Tell the user the search is unavailable right now instead of guessing.")
 
