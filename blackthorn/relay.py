@@ -85,31 +85,38 @@ def _hub(request: Request, channel: str = "model") -> RelayHub:
     return hub
 
 
-_KEY_CACHE = {"t": 0.0, "v": ""}
+_KEY_CACHE = {"t": 0.0, "v": ()}
 
 
-async def _row_key(request: Request) -> str:
-    """The per-boot key the notebook publishes to D1; pull/push must present it.
-
-    Cached briefly: a D1 read blip must not 401 a healthy notebook (and must not
-    break auth either - a stale key expires with the cache).
+async def _row_keys(request: Request) -> tuple:
+    """The per-boot keys the notebooks publish to D1 (model row AND computer row).
+    Each host authenticates with its own key; a D1 read blip must not 401 a healthy
+    notebook, so both keys are cached briefly.
     """
     now = time.monotonic()
     if _KEY_CACHE["v"] and now - _KEY_CACHE["t"] < KEY_CACHE_TTL_S:
-        return str(_KEY_CACHE["v"])
+        return tuple(_KEY_CACHE["v"])
+    keys = set()
     try:
-        row = await request.app.state.bt.store.gpu_row()
-        value = str(row.get("api_key") or "")
-        if value:
-            _KEY_CACHE.update(t=now, v=value)
-        return value
+        store = request.app.state.bt.store
+        for getter in ("gpu_row", "computer_row"):
+            try:
+                row = await getattr(store, getter)()
+                value = str(row.get("api_key") or "")
+                if value:
+                    keys.add(value)
+            except Exception:  # noqa: BLE001 - one row missing must not lose the other
+                pass
+        if keys:
+            _KEY_CACHE.update(t=now, v=tuple(keys))
+        return tuple(keys)
     except Exception:
-        return str(_KEY_CACHE["v"] or "")
+        return tuple(_KEY_CACHE["v"] or ())
 
 
-def _authed(request: Request, expected: str) -> bool:
+def _authed(request: Request, expected: tuple) -> bool:
     got = request.headers.get("x-blackthorn-key") or ""
-    return bool(got) and bool(expected) and got == expected
+    return bool(got) and got in set(expected)
 
 
 # --------------------------------------------------------------------------- control plane (notebook side)
@@ -118,7 +125,7 @@ async def relay_pull(request: Request, channel: str = "model"):
     if channel not in CHANNELS:
         channel = "model"
     hub = _hub(request, channel)
-    if not _authed(request, await _row_key(request)):
+    if not _authed(request, await _row_keys(request)):
         raise HTTPException(status_code=401, detail={"code": "relay_auth", "message": "unknown relay key"})
     hub.last_seen = time.monotonic()
     hub.waiting_pulls += 1
@@ -155,7 +162,7 @@ async def relay_push(request: Request, job_id: str):
             break
     if hub is None:
         hub = _hub(request)
-    if not _authed(request, await _row_key(request)):
+    if not _authed(request, await _row_keys(request)):
         raise HTTPException(status_code=401, detail={"code": "relay_auth", "message": "unknown relay key"})
     hub.last_seen = time.monotonic()
     job = hub.inflight.get(job_id)
