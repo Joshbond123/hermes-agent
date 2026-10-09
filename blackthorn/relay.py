@@ -67,12 +67,21 @@ class RelayHub:
         job.headers_ready.set()          # release any waiter even if the notebook vanished
 
 
-def _hub(request: Request) -> RelayHub:
+CHANNELS = ("model", "computer")
+
+
+def _hub(request: Request, channel: str = "model") -> RelayHub:
+    """One RelayHub per role channel so the model host and the computer host never
+    steal each other's jobs."""
     services = request.app.state.bt
-    hub = getattr(services, "relay_hub", None)
+    hubs = getattr(services, "relay_hubs", None)
+    if hubs is None:
+        hubs = {}
+        services.relay_hubs = hubs
+    hub = hubs.get(channel)
     if hub is None:
         hub = RelayHub()
-        services.relay_hub = hub
+        hubs[channel] = hub
     return hub
 
 
@@ -104,9 +113,11 @@ def _authed(request: Request, expected: str) -> bool:
 
 
 # --------------------------------------------------------------------------- control plane (notebook side)
-async def relay_pull(request: Request):
+async def relay_pull(request: Request, channel: str = "model"):
     """Long-poll: hand the next queued request to the notebook, or 204 when quiet."""
-    hub = _hub(request)
+    if channel not in CHANNELS:
+        channel = "model"
+    hub = _hub(request, channel)
     if not _authed(request, await _row_key(request)):
         raise HTTPException(status_code=401, detail={"code": "relay_auth", "message": "unknown relay key"})
     hub.last_seen = time.monotonic()
@@ -135,7 +146,15 @@ async def relay_pull(request: Request):
 
 async def relay_push(request: Request, job_id: str):
     """Stream the gateway's response back; the body is forwarded chunk for chunk."""
-    hub = _hub(request)
+    services = request.app.state.bt
+    hubs = getattr(services, "relay_hubs", {}) or {}
+    hub = None
+    for candidate in hubs.values():
+        if job_id in candidate.inflight:
+            hub = candidate
+            break
+    if hub is None:
+        hub = _hub(request)
     if not _authed(request, await _row_key(request)):
         raise HTTPException(status_code=401, detail={"code": "relay_auth", "message": "unknown relay key"})
     hub.last_seen = time.monotonic()
@@ -165,12 +184,23 @@ async def relay_push(request: Request, job_id: str):
 
 # --------------------------------------------------------------------------- data plane (agent side)
 async def relay_proxy(request: Request, path: str = ""):
-    """Any method, any path under /gpu-relay/: pipe it to the notebook gateway and stream back."""
+    """Any method, any path under /gpu-relay/: pipe it to the notebook gateway and stream back.
+
+    ``/gpu-relay/computer/...`` selects the computer channel (the leading segment is
+    stripped before forwarding); everything else rides the model channel for
+    backward compatibility with the published model URL.
+    """
+    channel = "model"
+    for candidate in CHANNELS:
+        if path == candidate or path.startswith(candidate + "/"):
+            channel = candidate
+            path = path[len(candidate):].lstrip("/")
+            break
     if path.startswith("api/kaggle-relay"):
         # the control plane lives on the app origin; asking for it through the data plane
         # would queue a request for the very client that is asking
         raise HTTPException(status_code=404, detail={"code": "relay_path", "message": "control plane is /api/kaggle-relay/*"})
-    hub = _hub(request)
+    hub = _hub(request, channel)
     if not hub.alive():
         raise HTTPException(status_code=502,
                             detail={"code": "gpu_unreachable",

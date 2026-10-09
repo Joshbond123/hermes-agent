@@ -15,16 +15,18 @@ KEY = "test-key"
 class Notebook:
     """What the notebook-side relay client does, in-process: pull, execute, push."""
 
-    def __init__(self, stack, key: str = KEY):
+    def __init__(self, stack, key: str = KEY, channel: str = "model"):
         self.stack = stack
         self.key = key
+        self.channel = channel
         self.seen = []
         self.respond = {"status": 200, "content_type": "application/json", "body": b'{"ok": true}', "chunks": None}
         self.push = True
 
     async def run_once(self) -> int:
         async with httpx.AsyncClient(timeout=30) as c:
-            r = await c.get(f"{self.stack.url}/api/kaggle-relay/pull", headers={"X-Blackthorn-Key": self.key})
+            r = await c.get(f"{self.stack.url}/api/kaggle-relay/pull?channel={self.channel}",
+                            headers={"X-Blackthorn-Key": self.key})
             if r.status_code != 200:
                 return r.status_code
             job = r.json()
@@ -94,8 +96,9 @@ async def test_relay_pull_requires_the_per_boot_key(stack):
 
 
 async def test_relay_proxy_fails_fast_when_no_notebook_is_connected(stack):
-    stack.services.relay_hub = relay_mod.RelayHub()
-    stack.services.relay_hub.last_seen = 0.0                     # nobody has been around for ages
+    hub = relay_mod.RelayHub()
+    hub.last_seen = 0.0                                          # nobody has been around for ages
+    stack.services.relay_hubs = {"model": hub}
     resp = await _proxy(stack)
     assert resp.status_code == 502
     assert resp.json()["detail"]["code"] == "gpu_unreachable"
@@ -123,3 +126,26 @@ async def test_relay_quiet_poll_returns_204(stack, monkeypatch):
     monkeypatch.setattr(relay_mod, "PULL_WAIT_S", 0.2)
     nb = Notebook(stack)
     assert await nb.run_once() == 204
+
+
+async def test_model_and_computer_channels_never_share_jobs(stack):
+    nb_model = Notebook(stack)
+    nb_model.respond = {"status": 200, "content_type": "application/json", "body": b'{"who":"model"}'}
+    nb_comp = Notebook(stack, channel="computer")
+    nb_comp.respond = {"status": 200, "content_type": "application/json", "body": b'{"who":"computer"}'}
+
+    async def call(path):
+        async with httpx.AsyncClient(timeout=30) as c:
+            return await c.get(f"{stack.url}/gpu-relay/{path}")
+
+    # the published computer base is /gpu-relay/computer, so gateway paths arrive doubled
+    jobs = [asyncio.create_task(call("v1/models")),
+            asyncio.create_task(call("computer/computer/info"))]
+    await asyncio.sleep(0.05)
+    await nb_model.run_once()
+    await nb_comp.run_once()
+    resp_model, resp_comp = await jobs[0], await jobs[1]
+    # each notebook got exactly the job of its own channel
+    assert nb_model.seen and nb_model.seen[0]["path"] == "v1/models"
+    assert nb_comp.seen and nb_comp.seen[0]["path"] == "computer/info"
+    assert b"model" in resp_model.content and b"computer" in resp_comp.content
