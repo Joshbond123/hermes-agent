@@ -108,8 +108,8 @@ def test_failover_syncs_state_before_booting_the_backup(ops):
         fm.mirror_state_dataset = orig_mirror
     assert out["account"] == "alagbo"
     assert order.index("sync") < order.index("boot:alagbo")           # state first, then switch
-    assert "StopKernel:josh787" in order                              # old primary retired afterwards
-    assert order.index("boot:alagbo") < order.index("StopKernel:josh787")
+    assert "GetKernelSessionStatus:josh787" in order                  # old primary retire attempted after
+    assert order.index("boot:alagbo") < order.index("GetKernelSessionStatus:josh787")
 
 
 def test_resource_exhaustion_is_reported_not_hidden(ops):

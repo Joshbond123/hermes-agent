@@ -1603,8 +1603,7 @@ def failover_fleet_role(role: str, from_slot: str, to_slot: str) -> Dict[str, An
     # 3) stop the old active's kernel only after the new one is on its way
     if old is not None:
         try:
-            fleet.rpc(old, "StopKernel", {"slug": kernel_slug_for(old)})
-            out["old_stopped"] = True
+            out["old_stopped"] = fleet.stop_kernel_session(old, kernel_slug_for(old))
         except Exception:  # noqa: BLE001
             out["old_stopped"] = False
     return out
@@ -1625,10 +1624,11 @@ def turn_off_fleet() -> Dict[str, Any]:
         if account is None:
             out[role] = {"status": "unconfigured"}
             continue
-        slug = kernel_slug_for(account)
+        found = fleet.find_role_kernel(account)
+        slug = (found or {}).get("slug") or kernel_slug_for(account)
         try:
-            fleet.rpc(account, "StopKernel", {"slug": slug})
-            out[role] = {"account": account.user, "status": "stopping"}
+            stopped = fleet.stop_kernel_session(account, slug)
+            out[role] = {"account": account.user, "status": "stopped" if stopped else "not_running"}
         except Exception as exc:  # noqa: BLE001
             out[role] = {"account": account.user, "status": "stop_failed", "error": str(exc)[:160]}
         _write_fleet_row(row_id, "GPU_STOPPED_SAVING_QUOTA", gpu_info="")
