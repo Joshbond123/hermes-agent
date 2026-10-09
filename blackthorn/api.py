@@ -391,7 +391,12 @@ async def fleet_status(request: Request, refresh: bool = False):
                 s.fleet.decide(role, force=True)
         else:
             s.fleet.refresh_slots()
-        return {"configured": True, **s.fleet.status()}
+        out = {"configured": True, **s.fleet.status()}
+        try:
+            out["live"] = {"model": await s.store.gpu_row(), "computer": await s.store.computer_row()}
+        except Exception:  # noqa: BLE001
+            out["live"] = {}
+        return out
     except Exception as exc:  # noqa: BLE001 - the panel must show errors, not 500
         return {"configured": True, "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
 
@@ -406,6 +411,25 @@ async def fleet_decide(request: Request):
         st = s.fleet.decide(role, force=True)
         out[role] = {"active": st.active, "reason": st.reason}
     return out
+
+
+@router.post("/api/fleet/sync")
+async def fleet_sync(request: Request):
+    """Mirror the computer pair's state dataset (primary -> backup) on demand."""
+    s = svc(request)
+    if s.fleet is None:
+        raise _err(503, "fleet_unconfigured", "No fleet accounts are configured on this server.")
+    from .fleet import mirror_state_dataset
+    primary = s.fleet.by_slot.get(("computer", "primary"))
+    backup = s.fleet.by_slot.get(("computer", "backup"))
+    if primary is None or backup is None:
+        raise _err(503, "pair_incomplete", "Both computer accounts are required for sync.")
+    import asyncio as _a
+    try:
+        result = await _a.to_thread(mirror_state_dataset, primary, backup)
+    except Exception as exc:  # noqa: BLE001
+        raise _err(502, "sync_failed", f"{type(exc).__name__}: {str(exc)[:160]}")
+    return result
 
 
 # --------------------------------------------------------------------------- durable GPU relay

@@ -89,10 +89,20 @@ def create_app(settings: Optional[Settings] = None, *, services: Optional[Servic
             import threading
 
             def _fleet_watchdog() -> None:
+                active = {role: bt.fleet.state[role].active for role in ("model", "computer")}
                 while True:
                     try:
                         for role in ("model", "computer"):
-                            bt.fleet.decide(role)
+                            before = active[role]
+                            st = bt.fleet.decide(role)
+                            if st.active != before:
+                                active[role] = st.active
+                                log.warning("fleet failover: %s %s -> %s (%s)", role, before, st.active, st.reason)
+                                try:
+                                    import cloudflare_d1_client as _d1
+                                    _d1.failover_fleet_role(role, before, st.active)
+                                except Exception:  # noqa: BLE001
+                                    log.exception("failover execution failed for %s", role)
                     except Exception:  # noqa: BLE001 - a watchdog must survive anything
                         log.exception("fleet watchdog tick failed")
                     import time as _t

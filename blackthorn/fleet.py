@@ -353,6 +353,57 @@ class FleetManager:
                 log.warning("fleet restore failed for %s", role, exc_info=True)
 
 
+def kernel_slug_for(account: Account) -> str:
+    return f"{account.user}/blackthorn-{account.role}"
+
+
+def notebook_env_for(account: Account, base_env: Dict[str, str]) -> Dict[str, str]:
+    """Per-account environment for the notebook: the kernel always speaks with its own
+    credentials (state dataset, heartbeats) so pairs can be synchronized and failed over."""
+    env = dict(base_env)
+    env["KAGGLE_USERNAME"] = account.user
+    env["KAGGLE_API_TOKEN"] = account.token
+    if account.role == "computer":
+        env["ORNITH_ROLE"] = "computer"
+        env.setdefault("COMPUTER_STATE_DATASET", f"{account.user}/blackthorn-computer-state")
+    return env
+
+
+def mirror_state_dataset(from_account: Account, to_account: Account, *,
+                         dataset_slug: str = "blackthorn-computer-state",
+                         runner: Optional[Callable[[List[str], Dict[str, str]], int]] = None) -> Dict[str, Any]:
+    """Copy the computer state dataset from one account to its pair partner.
+
+    The primary is the source of truth. This runs in the controller (it holds all four
+    credentials) right after checkpoints and before failovers, so the backup always has
+    the newest published generation to boot from.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
+    def _run(cmd: List[str], env: Dict[str, str]) -> int:
+        if runner is not None:
+            return runner(cmd, env)
+        proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=1800)
+        return proc.returncode
+
+    src_slug = f"{from_account.user}/{dataset_slug}"
+    dst_slug = f"{to_account.user}/{dataset_slug}"
+    with tempfile.TemporaryDirectory() as tmp:
+        env_down = {"KAGGLE_USERNAME": from_account.user, "KAGGLE_KEY": from_account.token,
+                    "PATH": os.environ.get("PATH", "")}
+        rc = _run(["kaggle", "datasets", "download", "-p", tmp, "-u", src_slug], env_down)
+        if rc != 0:
+            return {"ok": False, "error": f"download rc={rc}"}
+        env_up = {"KAGGLE_USERNAME": to_account.user, "KAGGLE_KEY": to_account.token,
+                  "PATH": os.environ.get("PATH", "")}
+        rc = _run(["kaggle", "datasets", "create", "-p", tmp, "--dir-mode", "zip"], env_up)
+        if rc != 0:
+            rc = _run(["kaggle", "datasets", "version", "-p", tmp, "-m", "mirror"], env_up)
+        return {"ok": rc == 0, "from": src_slug, "to": dst_slug, "error": "" if rc == 0 else f"upload rc={rc}"}
+
+
 def accounts_from_env(env: Dict[str, str]) -> List[Account]:
     """Build the fleet from environment variables (KAGGLE_FLEET_*)."""
 

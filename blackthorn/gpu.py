@@ -115,10 +115,28 @@ class GpuService:
 
     async def turn_on(self) -> Dict[str, Any]:
         d1 = self._module()
+        if hasattr(d1, "turn_on_fleet"):
+            try:
+                import os
+                from .fleet import accounts_from_env
+                if accounts_from_env(os.environ):
+                    out = await asyncio.to_thread(d1.turn_on_fleet)
+                    return {"fleet": out}
+            except Exception:  # noqa: BLE001 - fall back to the single-GPU path
+                pass
         return await self._augment(await asyncio.to_thread(d1.turn_on_kaggle_gpu))
 
     async def turn_off(self) -> Dict[str, Any]:
         d1 = self._module()
+        if hasattr(d1, "turn_off_fleet"):
+            try:
+                import os
+                from .fleet import accounts_from_env
+                if accounts_from_env(os.environ):
+                    out = await asyncio.to_thread(d1.turn_off_fleet)
+                    return {"fleet": out}
+            except Exception:  # noqa: BLE001
+                pass
         return await self._augment(await asyncio.to_thread(d1.turn_off_kaggle_gpu))
 
     async def activity(self) -> Dict[str, Any]:

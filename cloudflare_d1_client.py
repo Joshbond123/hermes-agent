@@ -1490,6 +1490,151 @@ def _turn_on_kaggle_gpu_sync() -> Dict[str, Any]:
     return get_kaggle_gpu_status(force_refresh=True)
 
 
+def _write_fleet_row(row_id: str, status: str, tunnel_url: str = "", api_key: str = "",
+                     model: str = "Qwen3.8-27B-Uncensored", gpu_info: str = "") -> None:
+    try:
+        d1_query(
+            "INSERT OR REPLACE INTO kaggle_gpu_state (id, status, tunnel_url, api_key, model, gpu_info, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?);",
+            [row_id, status, tunnel_url, api_key, model, gpu_info, time.time()])
+    except Exception as exc:
+        logger.warning("fleet row write note (%s): %s", row_id, exc)
+
+
+def turn_on_fleet() -> Dict[str, Any]:
+    """Start the model GPU and the computer GPU TOGETHER on their fleet-active accounts.
+
+    Policy: only the *active* account of each role boots — the backup stays completely
+    cold (burning zero quota) until the fleet engine flips the role at the 30-minute
+    threshold or on a hard failure. Both systems boot in parallel with their own state
+    row so the controller shows independent progress.
+    """
+    from blackthorn.fleet import (FleetManager, accounts_from_env, kernel_slug_for,
+                                  notebook_env_for)
+    from blackthorn.kaggle_bundle import build_computer_notebook_text, build_notebook_text
+
+    ensure_d1_schema()
+    accounts = accounts_from_env(os.environ)
+    if not accounts:
+        # legacy single-account behaviour
+        return turn_on_kaggle_gpu()
+    fleet = FleetManager(accounts)
+    plan: Dict[str, Any] = {}
+    for role in ("model", "computer"):
+        st = fleet.decide(role, force=True)
+        account = fleet.by_slot.get((role, st.active))
+        plan[role] = {"state": st, "account": account}
+
+    def boot(role: str) -> Dict[str, Any]:
+        st, account = plan[role]["state"], plan[role]["account"]
+        if account is None:
+            _write_fleet_row("computer" if role == "computer" else "primary", "BOOT_FAILED")
+            return {"role": role, "status": "unconfigured"}
+        row_id = "computer" if role == "computer" else "primary"
+        try:
+            env = notebook_env_for(account, dict(os.environ))
+            text = (build_computer_notebook_text if role == "computer" else build_notebook_text)(env=env)
+        except Exception as exc:  # noqa: BLE001 - surface honestly per-role
+            _write_fleet_row(row_id, "BOOT_FAILED", gpu_info=f"FAILED: {exc}")
+            return {"role": role, "account": account.user, "status": "build_failed", "error": str(exc)[:200]}
+        slug = kernel_slug_for(account)
+        _write_fleet_row(row_id, "BOOTING_KAGGLE_GPU", gpu_info=f"Allocating on {account.user}...")
+        try:
+            out = fleet.start_kernel(account, slug=slug, title=f"Blackthorn {role} ({account.user})",
+                                     notebook_text=text)
+            return {"role": role, "account": account.user, "slug": slug,
+                    "slot": st.active, "reason": st.reason, "status": "starting", "push": bool(out)}
+        except Exception as exc:  # noqa: BLE001
+            _write_fleet_row(row_id, "BOOT_FAILED", gpu_info=f"FAILED: {exc}")
+            return {"role": role, "account": account.user, "status": "start_failed", "error": str(exc)[:200]}
+
+    import concurrent.futures as _fut
+    results: Dict[str, Any] = {}
+    with _fut.ThreadPoolExecutor(max_workers=2) as pool:
+        futs = {role: pool.submit(boot, role) for role in ("model", "computer")}
+        for role, fut in futs.items():
+            try:
+                results[role] = fut.result(timeout=300)
+            except Exception as exc:  # noqa: BLE001
+                results[role] = {"role": role, "status": "start_failed", "error": str(exc)[:200]}
+    results["fleet"] = fleet.status()
+    return results
+
+
+def failover_fleet_role(role: str, from_slot: str, to_slot: str) -> Dict[str, Any]:
+    """Execute a failover the fleet engine decided: sync state, boot the new active, retire the old.
+
+    The backup has been completely cold until this moment (zero quota burned); this is
+    the first and only time its kernel starts.
+    """
+    from blackthorn.fleet import (FleetManager, accounts_from_env, kernel_slug_for,
+                                  mirror_state_dataset, notebook_env_for)
+    from blackthorn.kaggle_bundle import build_computer_notebook_text, build_notebook_text
+
+    accounts = accounts_from_env(os.environ)
+    fleet = FleetManager(accounts)
+    old = fleet.by_slot.get((role, from_slot))
+    new = fleet.by_slot.get((role, to_slot))
+    if new is None:
+        return {"ok": False, "error": "no account for the new active slot"}
+    out: Dict[str, Any] = {"role": role, "from": from_slot, "to": to_slot, "account": new.user}
+
+    # 1) bring the pair as close as possible before switching (computer state only)
+    if role == "computer" and old is not None and from_slot == "primary":
+        try:
+            out["sync"] = mirror_state_dataset(old, new)
+        except Exception as exc:  # noqa: BLE001
+            out["sync"] = {"ok": False, "error": str(exc)[:160]}
+
+    # 2) boot the new active (this is when the backup starts running)
+    row_id = "computer" if role == "computer" else "primary"
+    try:
+        env = notebook_env_for(new, dict(os.environ))
+        text = (build_computer_notebook_text if role == "computer" else build_notebook_text)(env=env)
+        slug = kernel_slug_for(new)
+        _write_fleet_row(row_id, "BOOTING_KAGGLE_GPU", gpu_info=f"Failover to {new.user}...")
+        fleet.start_kernel(new, slug=slug, title=f"Blackthorn {role} ({new.user})", notebook_text=text)
+        out.update(status="starting", slug=slug)
+    except Exception as exc:  # noqa: BLE001
+        _write_fleet_row(row_id, "BOOT_FAILED", gpu_info=f"FAILED: {exc}")
+        out.update(status="start_failed", error=str(exc)[:200])
+        return out
+
+    # 3) stop the old active's kernel only after the new one is on its way
+    if old is not None:
+        try:
+            fleet.rpc(old, "StopKernel", {"slug": kernel_slug_for(old)})
+            out["old_stopped"] = True
+        except Exception:  # noqa: BLE001
+            out["old_stopped"] = False
+    return out
+
+
+def turn_off_fleet() -> Dict[str, Any]:
+    """Stop the running kernels of both roles (best effort, honest per-role result)."""
+    from blackthorn.fleet import FleetManager, accounts_from_env, kernel_slug_for
+    accounts = accounts_from_env(os.environ)
+    if not accounts:
+        return turn_off_kaggle_gpu()
+    fleet = FleetManager(accounts)
+    out: Dict[str, Any] = {}
+    for role in ("model", "computer"):
+        st = fleet.state[role]
+        account = fleet.by_slot.get((role, st.active)) or fleet.by_slot.get((role, "primary"))
+        row_id = "computer" if role == "computer" else "primary"
+        if account is None:
+            out[role] = {"status": "unconfigured"}
+            continue
+        slug = kernel_slug_for(account)
+        try:
+            fleet.rpc(account, "StopKernel", {"slug": slug})
+            out[role] = {"account": account.user, "status": "stopping"}
+        except Exception as exc:  # noqa: BLE001
+            out[role] = {"account": account.user, "status": "stop_failed", "error": str(exc)[:160]}
+        _write_fleet_row(row_id, "GPU_STOPPED_SAVING_QUOTA", gpu_info="")
+    return out
+
+
 def turn_off_kaggle_gpu() -> Dict[str, Any]:
     """Immediately turn OFF the Kaggle GPU session to save weekly GPU quota."""
     global _STATUS_CACHE_TS
