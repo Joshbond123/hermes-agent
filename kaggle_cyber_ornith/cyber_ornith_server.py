@@ -1734,7 +1734,18 @@ def main() -> None:
                 _tunnel_fail_streak += 1
                 log(f"⚠️ public tunnel health fail streak={_tunnel_fail_streak}: {type(_te).__name__}")
             if _tunnel_fail_streak >= 3:
-                log("⚠️ public tunnel unhealthy 3× — forcing cloudflared restart")
+                log("⚠️ public tunnel unhealthy 3× — checking gateway, then restarting tunnel")
+                # a dead gateway looks exactly like a dead tunnel from the outside; revive it first
+                try:
+                    urllib.request.urlopen(f"http://127.0.0.1:{GATEWAY_PORT}/health", timeout=5)
+                except Exception:
+                    log("⚠️ local gateway is down — restarting it")
+                    try:
+                        subprocess.run(["pkill", "-f", "gateway_server"], capture_output=True, timeout=10)
+                        time.sleep(1)
+                        start_gateway()
+                    except Exception as _ge:
+                        log(f"⚠️ gateway restart note: {_ge}")
                 try:
                     cf_proc.terminate()
                 except Exception:
