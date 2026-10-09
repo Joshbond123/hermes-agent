@@ -1465,52 +1465,65 @@ def _kaggle_cli_env() -> dict:
 def restore_workspace() -> bool:
     """Bring the computer workspace back from the state dataset before any work begins.
 
-    Never deletes local data it does not understand: an existing workspace wins over an
-    older snapshot, and the manifest records which generation was restored.
+    Never deletes local data it does not understand: an existing file wins over an
+    older snapshot copy, and the manifest records which generation was restored.
     """
     if not STATE_DATASET:
         log("Persistence: no COMPUTER_STATE_DATASET configured — starting with a live workspace")
         return False
-    owner_slug = STATE_DATASET
-    url = f"https://www.kaggle.com/api/v1/datasets/download/{owner_slug}"
     os.makedirs(STATE_DIR, exist_ok=True)
-    archive = os.path.join(STATE_DIR, "state.zip")
-    try:
-        urllib.request.urlretrieve(url, archive)   # authenticated via ~/.kaggle/kaggle.json when present
-    except Exception:
-        try:
-            req = urllib.request.Request(url, headers={"Authorization": "Bearer " + KAGGLE_API_TOKEN})
-            with urllib.request.urlopen(req, timeout=120) as resp, open(archive, "wb") as fh:
-                shutil.copyfileobj(resp, fh)
-        except Exception as exc:
-            log(f"Persistence: no snapshot to restore ({type(exc).__name__}) — fresh workspace")
-            return False
-    try:
-        with zipfile.ZipFile(archive) as zf:
-            zf.extractall(STATE_DIR)
-        snapshot = os.path.join(STATE_DIR, "workspace")
-        if os.path.isdir(snapshot):
-            os.makedirs(COMPUTER_WORKSPACE, exist_ok=True)
-            copied = 0
-            for root, _dirs, files in os.walk(snapshot):
-                rel = os.path.relpath(root, snapshot)
-                dest = os.path.join(COMPUTER_WORKSPACE, rel) if rel != "." else COMPUTER_WORKSPACE
-                os.makedirs(dest, exist_ok=True)
-                for name in files:
-                    src_f, dst_f = os.path.join(root, name), os.path.join(dest, name)
-                    if not os.path.exists(dst_f):            # never overwrite newer local files
-                        try:
-                            os.link(src_f, dst_f)
-                        except OSError:
-                            shutil.copy2(src_f, dst_f)
-                        copied += 1
-            gen = "?"
+    archive_dir = os.path.join(STATE_DIR, "download")
+    if os.path.isdir(archive_dir):
+        shutil.rmtree(archive_dir, ignore_errors=True)
+    os.makedirs(archive_dir, exist_ok=True)
+    env = _kaggle_cli_env()
+
+    def _kaggle(args):
+        for cmd in (["kaggle", *args], [sys.executable, "-m", "kaggle", *args]):
             try:
-                gen = json.load(open(STATE_MANIFEST)).get("generation", "?")
-            except Exception:
-                pass
-            log(f"✅ Persistence: restored {copied} files (generation {gen}) into {COMPUTER_WORKSPACE}")
-            return True
+                return subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=600)
+            except FileNotFoundError:
+                continue
+        class _R:
+            returncode = 127
+            stderr = "kaggle CLI not installed"
+            stdout = ""
+        return _R()
+
+    proc = _kaggle(["datasets", "download", "-p", archive_dir, STATE_DATASET])
+    if proc.returncode != 0:
+        log(f"Persistence: no snapshot to restore ({(proc.stderr or proc.stdout or '')[-160:]})")
+        return False
+    try:
+        extracted = os.path.join(archive_dir, "unzipped")
+        os.makedirs(extracted, exist_ok=True)
+        for name in os.listdir(archive_dir):
+            if name.endswith(".zip"):
+                with zipfile.ZipFile(os.path.join(archive_dir, name)) as zf:
+                    zf.extractall(extracted)
+        os.makedirs(COMPUTER_WORKSPACE, exist_ok=True)
+        copied = 0
+        for root, _dirs, files in os.walk(extracted):
+            rel = os.path.relpath(root, extracted)
+            dest = os.path.join(COMPUTER_WORKSPACE, rel) if rel != "." else COMPUTER_WORKSPACE
+            os.makedirs(dest, exist_ok=True)
+            for name in files:
+                if name in ("dataset-metadata.json", "manifest.json") and rel == ".":
+                    continue
+                src_f, dst_f = os.path.join(root, name), os.path.join(dest, name)
+                if not os.path.exists(dst_f):            # never overwrite newer local files
+                    try:
+                        os.link(src_f, dst_f)
+                    except OSError:
+                        shutil.copy2(src_f, dst_f)
+                    copied += 1
+        gen = "?"
+        try:
+            gen = json.load(open(os.path.join(extracted, "manifest.json"))).get("generation", "?")
+        except Exception:
+            pass
+        log(f"✅ Persistence: restored {copied} files (generation {gen}) into {COMPUTER_WORKSPACE}")
+        return True
     except Exception as exc:
         log(f"Persistence: restore failed ({type(exc).__name__}: {exc})")
     return False

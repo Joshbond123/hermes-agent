@@ -28,7 +28,7 @@
   "blackthorn/version.py": "5d43f6378622c4ddeeec627755c2e98152f6077be9334b2770c3a8199018bf37",
   "blackthorn_start.py": "d8189febd25f393cc6b41cd17f7cc88d73ecaa44942fa52f51dd310602b108df",
   "cloudflare_d1_client.py": "1fa6d3218739e16f953644c8010c2d8bc37ef2fa077fdc34eeafb702d4e3cb5b",
-  "kaggle_cyber_ornith/cyber_ornith_server.py": "395eb5a3871278f20fb2ca37297ef45b6f64783cbb8a8d7e08f962f970958e96"
+  "kaggle_cyber_ornith/cyber_ornith_server.py": "440aaaf4b15214e69e01b57aa40b4f757c91e23e1ff8d8e8b9b4da227bb6e54a"
  },
  "version": "5.0.0"
 }

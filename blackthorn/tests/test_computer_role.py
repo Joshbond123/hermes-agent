@@ -2,6 +2,7 @@
 
 import io
 import json
+import os
 import zipfile
 
 import httpx
@@ -14,33 +15,47 @@ from blackthorn.tools.computer import ComputerClient, ToolError
 
 # --------------------------------------------------------------------------- persistence
 def _zip_with(files):
+    """Snapshot zips are flat: files at the root, manifest.json alongside."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
         for name, content in files.items():
-            zf.writestr(f"workspace/{name}", content)
+            zf.writestr(name, content)
         zf.writestr("manifest.json", json.dumps({"generation": 42, "files": len(files)}))
     return buf.getvalue()
 
 
+def _fake_cli(zip_bytes):
+    """Stub the kaggle CLI: 'datasets download' drops the zip into -p; everything else succeeds."""
+    def run(cmd, **kw):
+        class R:
+            returncode = 0
+            stderr = ""
+            stdout = ""
+
+        if "download" in cmd:
+            idx = cmd.index("-p")
+            dest = cmd[idx + 1]
+            os.makedirs(dest, exist_ok=True)
+            with open(os.path.join(dest, "state.zip"), "wb") as fh:
+                fh.write(zip_bytes)
+        return R()
+
+    return run
+
+
 def test_restore_brings_back_snapshot_files_but_never_overwrites_newer_local(tmp_path, monkeypatch):
-    snap = _zip_with({"notes.md": "from snapshot", "scripts/run.sh": "#!/bin/sh"})
-    (tmp_path / "dl").mkdir()
-
-    def fake_urlretrieve(url, dest):
-        with open(dest, "wb") as fh:
-            fh.write(snap)
-
-    monkeypatch.setattr(srv.urllib.request, "urlretrieve", fake_urlretrieve)
+    snap = _zip_with({"hello.txt": "from snapshot", "scripts/run.sh": "#!/bin/sh"})
     monkeypatch.setattr(srv, "STATE_DATASET", "josh787/blackthorn-computer-state")
     monkeypatch.setattr(srv, "STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setattr(srv, "STATE_MANIFEST", str(tmp_path / "state" / "manifest.json"))
     monkeypatch.setattr(srv, "COMPUTER_WORKSPACE", str(tmp_path / "ws"))
+    monkeypatch.setattr(srv.subprocess, "run", _fake_cli(snap))
     (tmp_path / "ws").mkdir()
-    (tmp_path / "ws" / "notes.md").write_text("local and newer")     # must survive
+    (tmp_path / "ws" / "hello.txt").write_text("local and newer")     # must survive
 
     assert srv.restore_workspace() is True
     ws = tmp_path / "ws"
-    assert (ws / "notes.md").read_text() == "local and newer"        # never overwritten
+    assert (ws / "hello.txt").read_text() == "local and newer"        # never overwritten
     assert (ws / "scripts" / "run.sh").exists()                      # missing files restored
 
 
@@ -48,12 +63,17 @@ def test_restore_without_dataset_or_snapshot_is_honest(tmp_path, monkeypatch):
     monkeypatch.setattr(srv, "STATE_DATASET", "")
     assert srv.restore_workspace() is False
 
-    def boom(url, dest):
-        raise OSError("no snapshot")
+    def boom(cmd, **kw):
+        class R:
+            returncode = 1
+            stderr = "403 forbidden"
+            stdout = ""
+
+        return R()
 
     monkeypatch.setattr(srv, "STATE_DATASET", "josh787/blackthorn-computer-state")
     monkeypatch.setattr(srv, "STATE_DIR", str(tmp_path / "state"))
-    monkeypatch.setattr(srv.urllib.request, "urlretrieve", boom)
+    monkeypatch.setattr(srv.subprocess, "run", boom)
     assert srv.restore_workspace() is False                          # fresh workspace, no crash
 
 
