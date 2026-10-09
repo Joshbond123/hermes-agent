@@ -87,6 +87,7 @@ COMPUTER_WORKSPACE = os.environ.get("COMPUTER_WORKSPACE") or f"{WORK_ROOT}/black
 STATE_DATASET = (os.environ.get("COMPUTER_STATE_DATASET") or "").strip()   # e.g. josh787/blackthorn-computer-state
 STATE_DIR = "/tmp/computer_state"
 STATE_MANIFEST = f"{STATE_DIR}/manifest.json"
+CHECKPOINT_INTERVAL_S = int(os.environ.get("COMPUTER_CHECKPOINT_S") or "1200")
 BLIND_DISK_DIR = f"{_tmp}/model_cache"
 UPLOAD_DIR = f"{WORK_ROOT}/cache_upload"
 MARKER_PATH = f"{BLIND_DISK_DIR}/.verified"
@@ -1533,12 +1534,21 @@ def checkpoint_workspace(label: str = "") -> dict:
         json.dump({"title": "Blackthorn Computer State", "id": STATE_DATASET,
                    "licenses": [{"name": "other"}]}, fh)
     env = _kaggle_cli_env()
-    proc = subprocess.run(["kaggle", "datasets", "version", "-p", snap, "-m", f"gen {generation} {label}"[:100],
-                           "--dir-mode", "zip"],
-                          capture_output=True, text=True, env=env, timeout=1800)
+    def _kaggle(args):
+        for cmd in (["kaggle", *args], [sys.executable, "-m", "kaggle", *args]):
+            try:
+                return subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=1800)
+            except FileNotFoundError:
+                continue
+        class _R:
+            returncode = 127
+            stderr = "kaggle CLI not installed"
+            stdout = ""
+        return _R()
+
+    proc = _kaggle(["datasets", "version", "-p", snap, "-m", f"gen {generation} {label}"[:100], "--dir-mode", "zip"])
     if proc.returncode != 0:
-        proc = subprocess.run(["kaggle", "datasets", "create", "-p", snap, "--dir-mode", "zip"],
-                              capture_output=True, text=True, env=env, timeout=1800)
+        proc = _kaggle(["datasets", "create", "-p", snap, "--dir-mode", "zip"])
     ok = proc.returncode == 0
     if ok:
         log(f"💾 Persistence: checkpoint generation {generation} ({files} files) published")
@@ -1616,6 +1626,12 @@ def main_computer(started: float) -> None:
     notify_workspace("INSTALLING_DEPS", extra={"role": "computer"})
     try:
         ensure_python_deps()
+        try:
+            subprocess.run([sys.executable, "-m", "kaggle", "--version"], capture_output=True, timeout=30)
+        except Exception:
+            log("📦 Installing the kaggle CLI (checkpoint publishing needs it)")
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-input", "kaggle"],
+                           check=False, timeout=600)
     except Exception as exc:
         fail("BOOT_FAILED", f"dependency install failed: {exc}")
         return
@@ -1658,10 +1674,12 @@ def main_computer(started: float) -> None:
                 cf_proc, tunnel_url = launch_cloudflared(cloudflared_bin)
             except Exception as exc:
                 log(f"relay restart note: {exc}")
-        if now - _last_checkpoint >= 20 * 60:
+        if now - _last_checkpoint >= CHECKPOINT_INTERVAL_S:
             _last_checkpoint = now
             try:
-                checkpoint_workspace("auto")
+                result = checkpoint_workspace("auto")
+                if not result.get("ok"):
+                    log(f"Persistence checkpoint FAILED: {result.get('error')}")
             except Exception as exc:
                 log(f"Persistence checkpoint note: {exc}")
         if now - _last_heartbeat >= 90:
