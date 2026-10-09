@@ -37,7 +37,7 @@ class _Job:
     path: str
     headers: Dict[str, str]
     body: bytes
-    chunks: "asyncio.Queue[Optional[bytes]]" = field(default_factory=asyncio.Queue)
+    chunks: "asyncio.Queue[Optional[bytes]]" = field(default_factory=lambda: asyncio.Queue(maxsize=256))
     headers_ready: "asyncio.Event" = field(default_factory=asyncio.Event)
     status: int = 200
     content_type: str = "application/octet-stream"
@@ -140,6 +140,10 @@ async def relay_push(request: Request, job_id: str):
         job.pushed = True
         job.headers_ready.set()
         async for chunk in request.stream():
+            if hub.inflight.get(job_id) is not job:
+                # the consumer is gone (cancelled run, timeout): tell the notebook to stop
+                # streaming into a dead job - its upstream call then closes and the model frees
+                return JSONResponse({"dropped": True}, status_code=410)
             if chunk:
                 await job.chunks.put(chunk)
     except Exception:
