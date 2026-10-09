@@ -112,9 +112,17 @@ async def relay_pull(request: Request):
     hub.last_seen = time.monotonic()
     hub.waiting_pulls += 1
     try:
-        job = await asyncio.wait_for(hub.pending.get(), timeout=PULL_WAIT_S)
-    except asyncio.TimeoutError:
-        return JSONResponse({"quiet": True}, status_code=204)
+        # poll instead of wait_for(queue.get()): a cancelled getter can swallow a job that
+        # arrived in the same instant as the timeout, and the request would then wait forever
+        job = None
+        deadline = time.monotonic() + PULL_WAIT_S
+        while job is None:
+            try:
+                job = hub.pending.get_nowait()
+            except asyncio.QueueEmpty:
+                if time.monotonic() >= deadline:
+                    return JSONResponse({"quiet": True}, status_code=204)
+                await asyncio.sleep(0.25)
     finally:
         hub.waiting_pulls -= 1
     hub.last_seen = time.monotonic()
