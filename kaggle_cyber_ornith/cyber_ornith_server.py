@@ -813,25 +813,25 @@ def ensure_llama_server_bin() -> str:
 
 
 def start_llama_server(gguf_path: str) -> None:
-    """Start OpenAI-compatible llama-server on GPU 0 only.
+    """Start OpenAI-compatible llama-server across BOTH GPUs for maximum inference speed.
 
-    GPU 1 is intentionally left free for the agent's computer / terminal workloads
-    (kernels, compile, tools). The 27B Q4 weights (~16.8 GB) do not fully fit in one
-    15 GB T4, so layers that do not fit spill to system RAM via -ngl rather than
-    claiming the second GPU.
+    The agent's computer runs on its own dedicated hosts (josh787 / alagbo), so this
+    machine hosts the model only: all 2x T4 work for it. The 27B Q4 weights (~15.7 GiB)
+    fit fully in the combined VRAM with room for the KV cache, which gives the fastest
+    prefill and first token. If a smaller or split-only arrangement must be used, the
+    -ngl ladder still degrades gracefully (99 -> 56 -> 40 layers on GPU, rest in RAM).
     """
     binary = ensure_llama_server_bin()
-    # Context window: prefer env, default 16384 so multi-step agent turns fit.
+    # Context window: prefer env, default 8192 to match the agent's context budget.
     try:
         n_ctx = int(os.environ.get("QWEN38_NUM_CTX") or os.environ.get("BLACKTHORN_CONTEXT_TOKENS") or "8192")
     except ValueError:
         n_ctx = 8192
     n_ctx = max(4096, min(n_ctx, 32768))
-    log(f"Starting CUDA llama-server on :{OLLAMA_PORT} with {gguf_path} (GPU0 only, ctx={n_ctx})")
+    log(f"Starting CUDA llama-server on :{OLLAMA_PORT} with {gguf_path} (all GPUs, ctx={n_ctx})")
     logf_path = "/tmp/llama_server.log"
-    # Pin the process to GPU 0 so GPU 1 stays available for agent tasks.
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = "0"
+    env.pop("CUDA_VISIBLE_DEVICES", None)      # both T4s serve the model
 
     def _launch(ngl: str):
         cmd = [
@@ -842,13 +842,14 @@ def start_llama_server(gguf_path: str) -> None:
             "--host", "0.0.0.0",
             "--port", str(OLLAMA_PORT),
             "-np", "1",
-            "--main-gpu", "0",
-            "--split-mode", "none",
             "--flash-attn", "on",
             "-b", "512",
             "-ub", "256",
-            "--no-mmap",
+            "--mlock",
         ]
+        extra = (os.environ.get("LLAMA_EXTRA_ARGS") or "").strip()
+        if extra:
+            cmd += extra.split()
         logf = open(logf_path, "w")
         return subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, env=env)
 
@@ -1049,7 +1050,8 @@ async def health():
         "backend_model": OLLAMA_MODEL,
         "model_loaded": model_loaded,
         "gpu": BOOT_STATE.get("gpu", ""),
-        "gpu_roles": {"0": "model", "1": "computer"},
+        "gpu_roles": ({"0": "computer", "1": "computer"} if (os.environ.get("ORNITH_ROLE") or "model") == "computer"
+                      else {"0": "model", "1": "model"}),
         "uptime_seconds": round(time.time() - START_TIME, 1),
         "boot": {k: BOOT_STATE.get(k) for k in ("cache_source", "boot_seconds", "download_skipped", "warmup_ok")},
         "endpoints": ["/v1/models", "/v1/chat/completions", "/chat", "/logs", "/health", "/computer/info", "/computer/exec", "/computer/list_files", "/computer/read_file", "/computer/write_file", "/computer/fetch_url"],
