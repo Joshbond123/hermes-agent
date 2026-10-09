@@ -158,3 +158,17 @@ def test_status_reports_all_four_slots_with_real_fields():
         assert set(role) >= {"active", "reason", "primary", "backup", "accounts", "events"}
         assert role["primary"]["remaining_seconds"] >= 0
     assert status["computer"]["primary"]["used_seconds"] == 54000
+
+
+def test_partial_fleet_still_works():
+    """Only the legacy single account configured: status/decide must never raise."""
+    clock = FakeClock()
+    fleet = FleetManager([Account("joshbond123", "tok", "model", "primary")],
+                         fetcher=lambda m, b, t: {"gpuQuota": {"timeUsed": "1s", "totalTimeAllowed": "108000s"}},
+                         clock=clock)
+    fleet.refresh_slots()
+    status = fleet.status()
+    assert status["model"]["backup"] == {"configured": False}
+    assert status["computer"]["primary"] == {"configured": False}
+    assert fleet.decide("model").active == "primary"
+    assert fleet.decide("computer").active == "primary"     # no accounts at all -> no crash

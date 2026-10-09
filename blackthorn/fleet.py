@@ -206,8 +206,18 @@ class FleetManager:
             raise FleetError(f"unknown role {role!r}")
         with self._lock:
             state = self.state[role]
-            primary, backup = self.by_slot[(role, "primary")], self.by_slot[(role, "backup")]
+            primary = self.by_slot.get((role, "primary"))
+            backup = self.by_slot.get((role, "backup"))
+            if primary is None and backup is None:
+                return state
+            if primary is None:                       # backup-only fleet: it is simply active
+                state.active = "backup"
+                if state.reason == "initial":
+                    state.reason = "backup_only"
+                return state
             for account in (primary, backup):
+                if account is None:
+                    continue
                 slot = self.slots[account.user]
                 slot.last_checked = self._clock()
                 try:
@@ -221,6 +231,21 @@ class FleetManager:
                     slot.last_error = str(exc)
                     if slot.remaining_s is None:
                         slot.healthy = None
+            if backup is None:                        # single-slot role: the primary just runs
+                for account in (primary,):
+                    slot = self.slots[account.user]
+                    slot.last_checked = self._clock()
+                    try:
+                        q = self.quota(account, force=force)
+                        slot.remaining_s, slot.used_s = q["remaining_seconds"], q["used_seconds"]
+                        slot.total_s, slot.refresh_time = q["total_seconds"], q["refresh_time"]
+                        if slot.healthy is not False:
+                            slot.healthy = True
+                        slot.last_error = ""
+                    except FleetError as exc:
+                        slot.last_error = str(exc)
+                state.active = "primary"
+                return state
             p, b = self.slots[primary.user], self.slots[backup.user]
             now = self._clock()
 
@@ -290,13 +315,14 @@ class FleetManager:
         out: Dict[str, Any] = {}
         for role in ROLES:
             st = self.state[role]
+            p_acct, b_acct = self.by_slot.get((role, "primary")), self.by_slot.get((role, "backup"))
             out[role] = {
                 "active": st.active, "reason": st.reason,
                 "active_since": round(st.since, 1), "events": st.events[-8:],
-                "primary": self.slots[self.by_slot[(role, "primary")].user].view(),
-                "backup": self.slots[self.by_slot[(role, "backup")].user].view(),
-                "accounts": {"primary": self.by_slot[(role, "primary")].user,
-                             "backup": self.by_slot[(role, "backup")].user},
+                "primary": self.slots[p_acct.user].view() if p_acct else {"configured": False},
+                "backup": self.slots[b_acct.user].view() if b_acct else {"configured": False},
+                "accounts": {"primary": p_acct.user if p_acct else None,
+                             "backup": b_acct.user if b_acct else None},
             }
         return out
 

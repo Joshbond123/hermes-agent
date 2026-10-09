@@ -6,7 +6,7 @@
   "blackthorn/api.py": "19e2b6055bcc77943daa9a623d7c2d2b31b81ae3a0c6d5391b519d13bccefc3e",
   "blackthorn/app.py": "d401f4cad540f49aa0a90c09c32058330bb6160b040460e6bb7bdb825912599e",
   "blackthorn/config.py": "e1057e2f9251e20cb599a167a1f3905944be2fb84209c6dc562cdfa35e976224",
-  "blackthorn/fleet.py": "966e5f72f64fa3dbe75bd2dac8abc874f8464da504793a58556bc875e6b63ed1",
+  "blackthorn/fleet.py": "0eb1105b4df816a1299690e307918371fab0da7cbebe4ad385e6c544a553bf82",
   "blackthorn/gpu.py": "6feac2172b5577f69b241c2f0836db4c248444dfbd33b65997ee4f48371cdb3e",
   "blackthorn/kaggle_bundle.py": "27308e62990732a9696673c7b69887b25dfaedf8128f68f752cc1d6ec471ab4e",
   "blackthorn/llm.py": "8d7966e03b3889b3a9f096c04922d95ff26060340dc9278b1c30d38bfa32e593",
