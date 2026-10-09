@@ -177,6 +177,17 @@ class FleetManager:
     # ------------------------------------------------------------------ kernel lifecycle
     def start_kernel(self, account: Account, *, slug: str, title: str, notebook_text: str,
                      datasets: Optional[List[str]] = None) -> Dict[str, Any]:
+        # Kaggle titles are account-unique and slugs get normalized: if this account already
+        # has a kernel for this role (by title), update THAT kernel instead of creating a twin.
+        try:
+            listing = self.rpc(account, "ListKernels", {"pageSize": 30, "user": account.user})
+            for k in (listing.get("kernels") or listing.get("results") or []):
+                if str(k.get("title") or "").startswith(f"Blackthorn {account.role}"):
+                    slug = str(k.get("ref") or k.get("slug") or slug)
+                    title = str(k.get("title") or title)
+                    break
+        except FleetError:
+            pass
         payload: Dict[str, Any] = {
             "slug": slug, "newTitle": title, "text": notebook_text,
             "language": "python", "kernelType": "notebook", "isPrivate": True,
@@ -185,7 +196,14 @@ class FleetManager:
         }
         if datasets:
             payload["datasetDataSources"] = datasets
-        out = self.rpc(account, "SaveKernel", payload)
+        try:
+            out = self.rpc(account, "SaveKernel", payload)
+        except FleetError as exc:
+            if "409" not in str(exc) and "already in use" not in str(exc):
+                raise
+            # Kaggle titles are account-unique: fall back to a timestamped title and retry once
+            payload["newTitle"] = f"{title} {int(self._clock())}"[:100]
+            out = self.rpc(account, "SaveKernel", payload)
         invalid = [x for x in (out.get("invalidDatasetSources") or []) if x]
         if invalid and datasets:
             payload.pop("datasetDataSources", None)
