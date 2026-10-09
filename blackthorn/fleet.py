@@ -175,18 +175,56 @@ class FleetManager:
                 slot.last_error = str(exc)
 
     # ------------------------------------------------------------------ kernel lifecycle
+    def find_role_kernel(self, account: Account) -> Optional[Dict[str, str]]:
+        """The account's kernel for this role, found by its reserved title prefix."""
+        try:
+            listing = self.rpc(account, "ListKernels", {"pageSize": 30, "user": account.user})
+        except FleetError:
+            return None
+        for k in (listing.get("kernels") or listing.get("results") or []):
+            if str(k.get("title") or "").startswith(f"Blackthorn {account.role}"):
+                return {"slug": str(k.get("ref") or k.get("slug") or ""), "title": str(k.get("title") or "")}
+        return None
+
+    def stop_kernel_session(self, account: Account, slug: str) -> bool:
+        """Stop a running session so the next push executes the fresh notebook code.
+
+        Kaggle keeps executing the version a session started with — without this, a
+        re-push is silently ignored and the stale code keeps answering.
+        """
+        name = slug.split("/", 1)[1] if "/" in slug else slug
+        try:
+            sess = self.rpc(account, "GetKernelSessionStatus", {"userName": account.user, "kernelSlug": name})
+        except FleetError:
+            return False
+        if str(sess.get("status") or "").upper() not in ("RUNNING", "QUEUED", "PENDING"):
+            return False
+        for _ in range(3):
+            try:
+                self.rpc(account, "DeleteKernel", {"userName": account.user, "kernelSlug": name})
+            except FleetError:
+                pass
+            import time as _t
+            _t.sleep(4)
+            try:
+                again = self.rpc(account, "GetKernelSessionStatus", {"userName": account.user, "kernelSlug": name})
+                if str(again.get("status") or "").upper() not in ("RUNNING", "QUEUED", "PENDING"):
+                    return True
+            except FleetError:
+                return True
+        return False
+
     def start_kernel(self, account: Account, *, slug: str, title: str, notebook_text: str,
                      datasets: Optional[List[str]] = None) -> Dict[str, Any]:
         # Kaggle titles are account-unique and slugs get normalized: if this account already
         # has a kernel for this role (by title), update THAT kernel instead of creating a twin.
+        existing = self.find_role_kernel(account)
+        if existing and existing.get("slug"):
+            slug = existing["slug"]
+            title = existing.get("title") or title
         try:
-            listing = self.rpc(account, "ListKernels", {"pageSize": 30, "user": account.user})
-            for k in (listing.get("kernels") or listing.get("results") or []):
-                if str(k.get("title") or "").startswith(f"Blackthorn {account.role}"):
-                    slug = str(k.get("ref") or k.get("slug") or slug)
-                    title = str(k.get("title") or title)
-                    break
-        except FleetError:
+            self.stop_kernel_session(account, slug)          # stale sessions ignore pushes
+        except Exception:  # noqa: BLE001 - stopping is best effort
             pass
         payload: Dict[str, Any] = {
             "slug": slug, "newTitle": title, "text": notebook_text,
