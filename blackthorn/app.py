@@ -44,10 +44,18 @@ def build_services(settings: Settings, *, executor: Any = None, http: Any = None
     store = ChatStore(executor, source=settings.session_source, backend=backend)
     http = http or new_http_client()
     resolver = RouteResolver(store)
+    fleet = None
+    try:
+        from .fleet import FleetManager, accounts_from_env
+        accounts = accounts_from_env(os.environ)
+        if accounts:
+            fleet = FleetManager(accounts)
+    except Exception as exc:  # noqa: BLE001 - the studio must run even without fleet accounts
+        log.warning("fleet not configured: %s", exc)
     return Services(settings=settings, store=store, resolver=resolver, registry=default_registry(), http=http,
                     tavily=TavilyKeys(store), computer=ComputerClient(resolver, http),
                     runs=RunManager(ttl=settings.run_ttl_s, max_active=settings.max_active_runs),
-                    gpu=GpuService(store), static_dir=static_dir or STATIC_DIR)
+                    gpu=GpuService(store), static_dir=static_dir or STATIC_DIR, fleet=fleet)
 
 
 def create_app(settings: Optional[Settings] = None, *, services: Optional[Services] = None, gpu_daemon: Optional[bool] = None) -> FastAPI:
@@ -77,6 +85,20 @@ def create_app(settings: Optional[Settings] = None, *, services: Optional[Servic
                 cloudflare_d1_client.start_permanent_gpu_daemon()
             except Exception as exc:
                 log.error("GPU watchdog could not start: %s", exc)
+        if bt.fleet is not None:
+            import threading
+
+            def _fleet_watchdog() -> None:
+                while True:
+                    try:
+                        for role in ("model", "computer"):
+                            bt.fleet.decide(role)
+                    except Exception:  # noqa: BLE001 - a watchdog must survive anything
+                        log.exception("fleet watchdog tick failed")
+                    import time as _t
+                    _t.sleep(60)
+
+            threading.Thread(target=_fleet_watchdog, daemon=True, name="fleet-watchdog").start()
         yield
         await bt.runs.shutdown()
         await bt.http.aclose()

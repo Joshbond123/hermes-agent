@@ -42,6 +42,7 @@ class Services:
     gpu: Any
     static_dir: Path
     relay_hub: Any = None
+    fleet: Any = None
     _prompt_cache: tuple = field(default=(0.0, ""))
     _memory_cache: tuple = field(default=(0.0, ()))
 
@@ -376,6 +377,35 @@ async def gpu_auto_off(body: AutoOffBody, request: Request):
 @router.get("/api/kaggle-gpu/logs")
 async def gpu_logs(request: Request, limit: int = Query(120, ge=1, le=300)):
     return await svc(request).gpu.logs(limit)
+
+
+# --------------------------------------------------------------------------- fleet (4-GPU failover)
+@router.get("/api/fleet/status")
+async def fleet_status(request: Request, refresh: bool = False):
+    s = svc(request)
+    if s.fleet is None:
+        return {"configured": False}
+    try:
+        if refresh:
+            for role in ("model", "computer"):
+                s.fleet.decide(role, force=True)
+        else:
+            s.fleet.refresh_slots()
+        return {"configured": True, **s.fleet.status()}
+    except Exception as exc:  # noqa: BLE001 - the panel must show errors, not 500
+        return {"configured": True, "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+
+
+@router.post("/api/fleet/decide")
+async def fleet_decide(request: Request):
+    s = svc(request)
+    if s.fleet is None:
+        raise _err(503, "fleet_unconfigured", "No fleet accounts are configured on this server.")
+    out = {}
+    for role in ("model", "computer"):
+        st = s.fleet.decide(role, force=True)
+        out[role] = {"active": st.active, "reason": st.reason}
+    return out
 
 
 # --------------------------------------------------------------------------- durable GPU relay
