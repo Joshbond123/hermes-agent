@@ -82,6 +82,11 @@ WORK_ROOT = "/kaggle/working"
 # Prefer /kaggle/tmp for the large GGUF when present (more free space than working)
 _tmp = "/kaggle/tmp" if os.path.isdir("/kaggle/tmp") else WORK_ROOT
 PERSIST_MODELS_DIR = f"{WORK_ROOT}/ollama_models"
+ROLE = (os.environ.get("ORNITH_ROLE") or "model").strip().lower()      # "model" | "computer"
+COMPUTER_WORKSPACE = os.environ.get("COMPUTER_WORKSPACE") or f"{WORK_ROOT}/blackthorn_workspace"
+STATE_DATASET = (os.environ.get("COMPUTER_STATE_DATASET") or "").strip()   # e.g. josh787/blackthorn-computer-state
+STATE_DIR = "/tmp/computer_state"
+STATE_MANIFEST = f"{STATE_DIR}/manifest.json"
 BLIND_DISK_DIR = f"{_tmp}/model_cache"
 UPLOAD_DIR = f"{WORK_ROOT}/cache_upload"
 MARKER_PATH = f"{BLIND_DISK_DIR}/.verified"
@@ -282,9 +287,10 @@ def notify_workspace(status: str, tunnel_url: str = "", extra: dict = None) -> N
         )
         cf_sql = (
             "INSERT OR REPLACE INTO kaggle_gpu_state (id, status, tunnel_url, api_key, model, gpu_info, updated_at) "
-            "VALUES ('primary', ?, ?, ?, ?, ?, ?);"
+            "VALUES (?, ?, ?, ?, ?, ?, ?);"
         )
         cf_params = [
+            "computer" if ROLE == "computer" else "primary",
             status,
             tunnel_url or "",
             API_KEY,
@@ -1444,6 +1450,99 @@ def launch_cloudflared(cloudflared_bin: str):
 
 
 
+def _kaggle_cli_env() -> dict:
+    env = dict(os.environ)
+    env["KAGGLE_USERNAME"] = os.environ.get("KAGGLE_USERNAME") or KAGGLE_USERNAME
+    env["KAGGLE_KEY"] = os.environ.get("KAGGLE_API_TOKEN") or KAGGLE_API_TOKEN
+    return env
+
+
+def restore_workspace() -> bool:
+    """Bring the computer workspace back from the state dataset before any work begins.
+
+    Never deletes local data it does not understand: an existing workspace wins over an
+    older snapshot, and the manifest records which generation was restored.
+    """
+    if not STATE_DATASET:
+        log("Persistence: no COMPUTER_STATE_DATASET configured — starting with a live workspace")
+        return False
+    owner_slug = STATE_DATASET
+    url = f"https://www.kaggle.com/api/v1/datasets/download/{owner_slug}"
+    os.makedirs(STATE_DIR, exist_ok=True)
+    archive = os.path.join(STATE_DIR, "state.zip")
+    try:
+        urllib.request.urlretrieve(url, archive)   # authenticated via ~/.kaggle/kaggle.json when present
+    except Exception:
+        try:
+            req = urllib.request.Request(url, headers={"Authorization": "Bearer " + KAGGLE_API_TOKEN})
+            with urllib.request.urlopen(req, timeout=120) as resp, open(archive, "wb") as fh:
+                shutil.copyfileobj(resp, fh)
+        except Exception as exc:
+            log(f"Persistence: no snapshot to restore ({type(exc).__name__}) — fresh workspace")
+            return False
+    try:
+        with zipfile.ZipFile(archive) as zf:
+            zf.extractall(STATE_DIR)
+        snapshot = os.path.join(STATE_DIR, "workspace")
+        if os.path.isdir(snapshot):
+            os.makedirs(COMPUTER_WORKSPACE, exist_ok=True)
+            copied = 0
+            for root, _dirs, files in os.walk(snapshot):
+                rel = os.path.relpath(root, snapshot)
+                dest = os.path.join(COMPUTER_WORKSPACE, rel) if rel != "." else COMPUTER_WORKSPACE
+                os.makedirs(dest, exist_ok=True)
+                for name in files:
+                    src_f, dst_f = os.path.join(root, name), os.path.join(dest, name)
+                    if not os.path.exists(dst_f):            # never overwrite newer local files
+                        try:
+                            os.link(src_f, dst_f)
+                        except OSError:
+                            shutil.copy2(src_f, dst_f)
+                        copied += 1
+            gen = "?"
+            try:
+                gen = json.load(open(STATE_MANIFEST)).get("generation", "?")
+            except Exception:
+                pass
+            log(f"✅ Persistence: restored {copied} files (generation {gen}) into {COMPUTER_WORKSPACE}")
+            return True
+    except Exception as exc:
+        log(f"Persistence: restore failed ({type(exc).__name__}: {exc})")
+    return False
+
+
+def checkpoint_workspace(label: str = "") -> dict:
+    """Publish the workspace as a new dataset version. Versions are history: nothing is deleted."""
+    if not STATE_DATASET:
+        return {"ok": False, "error": "no COMPUTER_STATE_DATASET configured"}
+    os.makedirs(STATE_DIR, exist_ok=True)
+    snap = os.path.join(STATE_DIR, "workspace")
+    if os.path.isdir(snap):
+        shutil.rmtree(snap, ignore_errors=True)
+    ignore = shutil.ignore_patterns("*.part", "*.partial", "__pycache__", ".git", "node_modules", "state.zip")
+    shutil.copytree(COMPUTER_WORKSPACE, snap, ignore=ignore, dirs_exist_ok=True)
+    generation = int(time.time())
+    files = sum(len(f) for _r, _d, f in os.walk(snap))
+    json.dump({"generation": generation, "label": label[:80], "files": files, "ts": time.time()},
+              open(STATE_MANIFEST, "w"))
+    with open(os.path.join(snap, "dataset-metadata.json"), "w") as fh:
+        json.dump({"title": "Blackthorn Computer State", "id": STATE_DATASET,
+                   "licenses": [{"name": "other"}]}, fh)
+    env = _kaggle_cli_env()
+    proc = subprocess.run(["kaggle", "datasets", "version", "-p", snap, "-m", f"gen {generation} {label}"[:100],
+                           "--dir-mode", "zip"],
+                          capture_output=True, text=True, env=env, timeout=1800)
+    if proc.returncode != 0:
+        proc = subprocess.run(["kaggle", "datasets", "create", "-p", snap, "--dir-mode", "zip"],
+                              capture_output=True, text=True, env=env, timeout=1800)
+    ok = proc.returncode == 0
+    if ok:
+        log(f"💾 Persistence: checkpoint generation {generation} ({files} files) published")
+    else:
+        log(f"Persistence: checkpoint failed: {(proc.stderr or proc.stdout or '')[-200:]}")
+    return {"ok": ok, "generation": generation, "files": files, "error": "" if ok else (proc.stderr or "")[-200:]}
+
+
 def cleanup_model_downloads() -> int:
     """Delete model weight downloads from the Kaggle computer disk (/kaggle/working).
 
@@ -1499,6 +1598,74 @@ def cleanup_model_downloads() -> int:
     return freed
 
 
+def main_computer(started: float) -> None:
+    """The agent's personal computer: gateway + persistent workspace + relay. No model here."""
+    os.makedirs(COMPUTER_WORKSPACE, exist_ok=True)
+    notify_workspace("CHECKING_ENVIRONMENT", extra={"role": "computer"})
+
+    try:
+        urllib.request.urlopen("https://huggingface.co", timeout=8)
+    except Exception as exc:
+        fail("INTERNET_UNAVAILABLE", f"Kaggle internet is off ({exc}). Enable Internet in session options.")
+        return
+
+    notify_workspace("INSTALLING_DEPS", extra={"role": "computer"})
+    try:
+        ensure_python_deps()
+    except Exception as exc:
+        fail("BOOT_FAILED", f"dependency install failed: {exc}")
+        return
+
+    try:
+        restore_workspace()
+    except Exception as exc:
+        log(f"Persistence restore note: {exc}")
+
+    notify_workspace("STARTING_GATEWAY", extra={"role": "computer"})
+    start_gateway()
+    try:
+        cloudflared_bin = ensure_cloudflared()
+    except Exception:
+        cloudflared_bin = "cloudflared"
+
+    tunnel_url = ""
+    cf_proc = None
+    try:
+        cf_proc, tunnel_url = launch_cloudflared(cloudflared_bin)
+    except Exception:
+        tunnel_url = ""
+    if not tunnel_url:
+        fail("TUNNEL_ERROR", "Could not bring up the computer tunnel (no URL and no configured hostname)")
+        return
+    notify_workspace("TUNNEL_ONLINE", tunnel_url=tunnel_url, extra={"role": "computer"})
+    notify_workspace("MODEL_READY_AND_WARMED", tunnel_url=tunnel_url,
+                     extra={"role": "computer", "boot_seconds": round(time.time() - started, 1)})
+    log(f"🖥️  Computer ready in {time.time() - started:.0f}s — workspace {COMPUTER_WORKSPACE}")
+
+    loop_start = time.time()
+    _last_heartbeat = 0.0
+    _last_checkpoint = time.time()
+    while time.time() - loop_start < MAX_RUNTIME_SECONDS:
+        time.sleep(15)
+        now = time.time()
+        if cf_proc is not None and cf_proc.poll() is not None:
+            log("⚠️ relay exited; restarting")
+            try:
+                cf_proc, tunnel_url = launch_cloudflared(cloudflared_bin)
+            except Exception as exc:
+                log(f"relay restart note: {exc}")
+        if now - _last_checkpoint >= 20 * 60:
+            _last_checkpoint = now
+            try:
+                checkpoint_workspace("auto")
+            except Exception as exc:
+                log(f"Persistence checkpoint note: {exc}")
+        if now - _last_heartbeat >= 90:
+            _last_heartbeat = now
+            notify_workspace("HEARTBEAT_ONLINE", tunnel_url=tunnel_url,
+                             extra={"role": "computer", "uptime": round(now - loop_start, 1)})
+
+
 def main() -> None:
     started = time.time()
     boot_state = {"gpu": "", "cache_source": "", "download_skipped": False, "boot_seconds": 0}
@@ -1507,6 +1674,13 @@ def main() -> None:
     except Exception:
         pass
     notify_workspace("CHECKING_ENVIRONMENT")
+
+    if ROLE == "computer":
+        try:
+            main_computer(started)
+        except Exception as exc:
+            fail("BOOT_FAILED", f"computer environment failed: {type(exc).__name__}: {exc}")
+        return
 
     try:
         gpu_out = subprocess.check_output(

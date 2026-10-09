@@ -16,12 +16,20 @@ from typing import Mapping, Optional
 
 REQUIRED_ENV = ("CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_D1_DATABASE_ID", "KAGGLE_USERNAME", "KAGGLE_API_TOKEN")
 OPTIONAL_ENV = ("QWEN38_NUM_CTX", "QWEN38_QUANT", "QWEN38_CACHE_DATASET",
-                "CLOUDFLARED_TUNNEL_TOKEN", "BLACKTHORN_TUNNEL_HOSTNAME", "BLACKTHORN_RELAY_URL", "PREFER_LLAMA")
+                "CLOUDFLARED_TUNNEL_TOKEN", "BLACKTHORN_TUNNEL_HOSTNAME", "BLACKTHORN_RELAY_URL", "PREFER_LLAMA",
+                "ORNITH_ROLE", "COMPUTER_STATE_DATASET", "COMPUTER_WORKSPACE")
 SERVER_SOURCE = Path(__file__).resolve().parent.parent / "kaggle_cyber_ornith" / "cyber_ornith_server.py"
 
 
 class BundleError(RuntimeError):
     pass
+
+
+def build_computer_notebook_text(server_py: Optional[str] = None, env: Optional[Mapping[str, str]] = None) -> str:
+    """Same server, computer role: the agent's personal computer (no model loading)."""
+    merged = dict(env if env is not None else os.environ)
+    merged["ORNITH_ROLE"] = "computer"
+    return build_notebook_text(server_py=server_py, env=merged)
 
 
 def build_notebook_text(server_py: Optional[str] = None, env: Optional[Mapping[str, str]] = None) -> str:

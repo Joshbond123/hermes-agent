@@ -21,20 +21,41 @@ DENY_PATTERNS = (
 
 
 class ComputerClient:
-    def __init__(self, resolver: RouteResolver, http: httpx.AsyncClient):
+    """Talks to the agent's personal computer. A dedicated computer host (id='computer' in
+    kaggle_gpu_state) is preferred; when none is enrolled the model host answers instead."""
+
+    def __init__(self, resolver: RouteResolver, http: httpx.AsyncClient, store: Any = None):
         self._resolver = resolver
         self._http = http
+        self._store = store
+
+    async def _endpoint(self) -> tuple:
+        if self._store is not None:
+            try:
+                row = await self._store.computer_row()
+            except Exception:  # noqa: BLE001 - fall back to the model host
+                row = {}
+            url = str(row.get("tunnel_url") or "").rstrip("/")
+            if url.endswith("/v1"):
+                url = url[:-3]
+            key = str(row.get("api_key") or "")
+            status = str(row.get("status") or "").upper()
+            if url and key and status not in ("", "OFF", "OFFLINE", "GPU_STOPPED_SAVING_QUOTA",
+                                              "STOPPED", "STOPPING_KAGGLE_GPU", "ERROR", "FAILED"):
+                return url, key
+        route = await self._resolver.get()
+        return route.url, route.api_key
 
     async def call(self, path: str, payload: Dict[str, Any] | None = None, *, method: str = "POST",
                    timeout: float = 60.0) -> Dict[str, Any]:
         try:
-            route = await self._resolver.get()
+            base_url, api_key = await self._endpoint()
         except RouteError as exc:
             raise ToolError("offline", "The remote computer is offline.", hint=exc.message) from exc
         try:
             resp = await self._http.request(
-                method, f"{route.url}{path}", json=payload if method == "POST" else None, timeout=timeout,
-                headers={"Authorization": f"Bearer {route.api_key}"})
+                method, f"{base_url}{path}", json=payload if method == "POST" else None, timeout=timeout,
+                headers={"Authorization": f"Bearer {api_key}"})
         except httpx.ConnectError as exc:
             self._resolver.invalidate()
             raise ToolError("offline", "Could not reach the remote computer (the tunnel may have stopped).",

@@ -53,7 +53,7 @@ def build_services(settings: Settings, *, executor: Any = None, http: Any = None
     except Exception as exc:  # noqa: BLE001 - the studio must run even without fleet accounts
         log.warning("fleet not configured: %s", exc)
     return Services(settings=settings, store=store, resolver=resolver, registry=default_registry(), http=http,
-                    tavily=TavilyKeys(store), computer=ComputerClient(resolver, http),
+                    tavily=TavilyKeys(store), computer=ComputerClient(resolver, http, store=store),
                     runs=RunManager(ttl=settings.run_ttl_s, max_active=settings.max_active_runs),
                     gpu=GpuService(store), static_dir=static_dir or STATIC_DIR, fleet=fleet)
 

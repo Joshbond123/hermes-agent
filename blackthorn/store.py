@@ -366,3 +366,9 @@ class ChatStore:
         res = await self.db.query(
             "SELECT status, tunnel_url, api_key, model, gpu_info, updated_at FROM kaggle_gpu_state WHERE id = 'primary' LIMIT 1")
         return dict(res.rows[0]) if res.rows else {}
+
+    async def computer_row(self) -> Dict[str, Any]:
+        """The agent's personal computer (id='computer'); empty until one is enrolled."""
+        res = await self.db.query(
+            "SELECT status, tunnel_url, api_key, model, gpu_info, updated_at FROM kaggle_gpu_state WHERE id = 'computer' LIMIT 1")
+        return dict(res.rows[0]) if res.rows else {}
