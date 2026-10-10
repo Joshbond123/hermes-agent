@@ -316,6 +316,16 @@ class AgentRun:
                             "Shorten the message or clear attachments and try again.",
                             True,
                         )
+                    # Mid-task resume after compaction (Hermes-style).
+                    if messages and messages[-1].get("role") == "tool":
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "Continue the task from the last tool result. "
+                                "Do not stop to summarize progress unless the user asked. "
+                                "Call tools as needed until the user request is complete."
+                            ),
+                        })
                 else:
                     raise RunFailure(
                         "context_full",
