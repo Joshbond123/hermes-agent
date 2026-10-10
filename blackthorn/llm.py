@@ -107,6 +107,8 @@ async def stream_chat(route: Route, messages: List[Dict[str, Any]], *, client: h
     if tools:
         body["tools"] = tools
         body["tool_choice"] = "auto"
+    body["max_tokens"] = int(max_tokens or 8192)
+    body.setdefault("keep_alive", "30m")
     if temperature is not None:
         body["temperature"] = temperature
     if extra:

@@ -182,7 +182,9 @@ def _sse_bytes(event: Dict[str, Any]) -> bytes:
 
 async def _sse(run: Run, after: int, heartbeat: float) -> AsyncIterator[bytes]:
     # A closed connection only stops *this* iterator; the run itself keeps going until it finishes or is cancelled.
-    yield b"retry: 3000\n\n"
+    # Force proxies (Render/Cloudflare) to flush immediately: comment retry + 2KB padding.
+    yield b"retry: 1000\n\n"
+    yield b": " + (b" " * 2048) + b"\n\n"
     async for event in run.subscribe(after=after, heartbeat=heartbeat):
         yield b": ping\n\n" if event is None else _sse_bytes(event)
 

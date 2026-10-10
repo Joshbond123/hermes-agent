@@ -239,6 +239,18 @@ class AgentRun:
             self.run.finish(status)
 
     # ------------------------------------------------------------------ the loop
+    def _tools_for_step(self, step: int):
+        """Omit tool schemas on tiny chit-chat turns to cut prompt prefill latency."""
+        if not self._schemas:
+            return None
+        text = (self.user_message or "").strip().lower()
+        if step <= 1 and len(text) < 48:
+            keys = ("run", "file", "search", "code", "install", "browse", "skill", "computer",
+                    "write", "read", "exec", "git", "http", "scan", "tool", "ls", "mkdir", "pip", "npm")
+            if not any(k in text for k in keys):
+                return None
+        return self._schemas
+
     async def _loop(self) -> None:
         s = self.deps.settings
         cpt = s.chars_per_token
@@ -262,7 +274,7 @@ class AgentRun:
                           "invalid tool arguments" if self.malformed >= s.max_malformed_calls else "the tool-call limit")
                 self.run.emit("notice", level="warn", text=f"Stopped using tools ({reason}); writing the answer from what was gathered.")
                 messages.append({"role": "user", "content": FINALIZE_NOTE})
-            result = await self._model_step(messages, None if force_final else self._schemas)
+            result = await self._model_step(messages, None if force_final else self._tools_for_step(self.steps))
             if result.calls and not force_final:
                 await self._run_tools(result, messages)
                 continue
