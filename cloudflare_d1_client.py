@@ -596,6 +596,76 @@ def _auto_off_stop() -> Dict[str, Any]:
     return turn_off_kaggle_gpu()
 
 
+# ---- computer background work (auto-off must not stop a computer that is busy) ----
+# The idle clock above only sees chat turns. The computer runs installs, builds and agent jobs on its own, so
+# the daemon asks the computer how many tagged processes are alive and counts them as active work.
+COMPUTER_ACTIVITY_MIN_INTERVAL_S = 30.0
+COMPUTER_ACTIVITY_MAX_UNKNOWN = 3   # bounded: after this many failed probes in a row, idle logic proceeds
+_COMPUTER_ACTIVITY: Dict[str, Any] = {"active_jobs": 0, "known": False, "fails": 0, "checked_at": 0.0, "error": ""}
+
+
+def _computer_link() -> Tuple[str, str, str]:
+    """(tunnel_url, api_key, status) of the computer row, or empty strings when there is no live computer."""
+    rows = d1_query("SELECT tunnel_url, api_key, status FROM kaggle_gpu_state WHERE id = 'computer' LIMIT 1;")
+    row = rows[0] if rows else {}
+    return (str(row.get("tunnel_url") or "").rstrip("/"), str(row.get("api_key") or ""), str(row.get("status") or ""))
+
+
+def _computer_request(path: str, payload: Optional[Dict[str, Any]], timeout: float) -> Dict[str, Any]:
+    url, key, _status = _computer_link()
+    if not url or not key:
+        raise RuntimeError("computer has no live tunnel")
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    req = urllib.request.Request(
+        url + path, data=data, method="POST" if data is not None else "GET",
+        headers={"Authorization": "Bearer " + key, "Content-Type": "application/json",
+                 "skip_zrok_interstitial": "true"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8") or "{}")
+
+
+def refresh_computer_activity(timeout: float = 8.0, force: bool = False) -> Dict[str, Any]:
+    """Probe the computer's live tagged processes (rate-limited). Never raises; result is cached for auto-off."""
+    now = time.time()
+    if not force and now - float(_COMPUTER_ACTIVITY.get("checked_at") or 0) < COMPUTER_ACTIVITY_MIN_INTERVAL_S:
+        return dict(_COMPUTER_ACTIVITY)
+    _COMPUTER_ACTIVITY["checked_at"] = now
+    try:
+        _url, _key, status = _computer_link()
+        if not _url:
+            _COMPUTER_ACTIVITY.update(active_jobs=0, known=True, fails=0, error="computer offline")
+        else:
+            body = _computer_request("/computer/activity", None, timeout)
+            _COMPUTER_ACTIVITY.update(active_jobs=int(body.get("active_jobs") or 0), known=True, fails=0, error="")
+    except urllib.error.HTTPError as exc:
+        # 404 means an older computer build without the endpoint: unknown, never silently "idle"
+        _COMPUTER_ACTIVITY.update(known=False, fails=int(_COMPUTER_ACTIVITY.get("fails") or 0) + 1,
+                                  error=f"computer activity probe HTTP {exc.code}")
+    except (urllib.error.URLError, OSError, ValueError, RuntimeError) as exc:
+        _COMPUTER_ACTIVITY.update(known=False, fails=int(_COMPUTER_ACTIVITY.get("fails") or 0) + 1,
+                                  error=f"computer activity probe: {type(exc).__name__}")
+    return dict(_COMPUTER_ACTIVITY)
+
+
+def checkpoint_computer(timeout: float = 120.0) -> Dict[str, Any]:
+    """Publish the computer workspace before a stop, so nothing since the last periodic checkpoint is lost.
+
+    Best effort and bounded: a failure is reported, but it never blocks the stop itself.
+    """
+    try:
+        url, _key, _status = _computer_link()
+        if not url:
+            return {"ok": False, "skipped": "computer offline"}
+        body = _computer_request("/computer/checkpoint", {}, timeout)
+        return {"ok": bool(body.get("ok")), "generation": body.get("generation"), "files": body.get("files"),
+                "error": str(body.get("error") or "")[:160]}
+    except urllib.error.HTTPError as exc:
+        return {"ok": False, "error": f"HTTP {exc.code}"}
+    except (urllib.error.URLError, OSError, ValueError, RuntimeError) as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}"}
+
+
 def auto_off_decision() -> Dict[str, Any]:
     """Pure decision helper: should the GPU be stopped right now?"""
     minutes = get_auto_off_minutes()
@@ -622,6 +692,16 @@ def auto_off_decision() -> Dict[str, Any]:
         return decided
     if snap["active_tasks"] > 0:
         decided["reason"] = f"{snap['active_tasks']} task(s) still running"
+        return decided
+    comp = dict(_COMPUTER_ACTIVITY)
+    decided["computer_jobs"] = int(comp.get("active_jobs") or 0)
+    if decided["computer_jobs"] > 0:
+        decided["reason"] = f"{decided['computer_jobs']} background job(s) running on the computer"
+        return decided
+    if not comp.get("known") and int(comp.get("fails") or 0) < COMPUTER_ACTIVITY_MAX_UNKNOWN \
+            and _computer_link()[0]:
+        decided["reason"] = (f"computer activity unknown ({comp.get('error') or 'probe failed'}) — "
+                             f"not stopping (probe {comp.get('fails')}/{COMPUTER_ACTIVITY_MAX_UNKNOWN})")
         return decided
     remaining = minutes * 60 - snap["idle_seconds"]
     if remaining <= 0:
@@ -1658,6 +1738,8 @@ def turn_off_fleet(blocking: bool = True) -> Dict[str, Any]:
         return turn_off_kaggle_gpu()
     fleet = FleetManager(accounts)
     out: Dict[str, Any] = {}
+    # Save the computer's workspace first (before its tunnel row is cleared below). Best effort, bounded.
+    checkpoint = checkpoint_computer()
     targets = []
     for role in ("model", "computer"):
         st = fleet.state[role]
@@ -1728,6 +1810,7 @@ def turn_off_fleet(blocking: bool = True) -> Dict[str, Any]:
                 except Exception:
                     pass
 
+    out["computer_checkpoint"] = checkpoint
     if blocking:
         _stops()
     else:
@@ -1833,6 +1916,8 @@ def start_permanent_gpu_daemon() -> None:
                     # Decide only AFTER the clock bookkeeping above, and never within
                     # the first minute of a fresh boot (a decision computed from the
                     # pre-boot idle time would otherwise kill the GPU instantly).
+                    if ready_now:
+                        refresh_computer_activity()   # background jobs on the computer count as activity
                     decision = auto_off_decision()
                     if (
                         decision.get("should_stop")

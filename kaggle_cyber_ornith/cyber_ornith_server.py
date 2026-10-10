@@ -18,6 +18,7 @@
 
 import concurrent.futures
 import contextlib
+import threading
 import hashlib
 import json
 import os
@@ -73,7 +74,7 @@ MAX_RUNTIME_SECONDS = int(os.environ.get("MAX_RUNTIME_SECONDS", str(11 * 3600)))
 
 KAGGLE_USERNAME = os.environ.get("KAGGLE_USERNAME", "")
 KAGGLE_API_TOKEN = os.environ.get("KAGGLE_API_TOKEN", "")
-CACHE_DATASET_SLUG = os.environ.get("QWEN38_CACHE_DATASET", f"{KAGGLE_USERNAME}/qwen38-27b-uncensored-cache")
+CACHE_DATASET_SLUG = os.environ.get("QWEN38_CACHE_DATASET", f"{KAGGLE_USERNAME}/qwen38-27b-uncensored-model-cache")
 CACHE_DATASET_TITLE = "Qwen3.8-27B-Uncensored Model Cache"
 
 INPUT_ROOT = "/kaggle/input"
@@ -607,6 +608,22 @@ def cache_dataset_is_ready(expected_bytes: int = 0) -> bool:
         return False
 
 
+def _publish_once(gguf_path: str, gpu_out: str) -> None:
+    try:
+        if cache_dataset_is_ready():
+            log("✅ Cache dataset already holds the model — skipping republish")
+            notify_workspace("CACHE_DATASET_READY", extra={"dataset": CACHE_DATASET_SLUG, "gpu": gpu_out})
+        else:
+            publish_cache_dataset(gguf_path)
+    except Exception as exc:  # the publish is best-effort; it must never take the running engine down
+        log(f"⚠️ cache publish thread: {type(exc).__name__}: {exc}")
+
+
+def _start_cache_publish(gguf_path: str, gpu_out: str) -> None:
+    """Persist the freshly downloaded model in the private Kaggle dataset (one-time per model version)."""
+    threading.Thread(target=_publish_once, args=(gguf_path, gpu_out), name="cache-publish", daemon=True).start()
+
+
 def publish_cache_dataset(gguf_path: str) -> None:
     """One-time: publish the verified GGUF as a private Kaggle dataset so future
     sessions mount it instantly instead of downloading 5.6 GB again."""
@@ -647,14 +664,14 @@ def publish_cache_dataset(gguf_path: str) -> None:
             )
         # Version the dataset when it already exists, otherwise create it.
         create = subprocess.run(
-            ["kaggle", "datasets", "create", "-p", UPLOAD_DIR, "--dir-mode", "zip", "-q"],
+            ["kaggle", "datasets", "create", "-p", UPLOAD_DIR, "--dir-mode", "skip", "-q"],
             env=env, capture_output=True, text=True,
         )
         if create.returncode != 0:
             log(f"   create note: {create.stderr.strip()[:200]}")
             version = subprocess.run(
-                ["kaggle", "datasets", "version", "-p", UPLOAD_DIR, "--dir-mode", "zip", "-q",
-                 "-m", f"Qwen3.8-27B {MODEL_QUANT} verified {time.strftime('%Y-%m-%d')}"],
+                ["kaggle", "datasets", "version", "-p", UPLOAD_DIR, "-q",
+                 "-m", f"Qwen3.8-27B {MODEL_QUANT} verified {time.strftime('%Y-%m-%d')}", "--dir-mode", "skip"],
                 env=env, capture_output=True, text=True,
             )
             if version.returncode != 0:
@@ -1135,6 +1152,7 @@ DEFAULT_SYSTEM_PROMPT = """''' + DEFAULT_SYSTEM_PROMPT + '''"""
 START_TIME = time.time()
 BOOT_STATE = json.load(open("/tmp/boot_state.json")) if os.path.exists("/tmp/boot_state.json") else {}
 LOGS = "/tmp/qwen38.log"
+CKPT_DIR = "/tmp/computer_state"
 
 app = FastAPI(title="Qwen3.8-27B-Uncensored API Server", version="4.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
@@ -1355,6 +1373,59 @@ async def computer_info(_=Depends(verify_api_key)):
         "cuda_available": bool(gpu and "Tesla" in gpu),
     }
 
+def _tagged_processes() -> list:
+    """Live processes started through /computer/exec (tag inherited by every child, daemonised or not)."""
+    found = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/environ", "rb") as fh:
+                tags = fh.read().split(b"\\0")
+            if b"BLACKTHORN_EXEC_TAG=1" not in tags:
+                continue
+            with open(f"/proc/{entry}/stat") as fh:
+                state = fh.read().rsplit(")", 1)[-1].split()[0]
+            if state in ("Z", "X"):
+                continue
+            with open(f"/proc/{entry}/cmdline", "rb") as fh:
+                cmd = fh.read().replace(b"\\0", b" ").decode("utf-8", "replace").strip()[:160]
+            found.append({"pid": int(entry), "state": state, "cmd": cmd})
+        except OSError:
+            continue  # process exited while we were reading it
+    return found
+
+
+@app.get("/computer/activity")
+async def computer_activity(_=Depends(verify_api_key)):
+    procs = _tagged_processes()
+    return {"active_jobs": len(procs), "processes": procs[:50], "ts": time.time()}
+
+
+@app.post("/computer/checkpoint")
+async def computer_checkpoint(_=Depends(verify_api_key)):
+    """Publish the workspace now. The notebook process owns the checkpoint code, so this writes a request file
+    the notebook's main loop answers (within ~15 s), and waits a bounded time for the result."""
+    os.makedirs(CKPT_DIR, exist_ok=True)
+    req_id = str(time.time_ns())
+    tmp = os.path.join(CKPT_DIR, "checkpoint.request.tmp")
+    with open(tmp, "w") as fh:
+        fh.write(req_id)
+    os.replace(tmp, os.path.join(CKPT_DIR, "checkpoint.request"))
+    deadline = time.time() + 200
+    while time.time() < deadline:
+        try:
+            with open(os.path.join(CKPT_DIR, "checkpoint.result")) as fh:
+                res = json.load(fh)
+            if res.get("id") == req_id:
+                return res
+        except (OSError, ValueError):
+            pass
+        await asyncio.sleep(1)
+    return {"ok": False, "error": "the notebook did not finish the checkpoint within 200 s"}
+
+
+
 @app.post("/computer/exec")
 async def computer_exec(request: Request, _=Depends(verify_api_key)):
     body = await request.json()
@@ -1376,6 +1447,7 @@ async def computer_exec(request: Request, _=Depends(verify_api_key)):
     # GPU 0 hosts llama-server. Computer work is pinned to physical GPU 1 only.
     env["CUDA_VISIBLE_DEVICES"] = "1"
     env["BLACKTHORN_GPU_ROLE"] = "computer"
+    env["BLACKTHORN_EXEC_TAG"] = "1"   # inherited by background jobs; read by /computer/activity
     def _run():
         return __import__("subprocess").run(
             cmd, shell=True, cwd=cwd, env=env,
@@ -1662,6 +1734,29 @@ def restore_workspace() -> bool:
     return False
 
 
+# Rebuildable trees stay out of the state dataset: caches, venvs and clones are re-created by the installer
+# from the registry on the next boot. Anything else larger than CHECKPOINT_MAX_FILE_BYTES is also skipped.
+CHECKPOINT_EXCLUDE_DIRS = {"__pycache__", ".git", "node_modules", ".cache", "venv", "security_catalog"}
+CHECKPOINT_EXCLUDE_RELPATHS = {"tools/venv", "tools/home/.cache", "tools/home/go/pkg", "tmp"}
+CHECKPOINT_MAX_FILE_BYTES = int(os.environ.get("CHECKPOINT_MAX_FILE_BYTES") or str(512 * 1024 * 1024))
+
+
+def _checkpoint_ignore(directory: str, names: list) -> set:
+    rel = os.path.relpath(directory, COMPUTER_WORKSPACE)
+    rel = "" if rel == "." else rel.replace(os.sep, "/")
+    skipped = set()
+    for name in names:
+        child_rel = f"{rel}/{name}" if rel else name
+        full = os.path.join(directory, name)
+        if name in CHECKPOINT_EXCLUDE_DIRS or child_rel in CHECKPOINT_EXCLUDE_RELPATHS:
+            skipped.add(name)
+        elif name.endswith((".part", ".partial", ".tmp")) or name == "state.zip":
+            skipped.add(name)
+        elif os.path.isfile(full) and os.path.getsize(full) > CHECKPOINT_MAX_FILE_BYTES:
+            skipped.add(name)
+    return skipped
+
+
 def checkpoint_workspace(label: str = "") -> dict:
     """Publish the workspace as a new dataset version. Versions are history: nothing is deleted."""
     if not STATE_DATASET:
@@ -1670,8 +1765,8 @@ def checkpoint_workspace(label: str = "") -> dict:
     snap = os.path.join(STATE_DIR, "workspace")
     if os.path.isdir(snap):
         shutil.rmtree(snap, ignore_errors=True)
-    ignore = shutil.ignore_patterns("*.part", "*.partial", "__pycache__", ".git", "node_modules", "state.zip")
-    shutil.copytree(COMPUTER_WORKSPACE, snap, ignore=ignore, dirs_exist_ok=True)
+    shutil.rmtree(snap, ignore_errors=True)
+    shutil.copytree(COMPUTER_WORKSPACE, snap, ignore=_checkpoint_ignore, dirs_exist_ok=True)
     generation = int(time.time())
     files = sum(len(f) for _r, _d, f in os.walk(snap))
     json.dump({"generation": generation, "label": label[:80], "files": files, "ts": time.time()},
@@ -1703,59 +1798,31 @@ def checkpoint_workspace(label: str = "") -> dict:
     return {"ok": ok, "generation": generation, "files": files, "error": "" if ok else (proc.stderr or "")[-200:]}
 
 
-def cleanup_model_downloads() -> int:
-    """Delete model weight downloads from the Kaggle computer disk (/kaggle/working).
-
-    The computer workspace lives under /kaggle/working; duplicate 16 GB model copies
-    there (ollama blobs, dataset-upload staging, loose GGUFs) starve the agent's own
-    work. The engine keeps exactly one runtime copy (the mounted cache dataset or the
-    /kaggle/tmp model_cache), so these working-disk copies are pure duplicates.
-    Returns the number of bytes freed. Never touches the agent workspace.
-    """
-    freed = 0
-
-    def _rm(path: str) -> None:
-        nonlocal freed
-        try:
-            if os.path.isfile(path) or os.path.islink(path):
-                freed += os.path.getsize(path) or 0
-                os.remove(path)
-            elif os.path.isdir(path):
-                for root, _dirs, files in os.walk(path):
-                    for name in files:
-                        try:
-                            freed += os.path.getsize(os.path.join(root, name)) or 0
-                        except OSError:
-                            pass
-                shutil.rmtree(path, ignore_errors=True)
-        except OSError:
-            pass
-
-    # staging copy for dataset upload
-    _rm(UPLOAD_DIR)
-    # partial / corrupt downloads anywhere on the working disk
-    for root, _dirs, files in os.walk(WORK_ROOT):
-        for name in files:
-            low = name.lower()
-            if low.endswith((".part", ".partial", ".download")) or ".gguf.part" in low:
-                _rm(os.path.join(root, name))
-    # duplicate weight stores on the computer disk (runtime copy exists elsewhere)
+def _answer_checkpoint_request() -> None:
+    """Gateway -> notebook hand-off for /computer/checkpoint (the gateway process cannot run this code itself)."""
+    req = os.path.join(CKPT_STATE_DIR, "checkpoint.request")
+    if not os.path.exists(req):
+        return
     try:
-        local = find_local_store_model()
-        dataset = find_dataset_gguf()
-    except Exception:
-        local, dataset = "", ""
-    if (os.path.isfile(MARKER_PATH) or dataset) and local and not str(local).startswith(UPLOAD_DIR):
-        # the persistent store blob is a duplicate of the mounted/runtime copy
-        _rm(PERSIST_MODELS_DIR)
-    for name in os.listdir(WORK_ROOT):
-        if name.lower().endswith(".gguf"):
-            path = os.path.join(WORK_ROOT, name)
-            if path != local and path != dataset:
-                _rm(path)
-    if freed:
-        log(f"🧹 Removed {freed / 1e9:.1f} GB of model downloads from the computer disk")
-    return freed
+        with open(req) as fh:
+            req_id = fh.read().strip()
+        os.remove(req)
+    except OSError as exc:
+        log(f"checkpoint request unreadable: {exc}")
+        return
+    try:
+        result = checkpoint_workspace("pre-stop")
+    except (OSError, ValueError, RuntimeError) as exc:
+        result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:160]}
+    result = {**result, "id": req_id}
+    tmp = os.path.join(CKPT_STATE_DIR, "checkpoint.result.tmp")
+    with open(tmp, "w") as fh:
+        json.dump(result, fh)
+    os.replace(tmp, os.path.join(CKPT_STATE_DIR, "checkpoint.result"))
+    log(f"pre-stop checkpoint answered: ok={result.get('ok')}")
+
+
+CKPT_STATE_DIR = "/tmp/computer_state"
 
 
 def main_computer(started: float) -> None:
@@ -1820,6 +1887,7 @@ def main_computer(started: float) -> None:
                 cf_proc, tunnel_url = launch_cloudflared(cloudflared_bin)
             except Exception as exc:
                 log(f"relay restart note: {exc}")
+        _answer_checkpoint_request()
         if now - _last_checkpoint >= CHECKPOINT_INTERVAL_S:
             _last_checkpoint = now
             try:
@@ -1904,6 +1972,7 @@ def main() -> None:
             gguf, how = download_model(dest)
         except Exception as exc:
             log(f"⚠️ Hugging Face source failed: {exc}")
+            notify_workspace("DOWNLOADING_MODEL", extra={"gpu": gpu_out, "note": f"HF failed, trying Kaggle copy: {str(exc)[:160]}"})
             gguf, how = "", ""
         if not gguf:
             gguf = download_from_cache_dataset(dest)
@@ -1948,6 +2017,7 @@ def main() -> None:
             log(f"⚠️ mirror source used ({how}) — size-checked only, sha256 not comparable")
         source = "download"
         boot_state["download_skipped"] = False
+        _start_cache_publish(gguf, gpu_out)
     else:
         boot_state["download_skipped"] = True
         log(f"⏭️  Download skipped — reusing {source} model")
@@ -1988,11 +2058,6 @@ def main() -> None:
     notify_workspace("STARTING_GATEWAY", extra={"gpu": gpu_out})
     start_gateway()
 
-    try:
-        cleanup_model_downloads()
-    except Exception as exc:
-        log(f"model-download cleanup note: {exc}")
-
     cf_proc, tunnel_url = launch_cloudflared(cloudflared_bin)
     if not tunnel_url:
         fail("TUNNEL_ERROR", "Could not bring up the Cloudflare tunnel (no URL and no configured hostname)")
@@ -2031,13 +2096,7 @@ def main() -> None:
         extra={"gpu": gpu_out, "source": source, "boot_seconds": boot_state["boot_seconds"]},
     )
 
-    # ---- one-time: make the verified model persistent for every future run ----
-    if source == "download":
-        if cache_dataset_is_ready():
-            log("✅ Cache dataset already holds the model — skipping republish")
-            notify_workspace("CACHE_DATASET_READY", extra={"dataset": CACHE_DATASET_SLUG, "gpu": gpu_out})
-        else:
-            publish_cache_dataset(gguf)
+    # (the one-time Kaggle cache publish was started right after the download; see _start_cache_publish)
 
     log(f"⏳ Server loop active for up to {MAX_RUNTIME_SECONDS // 3600}h")
     loop_start = time.time()
