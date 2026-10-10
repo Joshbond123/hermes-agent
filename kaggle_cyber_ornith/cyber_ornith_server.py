@@ -260,11 +260,12 @@ def notify_workspace(status: str, tunnel_url: str = "", extra: dict = None) -> N
         "tunnel_url": tunnel_url,
         "model": MODEL_ALIAS,
         "quant": MODEL_QUANT,
-        "api_key": API_KEY,
         "timestamp": int(time.time()),
     }
     if extra:
         payload.update(extra)
+    # The ntfy topic is public. The gateway key is never published there; it is stored in D1 only.
+    payload.pop("api_key", None)
     try:
         req = urllib.request.Request(
             f"https://ntfy.sh/{TELEMETRY_TOPIC}",
