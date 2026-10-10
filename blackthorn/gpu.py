@@ -201,7 +201,14 @@ class GpuService:
         import os
         from .fleet import accounts_from_env
         if hasattr(d1, "turn_off_fleet") and accounts_from_env(os.environ):
-            out = await asyncio.to_thread(d1.turn_off_fleet)
+            # Blocking stop so the UI does not report offline while the kernel is still up.
+            out = await asyncio.to_thread(d1.turn_off_fleet, True)
+            # Safety net: also run the single-session off path for the primary row.
+            try:
+                await asyncio.to_thread(d1.turn_off_kaggle_gpu)
+            except Exception as exc:  # noqa: BLE001
+                log = __import__("logging").getLogger("blackthorn.gpu")
+                log.warning("legacy turn_off_kaggle_gpu after fleet: %s", exc)
             st = await self.status(refresh=True)
             failed = {role: v for role, v in out.items() if isinstance(v, dict) and v.get("status") in ("stop_failed", "stop_unverified")}
             st["fleet"] = out

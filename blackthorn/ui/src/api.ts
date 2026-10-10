@@ -61,7 +61,7 @@ export const api = {
   gpu: {
     status: (refresh = false) => request<GpuStatus>(`/api/kaggle-gpu/status${refresh ? '?refresh=true' : ''}`, { timeoutMs: 30000 }),
     turnOn: () => request<GpuStatus>('/api/kaggle-gpu/turn-on', { method: 'POST', timeoutMs: 60000 }),
-    turnOff: () => request<GpuStatus>('/api/kaggle-gpu/turn-off', { method: 'POST', ...json({ confirm: true }), timeoutMs: 60000 }),
+    turnOff: () => request<GpuStatus>('/api/kaggle-gpu/turn-off', { method: 'POST', ...json({ confirm: true }), timeoutMs: 180000 }),
     activity: () => request<{ auto_off_minutes: number; choices: number[] }>('/api/kaggle-gpu/activity'),
     setAutoOff: (minutes: number) => request<{ auto_off_minutes: number }>('/api/kaggle-gpu/auto-off', { method: 'POST', ...json({ minutes }) }),
     logs: () => request<{ lines: string[]; error?: string }>('/api/kaggle-gpu/logs?limit=80', { timeoutMs: 25000 }),

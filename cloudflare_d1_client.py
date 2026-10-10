@@ -1622,10 +1622,13 @@ def failover_fleet_role(role: str, from_slot: str, to_slot: str) -> Dict[str, An
     return out
 
 
-def turn_off_fleet(blocking: bool = False) -> Dict[str, Any]:
+def turn_off_fleet(blocking: bool = True) -> Dict[str, Any]:
     """Stop both roles' kernels. Honest per-role result: a row is written GPU_STOPPED only
-    after Kaggle confirms; a refused stop is reported stop_failed. Runs in the background
-    so the controller responds instantly (blocking=True for tests/tools)."""
+    after Kaggle confirms; a refused stop is reported stop_failed.
+
+    Default is blocking so the API does not report success while kernels are still running.
+    Pass blocking=False only for fire-and-forget callers.
+    """
     from blackthorn.fleet import FleetManager, accounts_from_env, kernel_slug_for
     ensure_d1_schema()
     accounts = accounts_from_env(os.environ)
@@ -1642,10 +1645,25 @@ def turn_off_fleet(blocking: bool = False) -> Dict[str, Any]:
             out[role] = {"status": "unconfigured"}
             continue
         out[role] = {"account": account.user, "status": "stopping"}
+        # Mark stopping immediately so heartbeats do not look "ready" during the stop.
+        try:
+            _write_fleet_row(row_id, "STOPPING_KAGGLE_GPU", tunnel_url="", gpu_info="")
+        except Exception:
+            pass
         targets.append((fleet, account, role, row_id))
+        # Also try the inactive slot so a twin session cannot keep burning quota.
+        other_slot = "backup" if st.active == "primary" else "primary"
+        other = fleet.by_slot.get((role, other_slot))
+        if other is not None and other.user != account.user:
+            targets.append((fleet, other, role, row_id))
 
     def _stops() -> None:
+        seen = set()
         for fleet_, account, role, row_id in targets:
+            key = (account.user, role)
+            if key in seen:
+                continue
+            seen.add(key)
             try:
                 found = fleet_.find_role_kernel(account)
                 slug = (found or {}).get("slug") or kernel_slug_for(account)
@@ -1653,16 +1671,18 @@ def turn_off_fleet(blocking: bool = False) -> Dict[str, Any]:
             except Exception as exc:  # noqa: BLE001 - reported per role, never hidden
                 result = {"state": "failed", "error": f"{type(exc).__name__}: {str(exc)[:160]}"}
             if result["state"] in ("stopped", "not_running"):
-                _write_fleet_row(row_id, "GPU_STOPPED_SAVING_QUOTA", gpu_info="")
-                out[role]["status"] = "stopped" if result["state"] == "stopped" else "not_running"
+                _write_fleet_row(row_id, "GPU_STOPPED_SAVING_QUOTA", tunnel_url="", gpu_info="")
+                # Prefer reporting stopped if any account for the role stopped.
+                if out.get(role, {}).get("status") not in ("stopped",):
+                    out[role]["status"] = "stopped" if result["state"] == "stopped" else "not_running"
             elif result["state"] == "unverified":
-                # the stop was accepted but cannot be confirmed through the API: say so, do not claim either outcome
                 out[role]["status"] = "stop_unverified"
                 out[role]["error"] = result.get("error", "")
                 logger.warning("turn-off unverified for %s on %s: %s", role, account.user, result.get("error"))
             else:
-                out[role]["status"] = "stop_failed"
-                out[role]["error"] = result.get("error", "")
+                if out.get(role, {}).get("status") not in ("stopped", "not_running"):
+                    out[role]["status"] = "stop_failed"
+                    out[role]["error"] = result.get("error", "")
                 logger.error("turn-off refused for %s on %s: %s", role, account.user, result.get("error"))
 
     if blocking:
