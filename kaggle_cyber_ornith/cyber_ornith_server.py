@@ -765,6 +765,24 @@ def inrok_tunnel_name() -> str:
     return "blackthorn" if ROLE != "computer" else "blackthorn-computer"
 
 
+def _inrok_gateway_answers(public: str) -> bool:
+    """True only when the gateway itself answers through the tunnel.
+
+    Inrok serves its own HTML pages (interstitial, 'tunnel offline') through the same host, so an HTML
+    body or a 404 is NOT the gateway. The gateway answers 200 JSON, or 401/403 for a bad key.
+    """
+    req = urllib.request.Request(public + "/health", headers=dict(INROK_INTERSTITIAL_HEADERS))
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            body = resp.read(4096)
+            return resp.status == 200 and not body.lstrip().startswith(b"<")
+    except urllib.error.HTTPError as exc:
+        body = exc.read(4096) if hasattr(exc, "read") else b""
+        return exc.code in (401, 403) and not body.lstrip().startswith(b"<")
+    except Exception:
+        return False
+
+
 def launch_inrok() -> tuple:
     """Expose the local gateway at https://<name>.share.inrok.in and return (proc, url).
 
@@ -783,24 +801,16 @@ def launch_inrok() -> tuple:
     proc = subprocess.Popen([binary, "http", str(GATEWAY_PORT), "--name", name],
                             stdout=handle, stderr=subprocess.STDOUT)
     public = "https://" + name + ".share.inrok.in"
-    deadline = time.time() + 120
+    deadline = time.time() + 150
     while time.time() < deadline:
         if proc.poll() is not None:
             log("❌ inrok tunnel exited early (see /tmp/inrok_" + name + ".log)")
             return None, ""
-        try:
-            req = urllib.request.Request(public + "/health", headers=dict(INROK_INTERSTITIAL_HEADERS))
-            with urllib.request.urlopen(req, timeout=8):
-                pass
+        if _inrok_gateway_answers(public):
             log("Inrok tunnel up: " + public)
             return proc, public
-        except urllib.error.HTTPError:
-            # Any HTTP answer means the tunnel reached the gateway (auth/booting codes are fine here).
-            log("Inrok tunnel up: " + public)
-            return proc, public
-        except Exception:
-            time.sleep(2)
-    log("❌ inrok tunnel did not answer within 120s: " + public)
+        time.sleep(2)
+    log("❌ inrok tunnel did not answer within 150s: " + public)
     try:
         proc.terminate()
     except Exception:
