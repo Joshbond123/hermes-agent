@@ -199,6 +199,7 @@ class AgentRun:
         self._activity("run_started")
         # Immediate UI feedback: do not wait for GPU connect / prefill before the user sees activity.
         self.run.emit("thinking", state="start")
+        self.run.emit("notice", level="info", text="Connected — generating a reply…")
         self._early_thinking = True
         try:
             await self._loop()

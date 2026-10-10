@@ -751,6 +751,90 @@ def ensure_cloudflared() -> str:
     return binary
 
 
+def ensure_ngrok() -> str:
+    """Download the ngrok agent binary (used instead of ephemeral trycloudflare tunnels)."""
+    for candidate in ("/tmp/ngrok", "/usr/local/bin/ngrok"):
+        if os.path.exists(candidate) and os.access(candidate, os.X_OK):
+            log(f"✅ ngrok present: {candidate}")
+            return candidate
+    binary = "/tmp/ngrok"
+    log("🌐 Fetching ngrok...")
+    # Official stable linux amd64 tarball
+    archive = "/tmp/ngrok.tgz"
+    subprocess.run([
+        "curl", "-fsSL",
+        "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz",
+        "-o", archive,
+    ], check=True)
+    subprocess.run(["tar", "-xzf", archive, "-C", "/tmp"], check=True)
+    if not os.path.exists(binary):
+        # tarball extracts as ./ngrok
+        if os.path.exists("/tmp/ngrok"):
+            pass
+        else:
+            raise RuntimeError("ngrok binary missing after extract")
+    os.chmod(binary, 0o755)
+    return binary
+
+
+def launch_ngrok(port: int):
+    """Start an ngrok HTTP tunnel to the local gateway. Returns (proc, public_url).
+
+    Auth token: NGROK_AUTHTOKEN or BLACKTHORN_NGROK_AUTHTOKEN.
+    Optional fixed domain: NGROK_DOMAIN or BLACKTHORN_NGROK_DOMAIN (e.g. blackthorn.ngrok.app).
+    """
+    token = (os.environ.get("NGROK_AUTHTOKEN") or os.environ.get("BLACKTHORN_NGROK_AUTHTOKEN") or "").strip()
+    # Fallback authtoken provided for Blackthorn when Render env is not yet updated.
+    if not token:
+        token = "inrok_PxoKt_ma6T9SP_sXKb-EbopTxZvgQ8LFY6pqYl3hcvI"
+    if not token:
+        return None, ""
+    domain = (os.environ.get("NGROK_DOMAIN") or os.environ.get("BLACKTHORN_NGROK_DOMAIN") or "").strip()
+    binary = ensure_ngrok()
+    # Configure authtoken (idempotent)
+    try:
+        subprocess.run([binary, "config", "add-authtoken", token], check=False, capture_output=True, timeout=30)
+    except Exception as exc:
+        log(f"ngrok authtoken note: {exc}")
+    log_path = "/tmp/ngrok.log"
+    handle = open(log_path, "w")
+    # ngrok v3: `ngrok http <port> [--url=https://host]`
+    cmd = [binary, "http", f"127.0.0.1:{port}", "--log=stdout", "--log-format=logfmt"]
+    if domain:
+        host = domain if domain.startswith("http") else f"https://{domain}"
+        cmd.extend([f"--url={host}"])
+    proc = subprocess.Popen(cmd, stdout=handle, stderr=subprocess.STDOUT)
+    public = ""
+    # Poll local ngrok inspector API for the public URL
+    for _ in range(40):
+        time.sleep(0.5)
+        if proc.poll() is not None:
+            log(f"ngrok exited early; see {log_path}")
+            break
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:4040/api/tunnels", timeout=2) as resp:
+                data = json.loads(resp.read().decode())
+            for tun in data.get("tunnels") or []:
+                url = str(tun.get("public_url") or "")
+                if url.startswith("https://"):
+                    public = url.rstrip("/")
+                    break
+            if public:
+                break
+        except Exception:
+            continue
+    if public:
+        log(f"✅ ngrok online: {public}")
+    else:
+        log("⚠️ ngrok started but no public URL yet")
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        return None, ""
+    return proc, public
+
+
 def ollama_model_present() -> bool:
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{OLLAMA_PORT}/api/tags", timeout=5) as resp:
@@ -1400,15 +1484,18 @@ RELAY_CLIENT_CODE = '"""Render long-poll relay client for the Blackthorn Kaggle 
 
 
 def launch_cloudflared(cloudflared_bin: str):
-    """Start the tunnel and return (proc, public_url).
+    """Start the public tunnel and return (proc, public_url).
 
-    Preferred: the stable named tunnel (remotely managed, token auth) fronted by
-    blacktornagent.ing.ng. The URL never changes across reboots/restarts, so the
-    Render side keeps a permanent endpoint instead of chasing quick-tunnel URLs.
-    Second: the durable Render relay (long-poll) at BLACKTHORN_RELAY_URL - also a
-    permanent URL, needs no tunnel service at all.
-    Fallback: the ephemeral quick tunnel, only when neither is configured.
+    Order:
+    1. ngrok (NGROK_AUTHTOKEN / BLACKTHORN_NGROK_AUTHTOKEN) — preferred stable edge
+    2. Cloudflare named tunnel token (CLOUDFLARED_TUNNEL_TOKEN)
+    3. Render long-poll relay (BLACKTHORN_RELAY_URL)
+    4. Ephemeral trycloudflare quick tunnel (last resort)
     """
+    ngrok_proc, ngrok_url = launch_ngrok(GATEWAY_PORT)
+    if ngrok_url:
+        return ngrok_proc, ngrok_url
+
     cf_log_path = "/tmp/cloudflared.log"
     handle = open(cf_log_path, "w")
     relay_base = (os.environ.get("BLACKTHORN_RELAY_URL") or "").strip().rstrip("/")
