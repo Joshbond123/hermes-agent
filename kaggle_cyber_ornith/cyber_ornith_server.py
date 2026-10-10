@@ -1825,6 +1825,25 @@ def _answer_checkpoint_request() -> None:
 CKPT_STATE_DIR = "/tmp/computer_state"
 
 
+TUNNEL_PROBE_EVERY_S = 60
+TUNNEL_FAILS_BEFORE_RELAUNCH = 3
+
+
+def _tunnel_answers(public_url: str) -> bool:
+    """True when the public tunnel reaches this computer's gateway (any HTTP answer from the gateway is a yes)."""
+    if not public_url:
+        return False
+    req = urllib.request.Request(public_url.rstrip("/") + "/health",
+                                 headers={"skip_zrok_interstitial": "true"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status == 200
+    except urllib.error.URLError:
+        return False  # includes HTTPError (inrok answers 502 when the tunnel is down)
+    except OSError:
+        return False
+
+
 def main_computer(started: float) -> None:
     """The agent's personal computer: gateway + persistent workspace + relay. No model here."""
     os.makedirs(COMPUTER_WORKSPACE, exist_ok=True)
@@ -1878,6 +1897,8 @@ def main_computer(started: float) -> None:
     loop_start = time.time()
     _last_heartbeat = 0.0
     _last_checkpoint = time.time()
+    _last_tunnel_probe = 0.0
+    _tunnel_fails = 0
     while time.time() - loop_start < MAX_RUNTIME_SECONDS:
         time.sleep(15)
         now = time.time()
@@ -1888,6 +1909,30 @@ def main_computer(started: float) -> None:
             except Exception as exc:
                 log(f"relay restart note: {exc}")
         _answer_checkpoint_request()
+        if now - _last_tunnel_probe >= TUNNEL_PROBE_EVERY_S:
+            _last_tunnel_probe = now
+            if _tunnel_answers(tunnel_url):
+                _tunnel_fails = 0
+            else:
+                _tunnel_fails += 1
+                log(f"⚠️ public tunnel did not answer ({_tunnel_fails}/{TUNNEL_FAILS_BEFORE_RELAUNCH}): {tunnel_url}")
+                if _tunnel_fails >= TUNNEL_FAILS_BEFORE_RELAUNCH:
+                    _tunnel_fails = 0
+                    if cf_proc is not None and cf_proc.poll() is None:
+                        cf_proc.terminate()
+                        try:
+                            cf_proc.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            cf_proc.kill()
+                    try:
+                        cf_proc, fresh_url = launch_cloudflared(cloudflared_bin)
+                    except (OSError, RuntimeError, ValueError) as exc:
+                        cf_proc, fresh_url = None, ""
+                        log(f"tunnel relaunch failed: {type(exc).__name__}: {str(exc)[:160]}")
+                    if fresh_url:
+                        tunnel_url = fresh_url
+                        notify_workspace("TUNNEL_ONLINE", tunnel_url=tunnel_url, extra={"role": ROLE, "relaunched": True})
+                        log(f"tunnel relaunched: {tunnel_url}")
         if now - _last_checkpoint >= CHECKPOINT_INTERVAL_S:
             _last_checkpoint = now
             try:

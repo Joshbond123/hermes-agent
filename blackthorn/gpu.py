@@ -205,7 +205,7 @@ class GpuService:
         from .fleet import accounts_from_env
         if hasattr(d1, "turn_off_fleet") and accounts_from_env(os.environ):
             # Blocking stop so the UI does not report offline while the kernel is still up.
-            out = await asyncio.to_thread(d1.turn_off_fleet, True)
+            out = await asyncio.to_thread(d1.turn_off_fleet, True, "user turn-off")
             # Safety net: also run the single-session off path for the primary row.
             try:
                 await asyncio.to_thread(d1.turn_off_kaggle_gpu)

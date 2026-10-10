@@ -128,11 +128,40 @@ def test_idle_everywhere_is_stopped(ready_primary):
     assert decision["computer_jobs"] == 0
 
 
-def test_unknown_computer_activity_blocks_stop_a_bounded_number_of_times(ready_primary, monkeypatch):
-    monkeypatch.setattr(d1c, "_COMPUTER_ACTIVITY", {**ready_primary, "known": False, "fails": 1, "error": "timeout"})
-    assert d1c.auto_off_decision()["should_stop"] is False
-    monkeypatch.setattr(d1c, "_COMPUTER_ACTIVITY", {**ready_primary, "known": False, "fails": 3, "error": "timeout"})
-    assert d1c.auto_off_decision()["should_stop"] is True   # bounded: never blocks forever
+def test_unknown_computer_activity_blocks_stop_until_the_bound(ready_primary, monkeypatch):
+    now = time.time()
+    monkeypatch.setattr(d1c, "_COMPUTER_ACTIVITY", {**ready_primary, "known": False, "fails": 2, "error": "502",
+                                                   "unknown_since": now - 60})
+    decision = d1c.auto_off_decision()
+    assert decision["should_stop"] is False and "unknown" in decision["reason"]
+    monkeypatch.setattr(d1c, "_COMPUTER_ACTIVITY", {**ready_primary, "known": False, "fails": 40, "error": "502",
+                                                   "unknown_since": now - d1c.COMPUTER_ACTIVITY_MAX_UNKNOWN_S - 5})
+    assert d1c.auto_off_decision()["should_stop"] is True   # bounded: an unreachable computer cannot block forever
+
+
+def test_stop_requests_are_audited_with_their_source(monkeypatch):
+    written = {}
+    monkeypatch.setattr(d1c, "d1_query", lambda sql, params=None: (
+        [{"value": "[]"}] if sql.startswith("SELECT") else written.update(sql=sql, params=params) or []))
+    d1c._record_stop_event("auto-off", "idle 5.0 min")
+    import json as _json
+    events = _json.loads(written["params"][0])
+    assert events[-1]["source"] == "auto-off" and "idle" in events[-1]["detail"]
+
+
+def test_stop_audit_never_blocks_a_stop(monkeypatch):
+    def _down(sql, params=None):
+        raise RuntimeError("d1 unreachable")
+    monkeypatch.setattr(d1c, "d1_query", _down)
+    d1c._record_stop_event("user turn-off")   # must not raise
+
+
+def test_tunnel_health_probe_reports_502_as_down(monkeypatch):
+    import urllib.error as ue
+    def _502(req, timeout=None):
+        raise ue.HTTPError(req.full_url, 502, "tunnel offline", hdrs=None, fp=None)
+    monkeypatch.setattr(srv.urllib.request, "urlopen", _502)
+    assert srv._tunnel_answers("https://computer.example") is False
 
 
 def test_refresh_counts_jobs_from_the_computer(monkeypatch):

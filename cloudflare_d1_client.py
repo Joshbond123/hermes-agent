@@ -587,12 +587,29 @@ def _published_status() -> str:
         return ""
 
 
+def _record_stop_event(source: str, detail: str = "") -> None:
+    """Append an auditable record of every stop request (who asked, why, when) to D1 state_meta.
+
+    Keeps the last 30 events. Never raises: auditing must not block a stop.
+    """
+    try:
+        rows = d1_query("SELECT value FROM state_meta WHERE key = 'blackthorn_stop_events' LIMIT 1;")
+        events = json.loads(str(rows[0].get("value") or "[]")) if rows else []
+        if not isinstance(events, list):
+            events = []
+        events.append({"ts": int(time.time()), "source": source, "detail": str(detail)[:200]})
+        d1_query("INSERT OR REPLACE INTO state_meta (key, value) VALUES ('blackthorn_stop_events', ?);",
+                 [json.dumps(events[-30:])])
+    except (OSError, ValueError, RuntimeError, urllib.error.URLError, KeyError, IndexError) as exc:
+        logger.warning("stop audit not written: %s", type(exc).__name__)
+
+
 def _auto_off_stop() -> Dict[str, Any]:
     """Stop every GPU the controller runs: the fleet (primary and backup accounts) when configured, else the
     single primary session. Auto-off used to call only the primary path, so a backup GPU kept running."""
     from blackthorn.fleet import accounts_from_env
     if accounts_from_env(os.environ):
-        return turn_off_fleet(blocking=True)
+        return turn_off_fleet(blocking=True, source="auto-off")
     return turn_off_kaggle_gpu()
 
 
@@ -600,8 +617,12 @@ def _auto_off_stop() -> Dict[str, Any]:
 # The idle clock above only sees chat turns. The computer runs installs, builds and agent jobs on its own, so
 # the daemon asks the computer how many tagged processes are alive and counts them as active work.
 COMPUTER_ACTIVITY_MIN_INTERVAL_S = 30.0
-COMPUTER_ACTIVITY_MAX_UNKNOWN = 3   # bounded: after this many failed probes in a row, idle logic proceeds
-_COMPUTER_ACTIVITY: Dict[str, Any] = {"active_jobs": 0, "known": False, "fails": 0, "checked_at": 0.0, "error": ""}
+# Unknown computer activity (unreachable tunnel) blocks auto-off for up to this long, measured from the first
+# failed probe. Stopping a computer we cannot see could kill its work; after the bound the idle rules apply
+# and the reason is recorded, so the stop is explicit rather than silent.
+COMPUTER_ACTIVITY_MAX_UNKNOWN_S = 3600.0
+_COMPUTER_ACTIVITY: Dict[str, Any] = {"active_jobs": 0, "known": False, "fails": 0, "checked_at": 0.0, "error": "",
+                                      "unknown_since": 0.0}
 
 
 def _computer_link() -> Tuple[str, str, str]:
@@ -625,6 +646,12 @@ def _computer_request(path: str, payload: Optional[Dict[str, Any]], timeout: flo
         return json.loads(resp.read().decode("utf-8") or "{}")
 
 
+def _mark_unknown(error: str) -> None:
+    since = float(_COMPUTER_ACTIVITY.get("unknown_since") or 0) or time.time()
+    _COMPUTER_ACTIVITY.update(known=False, fails=int(_COMPUTER_ACTIVITY.get("fails") or 0) + 1,
+                              error=error, unknown_since=since)
+
+
 def refresh_computer_activity(timeout: float = 8.0, force: bool = False) -> Dict[str, Any]:
     """Probe the computer's live tagged processes (rate-limited). Never raises; result is cached for auto-off."""
     now = time.time()
@@ -638,17 +665,15 @@ def refresh_computer_activity(timeout: float = 8.0, force: bool = False) -> Dict
         else:
             body = _computer_request("/computer/activity", None, timeout)
             jobs = int(body.get("active_jobs") or 0)
-            _COMPUTER_ACTIVITY.update(active_jobs=jobs, known=True, fails=0, error="")
+            _COMPUTER_ACTIVITY.update(active_jobs=jobs, known=True, fails=0, error="", unknown_since=0.0)
             if jobs > 0:
                 # The idle clock keeps running while the computer works, so the window starts fresh when a job ends
                 mark_activity("computer-busy")
     except urllib.error.HTTPError as exc:
         # 404 means an older computer build without the endpoint: unknown, never silently "idle"
-        _COMPUTER_ACTIVITY.update(known=False, fails=int(_COMPUTER_ACTIVITY.get("fails") or 0) + 1,
-                                  error=f"computer activity probe HTTP {exc.code}")
+        _mark_unknown(f"computer activity probe HTTP {exc.code}")
     except (urllib.error.URLError, OSError, ValueError, RuntimeError) as exc:
-        _COMPUTER_ACTIVITY.update(known=False, fails=int(_COMPUTER_ACTIVITY.get("fails") or 0) + 1,
-                                  error=f"computer activity probe: {type(exc).__name__}")
+        _mark_unknown(f"computer activity probe: {type(exc).__name__}")
     return dict(_COMPUTER_ACTIVITY)
 
 
@@ -702,10 +727,10 @@ def auto_off_decision() -> Dict[str, Any]:
     if decided["computer_jobs"] > 0:
         decided["reason"] = f"{decided['computer_jobs']} background job(s) running on the computer"
         return decided
-    if not comp.get("known") and int(comp.get("fails") or 0) < COMPUTER_ACTIVITY_MAX_UNKNOWN \
-            and _computer_link()[0]:
-        decided["reason"] = (f"computer activity unknown ({comp.get('error') or 'probe failed'}) — "
-                             f"not stopping (probe {comp.get('fails')}/{COMPUTER_ACTIVITY_MAX_UNKNOWN})")
+    unknown_for = time.time() - float(comp.get("unknown_since") or 0) if not comp.get("known") else 0.0
+    if not comp.get("known") and comp.get("unknown_since") and unknown_for < COMPUTER_ACTIVITY_MAX_UNKNOWN_S:
+        decided["reason"] = (f"computer activity unknown for {unknown_for:.0f}s ({comp.get('error') or 'probe failed'}) "
+                             f"— not stopping until {COMPUTER_ACTIVITY_MAX_UNKNOWN_S:.0f}s")
         return decided
     remaining = minutes * 60 - snap["idle_seconds"]
     if remaining <= 0:
@@ -1615,6 +1640,7 @@ def turn_on_fleet(blocking: bool = False) -> Dict[str, Any]:
     threshold or on a hard failure. Both systems boot in parallel with their own state
     row so the controller shows independent progress.
     """
+    _record_stop_event("turn-on", "fleet push (stops same-slug sessions before pushing)")
     from blackthorn.fleet import (FleetManager, accounts_from_env, kernel_slug_for,
                                   notebook_env_for)
     from blackthorn.kaggle_bundle import build_computer_notebook_text, build_notebook_text
@@ -1728,7 +1754,7 @@ def failover_fleet_role(role: str, from_slot: str, to_slot: str) -> Dict[str, An
     return out
 
 
-def turn_off_fleet(blocking: bool = True) -> Dict[str, Any]:
+def turn_off_fleet(blocking: bool = True, source: str = "") -> Dict[str, Any]:
     """Stop both roles' kernels. Honest per-role result: a row is written GPU_STOPPED only
     after Kaggle confirms; a refused stop is reported stop_failed.
 
@@ -1738,6 +1764,7 @@ def turn_off_fleet(blocking: bool = True) -> Dict[str, Any]:
     from blackthorn.fleet import FleetManager, accounts_from_env, kernel_slug_for
     ensure_d1_schema()
     accounts = accounts_from_env(os.environ)
+    _record_stop_event(source or "turn-off", "fleet stop requested")
     if not accounts:
         return turn_off_kaggle_gpu()
     fleet = FleetManager(accounts)
@@ -1969,6 +1996,7 @@ def start_permanent_gpu_daemon() -> None:
                         )
                         last_boot_heal_ts = now
                         stale_boot_heals += 1
+                        _record_stop_event("boot-watchdog", f"stuck on {d1_status} for {quiet_for:.0f}s; re-push stops same-slug sessions")
                         try:
                             turn_on_kaggle_gpu()
                         except Exception as exc:
@@ -1990,6 +2018,7 @@ def start_permanent_gpu_daemon() -> None:
                         if consecutive_dead >= 3:
                             logger.info("Permanent GPU watchdog: restarting Kaggle GPU kernel to maintain permanent connection")
                             consecutive_dead = 0
+                            _record_stop_event("permanent-watchdog", "status not active for 3 ticks; re-push stops same-slug sessions")
                             try:
                                 turn_on_kaggle_gpu()
                             except Exception as exc:

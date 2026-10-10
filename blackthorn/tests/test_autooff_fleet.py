@@ -31,7 +31,7 @@ def test_daemon_auto_off_branch_uses_the_fleet_aware_stop():
 def test_auto_off_stops_backup_accounts_when_fleet_configured(monkeypatch):
     m = _module()
     calls = []
-    monkeypatch.setattr(m, "turn_off_fleet", lambda blocking=True: calls.append(("fleet", blocking)) or {"ok": True})
+    monkeypatch.setattr(m, "turn_off_fleet", lambda blocking=True, source="": calls.append(("fleet", blocking)) or {"ok": True})
     monkeypatch.setattr(m, "turn_off_kaggle_gpu", lambda: calls.append(("single",)) or {"ok": True})
     import blackthorn.fleet as fleet
     monkeypatch.setattr(fleet, "accounts_from_env", lambda env: ["primary-account", "backup-account"])
