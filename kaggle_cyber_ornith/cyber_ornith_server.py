@@ -759,11 +759,18 @@ def ensure_inrok() -> str:
     return INROK_BIN
 
 
+# Inrok names are held by the account until the fabric releases them. A fixed name collides with the
+# share left behind by the previous kernel (409 shareConflict), so every boot gets its own name. The
+# tunnel URL is published to D1 on each start, so routing does not depend on the name.
+_INROK_BOOT_SUFFIX = _secrets.token_hex(3)
+
+
 def inrok_tunnel_name() -> str:
     explicit = (os.environ.get("INROK_TUNNEL_NAME") or "").strip()
     if explicit:
         return explicit
-    return "blackthorn" if ROLE != "computer" else "blackthorn-computer"
+    base = "blackthorn" if ROLE != "computer" else "blackthorn-computer"
+    return f"{base}-{_INROK_BOOT_SUFFIX}"
 
 
 def _inrok_gateway_answers(public: str) -> bool:
