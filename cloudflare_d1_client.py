@@ -78,11 +78,24 @@ _PUBLIC_STATUS_FIELDS = (
 )
 
 
+def tunnel_transport(url: str) -> str:
+    """How the GPU is reached, without exposing the URL: 'inrok' (direct Inrok tunnel), 'relay', or ''."""
+    from urllib.parse import urlsplit
+    try:
+        host = (urlsplit(str(url or "")).hostname or "").lower()
+    except ValueError:
+        host = ""
+    if host.endswith(".share.inrok.in"):
+        return "inrok"
+    return "relay" if url else ""
+
+
 def public_gpu_status(state: Dict[str, Any]) -> Dict[str, Any]:
     """Allow-listed, secret-free view of the GPU state for HTTP responses."""
     out = {k: state[k] for k in _PUBLIC_STATUS_FIELDS if state.get(k) is not None}
     out["online"] = bool(state.get("active")) and not bool(state.get("booting"))
     out["has_endpoint"] = bool(state.get("tunnel_url"))
+    out["transport"] = tunnel_transport(state.get("tunnel_url"))
     return out
 
 _SCHEMA_INITIALIZED = False

@@ -130,6 +130,7 @@ class GpuService:
                     "online": c_online,
                     "booting": c_booting,
                     "has_endpoint": bool(c_url),
+                    "transport": "inrok" if ".share.inrok.in" in c_url else ("relay" if c_url else ""),
                     "display_status": (
                         "Computer Ready" if c_online else
                         ("Computer Starting" if c_booting else "Computer Offline")

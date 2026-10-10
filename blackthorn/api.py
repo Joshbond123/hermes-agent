@@ -331,6 +331,10 @@ def _relay_overlay(request: Request, out: dict) -> dict:
         target = out if key is None else out.get(key)
         if hub is None or not isinstance(target, dict) or not target.get("online"):
             continue
+        if target.get("transport") == "inrok":
+            # Direct Inrok tunnel: the notebook does not run the relay long-poll client, so relay liveness
+            # says nothing about the GPU. Readiness comes from the heartbeat and the tunnel itself.
+            continue
         health = hub.health()
         target["relay"] = health
         if health["stalled"]:
