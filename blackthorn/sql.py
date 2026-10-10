@@ -51,7 +51,7 @@ class D1Executor:
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(
                 timeout=httpx.Timeout(self._timeout, connect=10.0),
-                limits=httpx.Limits(max_keepalive_connections=8, keepalive_expiry=240.0),
+                limits=httpx.Limits(max_keepalive_connections=8, keepalive_expiry=30.0),
             )
             self._owns_client = True
         return self._client

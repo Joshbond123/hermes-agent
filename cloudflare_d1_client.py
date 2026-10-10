@@ -1501,7 +1501,7 @@ def _write_fleet_row(row_id: str, status: str, tunnel_url: str = "", api_key: st
         logger.warning("fleet row write note (%s): %s", row_id, exc)
 
 
-def turn_on_fleet() -> Dict[str, Any]:
+def turn_on_fleet(blocking: bool = False) -> Dict[str, Any]:
     """Start the model GPU and the computer GPU TOGETHER on their fleet-active accounts.
 
     Policy: only the *active* account of each role boots — the backup stays completely
@@ -1524,6 +1524,11 @@ def turn_on_fleet() -> Dict[str, Any]:
         st = fleet.decide(role, force=True)
         account = fleet.by_slot.get((role, st.active))
         plan[role] = {"state": st, "account": account}
+    # flip BOTH rows to BOOTING immediately so the controller shows real progress at once
+    for role in ("model", "computer"):
+        if plan[role]["account"] is not None:
+            _write_fleet_row("computer" if role == "computer" else "primary", "BOOTING_KAGGLE_GPU",
+                             gpu_info=f"Allocating on {plan[role]['account'].user}...")
 
     def boot(role: str) -> Dict[str, Any]:
         st, account = plan[role]["state"], plan[role]["account"]
@@ -1549,14 +1554,22 @@ def turn_on_fleet() -> Dict[str, Any]:
             return {"role": role, "account": account.user, "status": "start_failed", "error": str(exc)[:200]}
 
     import concurrent.futures as _fut
-    results: Dict[str, Any] = {}
-    with _fut.ThreadPoolExecutor(max_workers=2) as pool:
-        futs = {role: pool.submit(boot, role) for role in ("model", "computer")}
-        for role, fut in futs.items():
-            try:
-                results[role] = fut.result(timeout=300)
-            except Exception as exc:  # noqa: BLE001
-                results[role] = {"role": role, "status": "start_failed", "error": str(exc)[:200]}
+    results: Dict[str, Any] = {role: {"role": role, "account": (plan[role]["account"].user if plan[role]["account"] else None),
+                                      "status": "starting"} for role in ("model", "computer")}
+
+    def _boots() -> None:
+        with _fut.ThreadPoolExecutor(max_workers=2) as pool:
+            futs = {role: pool.submit(boot, role) for role in ("model", "computer")}
+            for role, fut in futs.items():
+                try:
+                    results[role] = fut.result(timeout=600)
+                except Exception as exc:  # noqa: BLE001
+                    results[role] = {"role": role, "status": "start_failed", "error": str(exc)[:200]}
+
+    if blocking:
+        _boots()
+    else:
+        threading.Thread(target=_boots, daemon=True, name="blackthorn-fleet-on").start()
     results["fleet"] = fleet.status()
     return results
 
@@ -1609,19 +1622,18 @@ def failover_fleet_role(role: str, from_slot: str, to_slot: str) -> Dict[str, An
     return out
 
 
-def turn_off_fleet() -> Dict[str, Any]:
-    """Stop the running kernels of both roles. Honest per-role result.
-
-    A role is written as GPU_STOPPED only after Kaggle confirms the session is not running. A refused
-    or unverifiable stop is reported as ``stop_failed`` with Kaggle's reason and the row is left alone,
-    so the controller never claims a GPU is off while it still bills quota.
-    """
+def turn_off_fleet(blocking: bool = False) -> Dict[str, Any]:
+    """Stop both roles' kernels. Honest per-role result: a row is written GPU_STOPPED only
+    after Kaggle confirms; a refused stop is reported stop_failed. Runs in the background
+    so the controller responds instantly (blocking=True for tests/tools)."""
     from blackthorn.fleet import FleetManager, accounts_from_env, kernel_slug_for
+    ensure_d1_schema()
     accounts = accounts_from_env(os.environ)
     if not accounts:
         return turn_off_kaggle_gpu()
     fleet = FleetManager(accounts)
     out: Dict[str, Any] = {}
+    targets = []
     for role in ("model", "computer"):
         st = fleet.state[role]
         account = fleet.by_slot.get((role, st.active)) or fleet.by_slot.get((role, "primary"))
@@ -1629,22 +1641,34 @@ def turn_off_fleet() -> Dict[str, Any]:
         if account is None:
             out[role] = {"status": "unconfigured"}
             continue
-        found = fleet.find_role_kernel(account)
-        slug = (found or {}).get("slug") or kernel_slug_for(account)
-        try:
-            result = fleet.stop_kernel_result(account, slug)
-        except Exception as exc:  # noqa: BLE001 - reported per role, never hidden
-            result = {"state": "failed", "error": f"{type(exc).__name__}: {str(exc)[:160]}"}
-        if result["state"] in ("stopped", "not_running"):
-            _write_fleet_row(row_id, "GPU_STOPPED_SAVING_QUOTA", gpu_info="")
-            out[role] = {"account": account.user, "status": "stopped" if result["state"] == "stopped" else "not_running"}
-        elif result["state"] == "unverified":
-            # the stop was accepted but cannot be confirmed through the API: say so, do not claim either outcome
-            out[role] = {"account": account.user, "status": "stop_unverified", "error": result.get("error", "")}
-            logger.warning("turn-off unverified for %s on %s: %s", role, account.user, result.get("error"))
-        else:
-            out[role] = {"account": account.user, "status": "stop_failed", "error": result.get("error", "")}
-            logger.error("turn-off refused for %s on %s: %s", role, account.user, result.get("error"))
+        out[role] = {"account": account.user, "status": "stopping"}
+        targets.append((fleet, account, role, row_id))
+
+    def _stops() -> None:
+        for fleet_, account, role, row_id in targets:
+            try:
+                found = fleet_.find_role_kernel(account)
+                slug = (found or {}).get("slug") or kernel_slug_for(account)
+                result = fleet_.stop_kernel_result(account, slug)
+            except Exception as exc:  # noqa: BLE001 - reported per role, never hidden
+                result = {"state": "failed", "error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+            if result["state"] in ("stopped", "not_running"):
+                _write_fleet_row(row_id, "GPU_STOPPED_SAVING_QUOTA", gpu_info="")
+                out[role]["status"] = "stopped" if result["state"] == "stopped" else "not_running"
+            elif result["state"] == "unverified":
+                # the stop was accepted but cannot be confirmed through the API: say so, do not claim either outcome
+                out[role]["status"] = "stop_unverified"
+                out[role]["error"] = result.get("error", "")
+                logger.warning("turn-off unverified for %s on %s: %s", role, account.user, result.get("error"))
+            else:
+                out[role]["status"] = "stop_failed"
+                out[role]["error"] = result.get("error", "")
+                logger.error("turn-off refused for %s on %s: %s", role, account.user, result.get("error"))
+
+    if blocking:
+        _stops()
+    else:
+        threading.Thread(target=_stops, daemon=True, name="blackthorn-fleet-off").start()
     return out
 
 

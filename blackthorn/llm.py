@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any, AsyncIterator, Dict, List, Optional
 
@@ -43,6 +44,20 @@ def _error_text(body: bytes) -> str:
     return text[:300]
 
 
+async def _anext(iterator):
+    return await iterator.__anext__()
+
+
+async def _route_alive(client: httpx.AsyncClient, route: Route) -> bool:
+    try:
+        async with client.stream("GET", f"{route.url}/health",
+                                 headers={"Authorization": f"Bearer {route.api_key}"},
+                                 timeout=httpx.Timeout(8.0, connect=5.0)) as resp:
+            return resp.status_code == 200
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _is_overflow(message: str) -> bool:
     m = message.lower()
     return ("context" in m and any(w in m for w in ("exceed", "size", "length", "too long", "window"))) or "n_ctx" in m or (
@@ -52,7 +67,10 @@ def _is_overflow(message: str) -> bool:
 def new_http_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(
         timeout=httpx.Timeout(30.0, connect=20.0),
-        limits=httpx.Limits(max_keepalive_connections=8, keepalive_expiry=300.0),
+        # keepalive_expiry MUST stay below the tunnel worker's idle-close (~100s):
+        # reusing a socket the edge already dropped writes into a half-open connection
+        # and the request hangs silently until the read timeout (4-minute responses).
+        limits=httpx.Limits(max_keepalive_connections=8, keepalive_expiry=15.0),
         headers={"User-Agent": "Blackthorn/5"},
     )
 
@@ -79,6 +97,12 @@ async def stream_chat(route: Route, messages: List[Dict[str, Any]], *, client: h
     if extra:
         body.update(extra)
     timeout = httpx.Timeout(connect=connect_timeout, read=idle_timeout, write=30.0, pool=15.0)
+    import time as _time
+    t_req = _time.monotonic()
+
+    def _log(msg: str) -> None:
+        print(f"[llm] {msg}", flush=True)
+
     try:
         async with client.stream("POST", f"{route.url}/v1/chat/completions", json=body, timeout=timeout,
                                  headers={"Authorization": f"Bearer {route.api_key}", "Accept": "text/event-stream"}) as resp:
@@ -94,49 +118,86 @@ async def stream_chat(route: Route, messages: List[Dict[str, Any]], *, client: h
                                    retryable=True, status=resp.status_code)
                 raise LLMError("gpu_http", f"The GPU endpoint returned HTTP {resp.status_code}: {detail}",
                                retryable=resp.status_code >= 500, status=resp.status_code)
-            async for raw in resp.aiter_lines():
-                if not raw.startswith("data:"):
-                    continue
-                data = raw[5:].strip()
-                if not data:
-                    continue
-                if data == "[DONE]":
-                    break
+            _log(f"connected in {_time.monotonic() - t_req:.1f}s")
+            t_first = _time.monotonic()
+            lines = resp.aiter_lines()
+            # First-byte watchdog: a pooled socket the edge already closed is half-open and
+            # stays silent forever. Detect it in ~30s and fail over to a fresh connection.
+            # A live-but-slow server (health endpoint answers) keeps its full budget.
+            pending = asyncio.ensure_future(_anext(lines))
+            done, _ = await asyncio.wait({pending}, timeout=30.0)
+            if not done:
+                healthy = await _route_alive(client, route)
+                _log(f"no first line after 30s (route {'alive' if healthy else 'DEAD'})")
+                if not healthy:
+                    pending.cancel()
+                    raise LLMError("gpu_dropped", "No response reached the app for 30s and the GPU route is not answering; retrying on a fresh connection.",
+                                   retryable=True)
+                done, _ = await asyncio.wait({pending}, timeout=60.0)  # slow prefill gets a real chance
+                if not done:
+                    pending.cancel()
+                    raise LLMError("gpu_stalled", "The GPU is online but produced no output for 90s; the request was abandoned.")
+            first = pending.result()
+            raw = first
+            while raw is not None:
+                if raw.startswith("data:"):
+                    data = raw[5:].strip()
+                    if data and data != "[DONE]":
+                        try:
+                            obj = json.loads(data)
+                        except ValueError:
+                            obj = None
+                        if isinstance(obj, dict) and obj.get("error"):
+                            message = _error_text(json.dumps({"error": obj["error"]}).encode())
+                            if _is_overflow(message):
+                                raise ContextOverflow("context_overflow", message)
+                            raise LLMError("gpu_stream", message, retryable=False)
+                        if isinstance(obj, dict):
+                            usage = obj.get("usage")
+                            if isinstance(usage, dict) and usage.get("completion_tokens") is not None:
+                                yield {"t": "usage", "prompt": int(usage.get("prompt_tokens") or 0),
+                                       "completion": int(usage.get("completion_tokens") or 0)}
+                            choices = obj.get("choices") or []
+                            if choices:
+                                choice = choices[0]
+                                delta = choice.get("delta") or {}
+                                reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
+                                if reasoning:
+                                    yield {"t": "reasoning", "v": reasoning}
+                                content = delta.get("content") or ""
+                                if content:
+                                    yield {"t": "content", "v": content}
+                                for tc in delta.get("tool_calls") or []:
+                                    fn = tc.get("function") or {}
+                                    yield {"t": "tool", "index": int(tc.get("index", 0) or 0), "id": tc.get("id"),
+                                           "name": fn.get("name"), "args": fn.get("arguments") or ""}
+                                if choice.get("finish_reason"):
+                                    yield {"t": "finish", "v": str(choice["finish_reason"])}
+                    elif data == "[DONE]":
+                        break
                 try:
-                    obj = json.loads(data)
-                except ValueError:
-                    continue
-                if isinstance(obj, dict) and obj.get("error"):
-                    message = _error_text(json.dumps({"error": obj["error"]}).encode())
-                    if _is_overflow(message):
-                        raise ContextOverflow("context_overflow", message)
-                    raise LLMError("gpu_stream", message, retryable=False)
-                usage = obj.get("usage") if isinstance(obj, dict) else None
-                if isinstance(usage, dict) and usage.get("completion_tokens") is not None:
-                    yield {"t": "usage", "prompt": int(usage.get("prompt_tokens") or 0),
-                           "completion": int(usage.get("completion_tokens") or 0)}
-                choices = obj.get("choices") or []
-                if not choices:
-                    continue
-                choice = choices[0]
-                delta = choice.get("delta") or {}
-                reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
-                if reasoning:
-                    yield {"t": "reasoning", "v": reasoning}
-                content = delta.get("content") or ""
-                if content:
-                    yield {"t": "content", "v": content}
-                for tc in delta.get("tool_calls") or []:
-                    fn = tc.get("function") or {}
-                    yield {"t": "tool", "index": int(tc.get("index", 0) or 0), "id": tc.get("id"),
-                           "name": fn.get("name"), "args": fn.get("arguments") or ""}
-                if choice.get("finish_reason"):
-                    yield {"t": "finish", "v": str(choice["finish_reason"])}
+                    raw = await _anext(lines)
+                except StopAsyncIteration:
+                    break
     except httpx.ConnectTimeout as exc:
         raise LLMError("gpu_unreachable", "Timed out connecting to the GPU tunnel.", retryable=True) from exc
     except httpx.ConnectError as exc:
         raise LLMError("gpu_unreachable", "Could not connect to the GPU tunnel (it may have stopped).", retryable=True) from exc
     except httpx.ReadTimeout as exc:
+        waited = _time.monotonic() - t_req
+        if waited < min(idle_timeout, 25.0):
+            # nothing at all came back within seconds: almost certainly a dead pooled
+            # socket / half-open connection - retryable, the caller re-runs on a fresh one.
+            raise LLMError("gpu_dropped", f"Connection to the GPU was half-open (silent for {waited:.0f}s); retrying on a fresh connection.",
+                           retryable=True) from exc
         raise LLMError("gpu_stalled", f"The model produced no output for {int(idle_timeout)}s and the request was abandoned.") from exc
     except (httpx.RemoteProtocolError, httpx.ReadError) as exc:
         raise LLMError("gpu_dropped", "The connection to the GPU dropped mid-response.", retryable=True) from exc
+    except httpx.HTTPError as exc:
+        raise LLMError("gpu_dropped", f"The connection to the GPU failed ({type(exc).__name__}).", retryable=True) from exc
+    except LLMError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - any transport-layer surprise is a recoverable drop
+        raise LLMError("gpu_dropped", f"The connection to the GPU failed ({type(exc).__name__}: {str(exc)[:80]}).", retryable=True) from exc
+    except (httpx.RemoteProtocolError, httpx.ReadError) as exc:
+        raise LLMError("gpu_dropped", "The connection to the GPU dropped mid-response.", retryable=False) from exc

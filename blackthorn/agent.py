@@ -353,6 +353,8 @@ class AgentRun:
                              exc.code in ("gpu_unreachable", "gpu_dropped", "gpu_stalled") or
                              (exc.status is not None and exc.status in (502, 503, 521, 522, 523, 524)))
                 # More patience on edge/proxy blips; auth/protocol still fail fast (retryable=False).
+                # Bounded and visible (attempt N of limit); the first-byte watchdog already
+                # fails over half-open sockets quickly, so each attempt is cheap.
                 limit = 6 if (exc.status in (502, 503, 521, 522, 523, 524) or
                               exc.code in ("gpu_unreachable", "gpu_dropped", "gpu_stalled")) else 3
                 if not transient or attempt >= limit:

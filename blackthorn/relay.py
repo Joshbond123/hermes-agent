@@ -277,12 +277,24 @@ async def relay_proxy(request: Request, path: str = ""):
         services = request.app.state.bt
         hubs = getattr(services, "relay_hubs", None) or {}
         comp = hubs.get("computer")
-        if comp is not None and comp.alive():
-            channel = "computer"
-            forward = raw  # keep /computer/... for the computer gateway
+        if comp is None or not comp.alive():
+            # The computer host may not have pulled yet (its hub appears on the first
+            # pull) or may be between long-polls; give it a moment before falling back
+            # to the model host (which also serves /computer/*).
+            for _ in range(6):
+                await asyncio.sleep(0.5)
+                comp = hubs.get("computer")
+                if comp is not None and comp.alive():
+                    break
+        channel = "computer" if (comp is not None and comp.alive()) else "model"
+        # The published computer base is /gpu-relay/computer, so gateway paths arrive either
+        # doubled (computer/computer/info) or single (computer/exec). The local gateway mounts
+        # /computer/* — normalise BOTH forms to exactly one "computer/" prefix.
+        rest = raw[len("computer"):].lstrip("/")
+        if rest == "computer" or rest.startswith("computer/"):
+            forward = rest
         else:
-            channel = "model"
-            forward = raw  # primary notebook serves /computer/* locally
+            forward = "computer/" + rest if rest else "computer"
     path = forward
     if path.startswith("api/kaggle-relay"):
         # the control plane lives on the app origin; asking for it through the data plane

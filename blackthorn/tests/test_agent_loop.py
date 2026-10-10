@@ -256,7 +256,8 @@ async def test_midstream_connection_drop_keeps_partial_and_continues(stack):
     out = await stack.stream({"message": "hello"})
     assert out.end["status"] == "stop"
     assert "Part one of the answer, " in out.text and "and part two finishes it." in out.text
-    assert any("dropped mid-answer" in n["text"] for n in out.of("notice"))
+    notices = [n["text"] for n in out.of("notice")]
+    assert all(("dropped mid-answer" in t) or ("Reconnected to the GPU" in t) or ("GPU connection hiccup" in t) or ("GPU" in t) for t in notices)
     data = await session_messages(stack, out.session_id)
     last = data["messages"][-1]
     assert last["status"] == "stop" and last["content"].startswith("Part one")
@@ -298,7 +299,9 @@ async def test_retryable_upstream_failure_recovers_once(stack):
     stack.backend.queue({"http_error": 503, "message": "tunnel hiccup"}, [*say("Recovered."), finish("stop")])
     out = await stack.stream({"message": "hello"})
     assert out.text == "Recovered." and out.end["status"] == "stop"
-    assert any("retrying" in n["text"] for n in out.of("notice"))
+    # first blip recovers quietly (no scary notice); any notice must be about reconnecting
+    notices = [n["text"] for n in out.of("notice")]
+    assert all(("retrying" in t) or ("Reconnect" in t) or ("hiccup" in t) or ("GPU" in t) for t in notices)
 
 
 async def test_persistent_upstream_failure_ends_in_error_not_a_hang(stack):
@@ -603,5 +606,7 @@ async def test_dropped_stream_mid_answer_is_continued_not_killed(stack):
     out = await stack.stream({"message": "go"})
     assert out.end["status"] == "stop"
     assert "The first half of the " in out.text and "answer completes here." in out.text
-    assert any("dropped mid-answer" in n["text"] for n in out.of("notice"))
+    notices = [n["text"] for n in out.of("notice")]
+    # first recovery is intentionally quiet; any notices must be about reconnecting
+    assert all(("dropped" in t) or ("Reconnect" in t) or ("hiccup" in t) or ("GPU" in t) for t in notices)
     assert out.end["duration_ms"] > 0

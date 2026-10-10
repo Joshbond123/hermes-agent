@@ -60,7 +60,7 @@ def ops(monkeypatch):
 
 
 def test_turn_on_boots_both_systems_together_and_never_the_backups(ops):
-    out = d1.turn_on_fleet()
+    out = d1.turn_on_fleet(blocking=True)
     started = {user for user, _slug, _nb in ops["starts"]}
     assert started == {"joshbond123", "josh787"}                     # both primaries, in one call
     assert out["model"]["account"] == "joshbond123"
@@ -72,7 +72,7 @@ def test_turn_on_boots_both_systems_together_and_never_the_backups(ops):
 
 def test_backup_boots_only_when_the_primary_hits_thirty_minutes(ops):
     ops["quota"]["tp"] = 29 * 60                                     # model primary nearly spent
-    out = d1.turn_on_fleet()
+    out = d1.turn_on_fleet(blocking=True)
     started = {user for user, _s, _n in ops["starts"]}
     assert "teslaarymo" in started and "joshbond123" not in started   # only now does the backup run
     assert out["model"]["slot"] == "backup"
@@ -121,7 +121,7 @@ def test_resource_exhaustion_is_reported_not_hidden(ops):
 
     import unittest.mock as mock
     with mock.patch.object(FleetManager, "start_kernel", boom):
-        out = d1.turn_on_fleet()
+        out = d1.turn_on_fleet(blocking=True)
     assert out["model"]["status"] == "starting"
     assert out["computer"]["status"] == "start_failed"
     assert "quota exhausted" in out["computer"]["error"]
