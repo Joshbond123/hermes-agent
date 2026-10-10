@@ -24,7 +24,7 @@ import re
 import subprocess
 import sys
 
-ROOT = os.environ.get("BLACKTHORN_SKILL_ROOT", "/tmp/blackthorn_skills")
+ROOT = os.environ.get("BLACKTHORN_SKILL_ROOT", "/kaggle/working/blackthorn_workspace/security_catalog")
 SKILLS_REPO = "https://github.com/mukul975/Anthropic-Cybersecurity-Skills"
 TOOLS_REPO = "https://github.com/AKCodez/hackingtool-plugin"
 SKILLS_DIR = os.path.join(ROOT, "anthropic-cybersecurity-skills")
