@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import httpx
 
@@ -51,40 +51,79 @@ class ComputerClient:
         return route.url, route.api_key
 
     async def call(self, path: str, payload: Dict[str, Any] | None = None, *, method: str = "POST",
-                   timeout: float = 60.0) -> Dict[str, Any]:
-        try:
-            base_url, api_key = await self._endpoint()
-        except RouteError as exc:
-            raise ToolError("offline", "The remote computer is offline.", hint=exc.message) from exc
-        try:
-            resp = await self._http.request(
-                method, f"{base_url}{path}", json=payload if method == "POST" else None, timeout=timeout,
-                headers={"Authorization": f"Bearer {api_key}"})
-        except httpx.ConnectError as exc:
-            self._resolver.invalidate()
-            raise ToolError("offline", "Could not reach the remote computer (the tunnel may have stopped).",
-                            hint="Open the GPU panel and check that the GPU is Ready.") from exc
-        except httpx.TimeoutException as exc:
-            raise ToolError("timeout", f"The remote computer did not answer within {int(timeout)}s.") from exc
-        except httpx.HTTPError as exc:
-            raise ToolError("network", f"Network error talking to the remote computer: {type(exc).__name__}") from exc
-        ctype = (resp.headers.get("content-type") or "").lower()
-        if resp.status_code in DEAD or "text/html" in ctype:
-            self._resolver.invalidate()
-            raise ToolError("offline", f"The remote computer tunnel is down (HTTP {resp.status_code}).",
-                            hint="Open the GPU panel and turn the GPU on again if it is not Ready.")
-        if resp.status_code in (401, 403):
-            self._resolver.invalidate()
-            raise ToolError("auth", "The remote computer rejected the access key.", hint="Turn the GPU off and on to refresh it.")
-        try:
-            data = resp.json()
-        except ValueError:
-            raise ToolError("protocol", f"The remote computer returned a non-JSON response (HTTP {resp.status_code}).") from None
-        if resp.status_code >= 400:
-            raise ToolError("rejected", str(data.get("detail") or data.get("error") or f"HTTP {resp.status_code}")[:300])
-        if not isinstance(data, dict):
-            raise ToolError("protocol", "Unexpected response shape from the remote computer.")
-        return data
+                   timeout: float = 90.0) -> Dict[str, Any]:
+        """Call the remote computer through the relay. Retries transient auth/timeout/502 blips.
+
+        The GPU relay is in-process on Render: a deploy or a missed long-poll can drop a single
+        request even while the notebook is healthy. Retrying with a refreshed key is the durable fix.
+        """
+        import asyncio
+        # Never let a model-chosen short timeout kill a healthy but busy notebook.
+        timeout = max(45.0, float(timeout))
+        last_err: Optional[Exception] = None
+        attempts = 4
+        for attempt in range(1, attempts + 1):
+            try:
+                base_url, api_key = await self._endpoint()
+            except RouteError as exc:
+                raise ToolError("offline", "The remote computer is offline.", hint=exc.message) from exc
+            try:
+                resp = await self._http.request(
+                    method, f"{base_url}{path}", json=payload if method == "POST" else None, timeout=timeout,
+                    headers={"Authorization": f"Bearer {api_key}"})
+            except httpx.ConnectError as exc:
+                self._resolver.invalidate()
+                last_err = ToolError("offline", "Could not reach the remote computer (the tunnel may have stopped).",
+                                     hint="Open the GPU panel and check that the GPU is Ready.")
+                if attempt >= attempts:
+                    raise last_err from exc
+                await asyncio.sleep(min(4.0, 0.5 * attempt))
+                continue
+            except httpx.TimeoutException as exc:
+                last_err = ToolError("timeout", f"The remote computer did not answer within {int(timeout)}s.")
+                if attempt >= attempts:
+                    raise last_err from exc
+                self._resolver.invalidate()
+                await asyncio.sleep(min(4.0, 0.6 * attempt))
+                continue
+            except httpx.HTTPError as exc:
+                raise ToolError("network", f"Network error talking to the remote computer: {type(exc).__name__}") from exc
+
+            ctype = (resp.headers.get("content-type") or "").lower()
+            if resp.status_code in DEAD or "text/html" in ctype:
+                self._resolver.invalidate()
+                last_err = ToolError("offline", f"The remote computer tunnel is down (HTTP {resp.status_code}).",
+                                     hint="Open the GPU panel and turn the GPU on again if it is not Ready.")
+                if attempt >= attempts:
+                    raise last_err
+                await asyncio.sleep(min(4.0, 0.5 * attempt))
+                continue
+            if resp.status_code in (401, 403):
+                # Key rotation / multi-worker race: refresh D1 key and retry.
+                self._resolver.invalidate()
+                last_err = ToolError("auth", "The remote computer rejected the access key.",
+                                     hint="Turn the GPU off and on to refresh it.")
+                if attempt >= attempts:
+                    raise last_err
+                await asyncio.sleep(0.4 * attempt)
+                continue
+            try:
+                data = resp.json()
+            except ValueError:
+                raise ToolError("protocol", f"The remote computer returned a non-JSON response (HTTP {resp.status_code}).") from None
+            if resp.status_code >= 400:
+                # 502/503 from the relay are transient — retry.
+                if resp.status_code in (502, 503, 504) and attempt < attempts:
+                    self._resolver.invalidate()
+                    await asyncio.sleep(min(4.0, 0.6 * attempt))
+                    continue
+                raise ToolError("rejected", str(data.get("detail") or data.get("error") or f"HTTP {resp.status_code}")[:300])
+            if not isinstance(data, dict):
+                raise ToolError("protocol", "Unexpected response shape from the remote computer.")
+            return data
+        if last_err:
+            raise last_err
+        raise ToolError("offline", "The remote computer is offline.")
 
 
 def _need(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -100,9 +139,11 @@ async def run_command(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
             return ToolResult.failure("refused: the command matches a destructive pattern and was not run",
                                       hint="Choose a safer command or explain to the user why it cannot be run.",
                                       data={"kind": "denied"})
-    timeout = int(args.get("timeout_seconds") or 60)
+    # Floor command timeout: short model-chosen values (e.g. 20s) were the main source of
+    # "did not answer within 20s" while the notebook was merely busy on the shared relay.
+    timeout = max(60, int(args.get("timeout_seconds") or 90))
     data = await ctx.computer.call("/computer/exec", {"command": cmd, "timeout_seconds": timeout, "cwd": args.get("cwd") or "."},
-                                   timeout=timeout + 30.0)
+                                   timeout=float(timeout + 60))
     out = str(data.get("output") or "")
     code = data.get("exit_code", -1)
     body, cut = clip(out, ctx.settings.tool_result_chars, "ends")
@@ -193,5 +234,5 @@ def specs() -> list[ToolSpec]:
         ToolSpec("fetch_url", "Open a web page as text (offset to page).", SCHEMAS["fetch_url"], fetch_url,
                  timeout=75.0, kind="net", describe=lambda a: str(a.get("url") or "")),
         ToolSpec("computer_info", "Remote computer GPU, disk, OS.", SCHEMAS["computer_info"], computer_info,
-                 timeout=30.0, describe=lambda a: ""),
+                 timeout=90.0, describe=lambda a: ""),
     ]

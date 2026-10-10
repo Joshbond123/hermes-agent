@@ -139,4 +139,4 @@ async def stream_chat(route: Route, messages: List[Dict[str, Any]], *, client: h
     except httpx.ReadTimeout as exc:
         raise LLMError("gpu_stalled", f"The model produced no output for {int(idle_timeout)}s and the request was abandoned.") from exc
     except (httpx.RemoteProtocolError, httpx.ReadError) as exc:
-        raise LLMError("gpu_dropped", "The connection to the GPU dropped mid-response.", retryable=False) from exc
+        raise LLMError("gpu_dropped", "The connection to the GPU dropped mid-response.", retryable=True) from exc
