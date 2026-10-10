@@ -1938,6 +1938,16 @@ _TURN_ON_TS = 0.0
 
 
 def turn_on_kaggle_gpu(blocking: bool = False) -> Dict[str, Any]:
+    """Single entry point for "turn the GPU on". With a fleet configured it must go through the fleet: the
+    legacy single-session path pushes to KAGGLE_KERNEL_SLUG on the primary account and never stops the
+    fleet's session, so the boot watchdogs created a second live model session (observed 18:44 UTC)."""
+    from blackthorn.fleet import accounts_from_env
+    if accounts_from_env(os.environ):
+        return turn_on_fleet(blocking=blocking)
+    return _turn_on_kaggle_gpu_single(blocking=blocking)
+
+
+def _turn_on_kaggle_gpu_single(blocking: bool = False) -> Dict[str, Any]:
     """Turn the Kaggle GPU ON and return *immediately*.
 
     The Kaggle API needs a few seconds to a couple of minutes (a stale session has
