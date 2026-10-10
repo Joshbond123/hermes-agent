@@ -352,24 +352,28 @@ class AgentRun:
                 transient = (exc.retryable or
                              exc.code in ("gpu_unreachable", "gpu_dropped", "gpu_stalled") or
                              (exc.status is not None and exc.status in (502, 503, 521, 522, 523, 524)))
-                limit = 4 if (exc.status == 524 or exc.code == "gpu_dropped") else 2
+                # More patience on edge/proxy blips; auth/protocol still fail fast (retryable=False).
+                limit = 6 if (exc.status in (502, 503, 521, 522, 523, 524) or
+                              exc.code in ("gpu_unreachable", "gpu_dropped", "gpu_stalled")) else 3
                 if not transient or attempt >= limit:
                     raise
                 self.deps.resolver.invalidate()
                 partial = "".join(part["text"] for part in self.parts if part["type"] == "text")[before:]
                 if partial.strip():
-                    # Text already reached the user; keep it and let the model continue from the
-                    # cut point instead of failing the run over one dropped packet.
-                    if self._recoveries >= 3:
+                    if self._recoveries >= 5:
                         raise
                     self._recoveries += 1
-                    self.run.emit("notice", level="info",
-                                  text="The link to the GPU dropped mid-answer; continuing from where it stopped.")
+                    # Only surface a notice after the first silent recovery.
+                    if self._recoveries >= 2:
+                        self.run.emit("notice", level="info",
+                                      text="Reconnected to the GPU; continuing the answer.")
                     messages.append({"role": "assistant", "content": partial})
                     messages.append({"role": "user", "content": CONTINUE_NOTE})
                 else:
-                    self.run.emit("notice", level="info", text="GPU connection hiccup — retrying.")
-                await asyncio.sleep(min(4.0, 0.8 * attempt))
+                    # Silent on first blips — "hiccup" notices felt like failures during healthy retries.
+                    if attempt >= 3:
+                        self.run.emit("notice", level="info", text="Reconnecting to the GPU…")
+                await asyncio.sleep(min(6.0, 0.6 * (2 ** (attempt - 1))))
                 continue
 
     async def _consume(self, route: Any, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]]) -> StepResult:

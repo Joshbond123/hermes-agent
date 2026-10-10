@@ -1,4 +1,4 @@
-import { memo, useEffect, useRef, useState } from 'react'
+import { memo, useEffect, useState } from 'react'
 import type { Phase } from '../state'
 import type { Message, Part, ToolPart } from '../types'
 import { Markdown } from '../Markdown'
@@ -61,20 +61,19 @@ function Tool({ t }: { t: ToolPart }) {
 }
 
 function Activity({ tools, live }: { tools: ToolPart[]; live: boolean }) {
+  // Collapsed by default (Replit-style): show a one-line status; expand only on click.
   const running = tools.some((t) => t.status === 'running')
-  const [open, setOpen] = useState(running || live)
-  const touched = useRef(false)
-  useEffect(() => { if (!touched.current) setOpen(running) }, [running])
+  const [open, setOpen] = useState(false)
   const failed = tools.filter((t) => t.status === 'error').length
   const total = tools.reduce((n, t) => n + (t.duration_ms ?? 0), 0)
   const names = Array.from(new Set(tools.map((t) => label(t.name)))).join(', ')
   return (
     <div className={`activity${open ? ' open' : ''}`} data-testid="activity-group" data-open={open}>
-      <button type="button" className="activity-head" aria-expanded={open} onClick={() => { touched.current = true; setOpen((v) => !v) }} data-testid="activity-toggle">
+      <button type="button" className="activity-head" aria-expanded={open} onClick={() => setOpen((v) => !v)} data-testid="activity-toggle">
         <ChevronIcon className="chev" />
-        <span className="activity-title">{running ? 'Working' : 'Used tools'}</span>
-        <span className="muted">{names}</span>
-        <span className="muted">· {tools.length} {tools.length === 1 ? 'step' : 'steps'}{failed ? `, ${failed} failed` : ''}{total && !running ? ` · ${formatDuration(total)}` : ''}</span>
+        <span className="activity-title">{running || live ? 'Working' : 'Activity'}</span>
+        <span className="muted">{names || (live ? 'preparing…' : '')}</span>
+        <span className="muted">· {tools.length} {tools.length === 1 ? 'step' : 'steps'}{failed ? `, ${failed} failed` : ''}{total && !running ? ` · ${formatDuration(total)}` : ''}{running ? ' · running' : ''}</span>
       </button>
       {open && <ul className="tools">{tools.map((t) => <Tool key={t.id} t={t} />)}</ul>}
     </div>
@@ -155,18 +154,22 @@ export const MessageView = memo(function MessageView({ m, live, phase, isLast, b
       <div className="msg-body">
         {renderParts(m.parts, live)}
         {live ? (
-          m.thinkingSince ? (
-            <div className="waiting" data-testid="thinking" role="status">
-              Thinking <span className="muted">{Math.max(0, Math.round((Date.now() - m.thinkingSince) / 1000))}s</span>
+          <div className="activity live-status" data-testid="thinking" role="status">
+            <div className="activity-head static">
+              <span className="activity-title">{m.thinkingSince ? 'Working' : (phase === 'tool' ? 'Using tools' : 'Responding')}</span>
+              <span className="muted">
+                {m.thinkingSince
+                  ? `${Math.max(0, Math.round((Date.now() - m.thinkingSince) / 1000))}s`
+                  : null}
+              </span>
             </div>
-          ) : (
             <StatusLine
               phase={phase}
               since={(m.created_at ?? Date.now() / 1000) * 1000}
               tools={m.parts.filter((p): p is ToolPart => p.type === 'tool')}
               steps={m.parts.filter((p): p is ToolPart => p.type === 'tool').reduce((n, t) => Math.max(n, t.step ?? 0), 0)}
             />
-          )
+          </div>
         ) : null}
         {m.notices?.map((n, i) => <div key={i} className={`notice ${n.level}`} data-testid="notice">{n.text}</div>)}
         {m.status === 'cancelled' && <div className="status-note" data-testid="stopped-note">{hasText ? 'Stopped.' : 'Stopped before anything was written.'}</div>}
