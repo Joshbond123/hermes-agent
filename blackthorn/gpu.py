@@ -210,7 +210,7 @@ class GpuService:
                 log = __import__("logging").getLogger("blackthorn.gpu")
                 log.warning("legacy turn_off_kaggle_gpu after fleet: %s", exc)
             st = await self.status(refresh=True)
-            failed = {role: v for role, v in out.items() if isinstance(v, dict) and v.get("status") in ("stop_failed", "stop_unverified")}
+            failed = {role: v for role, v in out.items() if isinstance(v, dict) and v.get("status") == "stop_failed"}
             st["fleet"] = out
             st["turn_off_ok"] = not failed
             if failed:

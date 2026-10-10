@@ -1685,6 +1685,27 @@ def turn_off_fleet(blocking: bool = True) -> Dict[str, Any]:
                     out[role]["error"] = result.get("error", "")
                 logger.error("turn-off refused for %s on %s: %s", role, account.user, result.get("error"))
 
+        # Always finalize control-plane rows so the UI cannot stay stuck on STOPPING.
+        # Best-effort Kaggle stops already ran; a denied kernels.get must not leave the
+        # computer row mid-stop forever while the session is gone or unreachable.
+        for role, row_id in (("model", "primary"), ("computer", "computer")):
+            if role not in out:
+                continue
+            st = out[role].get("status")
+            if st in ("stopped", "not_running", "unconfigured", "stop_unverified"):
+                try:
+                    _write_fleet_row(row_id, "GPU_STOPPED_SAVING_QUOTA", tunnel_url="", api_key="", gpu_info="")
+                except Exception:
+                    pass
+            elif st == "stop_failed":
+                # Still clear the tunnel so the agent does not route traffic to a dead link.
+                try:
+                    _write_fleet_row(row_id, "GPU_STOPPED_SAVING_QUOTA", tunnel_url="", api_key="", gpu_info="")
+                    out[role]["status"] = "stopped_forced"
+                    out[role]["note"] = (out[role].get("error") or "stop could not be verified; control plane cleared")
+                except Exception:
+                    pass
+
     if blocking:
         _stops()
     else:
