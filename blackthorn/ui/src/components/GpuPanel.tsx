@@ -101,13 +101,37 @@ export function GpuPanel({ gpu, onClose }: { gpu: GpuView; onClose: () => void }
           {s?.online && s.model_loaded != null && (<><dt>Model memory</dt><dd>{s.model_loaded ? 'Loaded' : 'Loading…'}</dd></>)}
         </dl>
 
-        {q && (
+        {s?.computer && (
+          <div className="muted small" data-testid="computer-status">
+            Computer: {s.computer.display_status || s.computer.status || 'unknown'}
+            {s.computer.gpu_info ? ` · ${s.computer.gpu_info}` : ''}
+          </div>
+        )}
+
+        {s?.quotas && (s.quotas.model || s.quotas.computer) ? (
+          <div className="quota" data-testid="gpu-quota">
+            {s.quotas.model && (
+              <>
+                <div className="progress-line"><span>Model GPU quota{s.quotas.model.account ? ` (${s.quotas.model.account})` : ''}</span>
+                  <span className="muted">{Number(s.quotas.model.used_hours).toFixed(1)} h of {s.quotas.model.total_hours} h</span></div>
+                <div className="bar"><i style={{ width: `${Math.min(100, Number(s.quotas.model.used_pct) || 0)}%` }} /></div>
+              </>
+            )}
+            {s.quotas.computer && (
+              <>
+                <div className="progress-line" style={{ marginTop: 8 }}><span>Computer GPU quota{s.quotas.computer.account ? ` (${s.quotas.computer.account})` : ''}</span>
+                  <span className="muted">{Number(s.quotas.computer.used_hours).toFixed(1)} h of {s.quotas.computer.total_hours} h</span></div>
+                <div className="bar"><i style={{ width: `${Math.min(100, Number(s.quotas.computer.used_pct) || 0)}%` }} /></div>
+              </>
+            )}
+          </div>
+        ) : q ? (
           <div className="quota" data-testid="gpu-quota">
             <div className="progress-line"><span>Weekly GPU quota</span><span className="muted">{q.used_hours.toFixed(1)} h of {q.total_hours} h used</span></div>
             <div className="bar"><i style={{ width: `${Math.min(100, q.used_pct)}%` }} /></div>
             {q.refresh_time && <div className="muted small">Resets {new Date(q.refresh_time).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}</div>}
           </div>
-        )}
+        ) : null}
 
         <div className="panel-actions">
           {s?.can_turn_on && <button type="button" className="btn primary" onClick={() => void gpu.turnOn()} disabled={gpu.busy !== null} data-testid="gpu-turn-on">{gpu.busy === 'on' ? 'Starting…' : 'Turn on GPU'}</button>}

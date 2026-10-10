@@ -84,6 +84,9 @@ export interface GpuStatus {
   progress_stalled?: boolean
   elapsed_seconds?: number
   quota?: GpuQuota
+  quotas?: { model?: GpuQuota & { account?: string }; computer?: GpuQuota & { account?: string } }
+  computer?: { status?: string; online?: boolean; booting?: boolean; display_status?: string; gpu_info?: string }
+  computer_ready?: boolean
   error?: string
   can_turn_on: boolean
   can_turn_off: boolean

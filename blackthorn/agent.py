@@ -197,6 +197,9 @@ class AgentRun:
     async def execute(self) -> None:
         status, error = "stop", None
         self._activity("run_started")
+        # Immediate UI feedback: do not wait for GPU connect / prefill before the user sees activity.
+        self.run.emit("thinking", state="start")
+        self._early_thinking = True
         try:
             await self._loop()
             status = "length" if self.finish_reason == "length" else "stop"
@@ -382,7 +385,10 @@ class AgentRun:
             nonlocal thinking_since
             if thinking_since is None:
                 thinking_since = time.monotonic()
-                self.run.emit("thinking", state="start")
+                if getattr(self, "_early_thinking", False):
+                    self._early_thinking = False
+                else:
+                    self.run.emit("thinking", state="start")
 
         def end_thinking() -> None:
             nonlocal thinking_since

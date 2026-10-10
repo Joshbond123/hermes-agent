@@ -222,11 +222,11 @@ async def chat_stream(body: StreamRequest, request: Request):
         raise _err(429, "busy", "The assistant is handling several requests right now. Try again in a moment.")
     if body.session_id and s.runs.live_for_session(body.session_id):
         raise _err(409, "run_in_progress", "This conversation is still generating a response.")
-    try:  # fail fast and honestly when the model cannot answer; the draft stays in the composer
-        route = await s.resolver.get()
+    # Parallelize route + prompt + memories so simple messages are not stuck on serial D1 reads.
+    try:
+        route, user_prompt, memories = await asyncio.gather(s.resolver.get(), s.user_prompt(), s.memories())
     except RouteError as exc:
         raise _err(409, exc.code, exc.message)
-    user_prompt, memories = await asyncio.gather(s.user_prompt(), s.memories())
     system = prompts.system_prompt(user_prompt, memories)
     try:
         if body.regenerate:

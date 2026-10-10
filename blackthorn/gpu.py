@@ -22,6 +22,9 @@ STAGE_OF = {
 }
 TOTAL_STAGES = 12
 READY = {"ONLINE", "MODEL_READY_AND_WARMED", "HEARTBEAT_ONLINE", "MODEL_READY", "MODEL_READY_COLD"}
+BOOTING = {"BOOTING_KAGGLE_GPU", "CHECKING_ENVIRONMENT", "CHECKING_CACHE", "CACHE_HIT", "CACHE_MISS", "DOWNLOADING_MODEL",
+           "MODEL_DOWNLOADED", "VERIFYING_MODEL", "INSTALLING_DEPS", "STARTING_INSTALL", "INSTALLING_OLLAMA",
+           "STARTING_OLLAMA", "LOADING_MODEL", "STARTING_GATEWAY", "TUNNEL_ONLINE", "WARMING_GPU"}
 BOOT_META_KEY = "blackthorn_gpu_boot_started"
 
 
@@ -111,7 +114,73 @@ class GpuService:
 
     async def status(self, refresh: bool = False) -> Dict[str, Any]:
         d1 = self._module()
-        return await self._augment(await asyncio.to_thread(d1.get_kaggle_gpu_status, refresh))
+        model_pub = await self._augment(await asyncio.to_thread(d1.get_kaggle_gpu_status, refresh))
+        # Attach computer-role health + fleet quotas so the UI can show both systems.
+        try:
+            crow = await self._store.computer_row() if self._store is not None else {}
+            if crow:
+                c_status = str(crow.get("status") or "").upper()
+                c_url = str(crow.get("tunnel_url") or "").strip()
+                c_online = c_status in READY and bool(c_url)
+                c_booting = c_status in BOOTING or bool(crow.get("booting"))
+                computer_pub = {
+                    "status": c_status,
+                    "online": c_online,
+                    "booting": c_booting,
+                    "has_endpoint": bool(c_url),
+                    "display_status": (
+                        "Computer Ready" if c_online else
+                        ("Computer Starting" if c_booting else "Computer Offline")
+                    ),
+                    "gpu_info": crow.get("gpu_info") or "",
+                    "model": crow.get("model") or "",
+                }
+                if c_status and c_status not in ("", "OFF", "OFFLINE"):
+                    model_online = bool(model_pub.get("online"))
+                    if model_online and not c_online and not c_booting:
+                        model_pub["display_status"] = "Model ready — computer offline"
+                        model_pub["computer_ready"] = False
+                    elif model_online and c_booting:
+                        model_pub["display_status"] = "Waiting for computer GPU"
+                        model_pub["computer_ready"] = False
+                        model_pub["online"] = False
+                        model_pub["can_turn_on"] = False
+                    elif model_online and c_online:
+                        model_pub["display_status"] = "Model + Computer Ready"
+                        model_pub["computer_ready"] = True
+                    model_pub["computer"] = computer_pub
+        except Exception:
+            pass
+        try:
+            import os
+            from .fleet import accounts_from_env, FleetManager
+            accounts = accounts_from_env(os.environ)
+            if accounts:
+                fleet = FleetManager(accounts)
+                quotas = {}
+                for role in ("model", "computer"):
+                    acc = next((a for a in accounts if a.role == role and getattr(a, "slot", "primary") in ("primary", None, "")), None)
+                    if acc is None:
+                        acc = next((a for a in accounts if a.role == role), None)
+                    if acc is None:
+                        continue
+                    try:
+                        q = fleet.quota(acc)
+                        quotas[role] = {
+                            "account": acc.user,
+                            "used_hours": round(float(q.get("used_seconds") or 0) / 3600.0, 2),
+                            "total_hours": round(float(q.get("total_seconds") or 108000) / 3600.0, 2),
+                            "remaining_hours": round(max(0.0, float(q.get("total_seconds") or 108000) - float(q.get("used_seconds") or 0)) / 3600.0, 2),
+                            "used_pct": round(100.0 * float(q.get("used_seconds") or 0) / max(1.0, float(q.get("total_seconds") or 108000)), 1),
+                            "refresh_time": q.get("refresh_time") or "",
+                        }
+                    except Exception:
+                        continue
+                if quotas:
+                    model_pub["quotas"] = quotas
+        except Exception:
+            pass
+        return model_pub
 
     async def turn_on(self) -> Dict[str, Any]:
         d1 = self._module()

@@ -23,8 +23,8 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 PULL_WAIT_S = 25.0             # notebook long-poll window (below every proxy timeout)
-HEADERS_TIMEOUT_S = 240.0      # a warm model answers far faster; queued jobs start instantly
-IDLE_FAST_FAIL_S = 75.0        # no notebook seen for this long -> fail fast instead of hanging
+HEADERS_TIMEOUT_S = 90.0       # fail faster when the notebook is stuck; warm model answers in seconds
+IDLE_FAST_FAIL_S = 40.0        # no notebook seen for this long -> fail fast instead of hanging
 KEY_CACHE_TTL_S = 30.0          # ride out D1 blips without 401ing a healthy notebook
 DROP_HEADERS = {"host", "content-length", "connection", "accept-encoding", "transfer-encoding",
                 "x-blackthorn-key", "x-relay-status", "x-relay-content-type"}
@@ -217,8 +217,10 @@ async def relay_proxy(request: Request, path: str = ""):
                if k.lower() not in DROP_HEADERS and not k.lower().startswith("x-relay-")}
     job = hub.submit(request.method.upper(), path, headers, body)
 
+    # No notebook currently long-polling → do not block the agent for a full minute.
+    wait_s = HEADERS_TIMEOUT_S if hub.waiting_pulls > 0 else min(20.0, HEADERS_TIMEOUT_S)
     try:
-        await asyncio.wait_for(job.headers_ready.wait(), timeout=HEADERS_TIMEOUT_S)
+        await asyncio.wait_for(job.headers_ready.wait(), timeout=wait_s)
     except asyncio.TimeoutError:
         hub.finish(job)
         raise HTTPException(status_code=502,
