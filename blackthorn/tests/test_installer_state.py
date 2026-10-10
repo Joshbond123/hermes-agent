@@ -54,6 +54,19 @@ def test_installed_tool_is_reproved_and_reinstalled_when_gone(inst, monkeypatch,
     assert reinstalled == ["demo"]                                # probe failed on this runtime -> reinstall
 
 
+def test_kaggle_cancelling_packages_are_never_installed(inst, monkeypatch):
+    calls = []
+    monkeypatch.setattr(inst, "apt_installed", lambda pkg: False)
+    monkeypatch.setattr(inst, "run", lambda cmd, timeout, cwd=None: calls.append(cmd) or {"cmd": cmd, "rc": 0, "seconds": 0, "tail": ""})
+    monkeypatch.setattr(inst, "save", lambda reg: None)
+    reg = {"base": []}
+    inst.apt_base(reg)
+    for pkg in ("hydra", "john", "hashcat", "aircrack-ng"):
+        assert not any(c.endswith(" " + pkg) for c in calls), pkg
+        assert any(b["pkg"] == pkg and b["status"] == "skipped_kaggle_session_cancel" for b in reg["base"])
+    assert any(c.endswith(" nmap") for c in calls)            # scanners that work on Kaggle are still installed
+
+
 def test_caches_are_not_on_the_workspace(inst):
     e = inst.env()
     for key in ("PIP_CACHE_DIR", "XDG_CACHE_HOME", "GOCACHE", "GOMODCACHE", "TMPDIR"):

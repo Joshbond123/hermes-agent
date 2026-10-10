@@ -33,12 +33,18 @@ SKILLS_REPO = "https://github.com/mukul975/Anthropic-Cybersecurity-Skills"
 STEP_TIMEOUT = 1500
 PROBE_TIMEOUT = 40
 HELD = re.compile(r"\|\s*(sudo\s+)?(sh|bash)\b|\|\s*sudo\s+(sh|bash|tar)|sudo\s+su\b|rustup|sh\.rustup|curl[^|]*\|\s*sudo")
+# Kaggle cancelled the computer kernel every time these were installed (reproduced 2/2 on 2026-10-10: the session
+# was CANCEL_ACKNOWLEDGED within ~1 min of the install starting; the same host survived scanner, forensics and
+# general package installs). They are NOT installed on Kaggle. Run them on a host that permits them.
+KAGGLE_BLOCKED_PACKAGES = ["hydra", "john", "hashcat", "aircrack-ng"]
+KAGGLE_BLOCKED_TOOL_WORDS = ("hydra", "john-the-ripper", "hashcat", "aircrack")
+
 APT_BASE = [
     "git", "unzip", "jq", "golang-go", "ruby-full", "python3-venv", "python3-pip", "build-essential", "pkg-config",
     "libgtk-3-0t64", "libdbus-glib-1-2", "libxt6t64", "libasound2t64", "libx11-xcb1", "libxtst6", "libnss3", "libgbm1",
     "nmap", "masscan", "dnsutils", "whois", "netcat-openbsd", "socat", "tcpdump", "binwalk", "foremost", "steghide",
-    "exiftool", "file", "binutils", "yara", "sqlmap", "nikto", "hydra", "john", "hashcat", "aircrack-ng", "gobuster",
-    "dirb", "sslscan", "smbclient", "proxychains4", "wordlists", "radare2", "strace", "ltrace", "gdb",
+    "exiftool", "file", "binutils", "yara", "sqlmap", "nikto", "gobuster",
+    "dirb", "sslscan", "smbclient", "proxychains4", "radare2", "strace", "ltrace", "gdb",
 ]
 
 
@@ -104,6 +110,9 @@ def apt_installed(pkg: str) -> bool:
 
 
 def apt_base(reg: dict) -> None:
+    for pkg in KAGGLE_BLOCKED_PACKAGES:
+        reg["base"].append({"pkg": pkg, "rc": None, "status": "skipped_kaggle_session_cancel",
+                            "tail": "Kaggle cancels the computer session on this install; run it elsewhere"})
     todo = [p for p in APT_BASE if not apt_installed(p)]
     if not todo:
         return
@@ -178,6 +187,11 @@ def catalog(reg: dict) -> None:
     tools = json.loads(path.read_text())["tools"]
     done = {t["id"]: t for t in reg["tools"] if t["status"] in ("installed", "installed_probe_failed", "no_install_command", "held_review")}
     for tool in tools:
+        blob = (str(tool.get("id", "")) + " " + str(tool.get("title", "")) + " " +
+                " ".join(map(str, tool.get("install_commands") or []))).lower()
+        if any(word in blob for word in KAGGLE_BLOCKED_TOOL_WORDS):
+            reg["tools"].append({"id": tool["id"], "status": "skipped_kaggle_session_cancel", "steps": [], "probe": None})
+            continue
         prior = done.get(tool["id"])
         if prior and prior["status"] in ("installed", "installed_probe_failed") and tool.get("run_commands"):
             p = run(f"timeout {PROBE_TIMEOUT} {tool['run_commands'][0]}", PROBE_TIMEOUT + 15)

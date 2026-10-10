@@ -620,7 +620,7 @@ COMPUTER_ACTIVITY_MIN_INTERVAL_S = 30.0
 # Unknown computer activity (unreachable tunnel) blocks auto-off for up to this long, measured from the first
 # failed probe. Stopping a computer we cannot see could kill its work; after the bound the idle rules apply
 # and the reason is recorded, so the stop is explicit rather than silent.
-COMPUTER_ACTIVITY_MAX_UNKNOWN_S = 3600.0
+COMPUTER_ACTIVITY_MAX_UNKNOWN_S = 900.0
 _COMPUTER_ACTIVITY: Dict[str, Any] = {"active_jobs": 0, "known": False, "fails": 0, "checked_at": 0.0, "error": "",
                                       "unknown_since": 0.0}
 
