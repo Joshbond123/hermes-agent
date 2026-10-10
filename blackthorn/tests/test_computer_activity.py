@@ -178,3 +178,13 @@ def test_turn_off_checkpoints_before_clearing_the_computer_row():
     fn = next(n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.FunctionDef) and n.name == "turn_off_fleet")
     body = ast.get_source_segment(src, fn)
     assert body.index("checkpoint_computer()") < body.index("_write_fleet_row(row_id")
+
+
+def test_busy_computer_resets_the_idle_clock(monkeypatch):
+    monkeypatch.setattr(d1c, "_computer_link", lambda: ("https://computer.example", "k", "HEARTBEAT_ONLINE"))
+    monkeypatch.setattr(d1c, "_COMPUTER_ACTIVITY", {"active_jobs": 0, "known": False, "fails": 0, "checked_at": 0.0,
+                                                   "error": ""})
+    monkeypatch.setattr(d1c, "_LAST_ACTIVITY_TS", time.time() - 3600)
+    monkeypatch.setattr(d1c, "_computer_request", lambda path, payload, timeout: {"active_jobs": 1})
+    d1c.refresh_computer_activity(force=True)
+    assert time.time() - d1c._LAST_ACTIVITY_TS < 5

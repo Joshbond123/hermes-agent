@@ -637,7 +637,11 @@ def refresh_computer_activity(timeout: float = 8.0, force: bool = False) -> Dict
             _COMPUTER_ACTIVITY.update(active_jobs=0, known=True, fails=0, error="computer offline")
         else:
             body = _computer_request("/computer/activity", None, timeout)
-            _COMPUTER_ACTIVITY.update(active_jobs=int(body.get("active_jobs") or 0), known=True, fails=0, error="")
+            jobs = int(body.get("active_jobs") or 0)
+            _COMPUTER_ACTIVITY.update(active_jobs=jobs, known=True, fails=0, error="")
+            if jobs > 0:
+                # The idle clock keeps running while the computer works, so the window starts fresh when a job ends
+                mark_activity("computer-busy")
     except urllib.error.HTTPError as exc:
         # 404 means an older computer build without the endpoint: unknown, never silently "idle"
         _COMPUTER_ACTIVITY.update(known=False, fails=int(_COMPUTER_ACTIVITY.get("fails") or 0) + 1,

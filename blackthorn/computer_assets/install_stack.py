@@ -46,11 +46,19 @@ def now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+CACHE = Path(os.environ.get("BLACKTHORN_CACHE", "/tmp/bt-cache"))   # local disk: rebuildable, never in the workspace
+
+
 def env() -> dict:
     e = dict(os.environ)
     e["HOME"] = str(HOME)
     e["DEBIAN_FRONTEND"] = "noninteractive"
     e["PIP_BREAK_SYSTEM_PACKAGES"] = "1"
+    e["PIP_CACHE_DIR"] = str(CACHE / "pip")
+    e["XDG_CACHE_HOME"] = str(CACHE / "xdg")
+    e["GOCACHE"] = str(CACHE / "go-build")
+    e["GOMODCACHE"] = str(CACHE / "gomod")
+    e["TMPDIR"] = str(CACHE / "tmp")
     e["GOPATH"] = str(HOME / "go")
     e["GOBIN"] = str(HOME / "go" / "bin")
     e["PATH"] = ":".join([str(VENV / "bin"), str(HOME / "go" / "bin"), str(HOME / ".local" / "bin"),
@@ -90,9 +98,13 @@ def preflight(reg: dict) -> None:
                         "ws_free_gb": round(disk.free / 1e9, 2), "ws": str(WS), "checked": now()}
 
 
+def apt_installed(pkg: str) -> bool:
+    proc = subprocess.run(["dpkg-query", "-W", "-f=${Status}", pkg], capture_output=True, text=True)
+    return proc.returncode == 0 and "install ok installed" in proc.stdout
+
+
 def apt_base(reg: dict) -> None:
-    done = {b["pkg"] for b in reg["base"] if b.get("rc") == 0}
-    todo = [p for p in APT_BASE if p not in done]
+    todo = [p for p in APT_BASE if not apt_installed(p)]
     if not todo:
         return
     upd = run("apt-get update -qq", 900)
@@ -104,12 +116,14 @@ def apt_base(reg: dict) -> None:
 
 
 def camoufox(reg: dict) -> None:
-    if reg["camoufox"].get("status") == "installed":
-        return
+    if reg["camoufox"].get("status") == "installed" and (VENV / "bin" / "python").exists():
+        probe = run(f"{VENV}/bin/python -c \"import camoufox\"", 60)
+        if probe["rc"] == 0:
+            return
     steps = []
     steps.append(run(f"python3 -m venv {VENV}", 300))
     steps.append(run(f"{VENV}/bin/pip install -q --upgrade pip && {VENV}/bin/pip install -q 'camoufox[geoip]' playwright httpx", 1200))
-    steps.append(run(f"TMPDIR={WS}/tmp {VENV}/bin/python -m camoufox fetch", 1500))
+    steps.append(run(f"{VENV}/bin/python -m camoufox fetch", 1500))
     ok = all(s["rc"] == 0 for s in steps)
     probe = run(f"{VENV}/bin/python -c \"import camoufox; print('camoufox', getattr(camoufox,'__version__','ok'))\"", 60)
     reg["camoufox"] = {"status": "installed" if ok and probe["rc"] == 0 else "failed", "steps": steps, "probe": probe}
@@ -164,7 +178,12 @@ def catalog(reg: dict) -> None:
     tools = json.loads(path.read_text())["tools"]
     done = {t["id"]: t for t in reg["tools"] if t["status"] in ("installed", "installed_probe_failed", "no_install_command", "held_review")}
     for tool in tools:
-        if tool["id"] in done and done[tool["id"]]["status"] != "failed":
+        prior = done.get(tool["id"])
+        if prior and prior["status"] in ("installed", "installed_probe_failed") and tool.get("run_commands"):
+            p = run(f"timeout {PROBE_TIMEOUT} {tool['run_commands'][0]}", PROBE_TIMEOUT + 15)
+            if p["rc"] in (0, 1, 2) and "not found" not in p["tail"].lower() and "no such file" not in p["tail"].lower():
+                continue   # still present on this runtime
+        elif prior and prior["status"] in ("no_install_command", "held_review"):
             continue
         started = time.time()
         result = install_tool(tool, reg)
@@ -178,6 +197,7 @@ def main() -> None:
     TOOLS.mkdir(parents=True, exist_ok=True)
     HOME.mkdir(parents=True, exist_ok=True)
     (WS / "tmp").mkdir(parents=True, exist_ok=True)
+    (CACHE / "tmp").mkdir(parents=True, exist_ok=True)
     reg = load()
     preflight(reg)
     save(reg)
