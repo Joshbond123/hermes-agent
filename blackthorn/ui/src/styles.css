@@ -15,8 +15,9 @@
     --user-bg: #f3f5f8; --code-bg: #f6f8fa; --shadow: 0 12px 40px rgba(20, 30, 50, 0.18); --off: #8a929c;
     --t-kw: #cf222e; --t-str: #0a3069; --t-num: #0550ae; --t-com: #6e7781; --t-fn: #8250df; --t-type: #953800; --t-add: #1a7f37; --t-del: #cf222e;
 }
+/* System light only when explicitly requested via data-theme="system" is handled in JS as dark default. */
 @media (prefers-color-scheme: light) {
-  :root:not([data-theme]) { color-scheme: light;
+  :root[data-theme="system"] { color-scheme: light;
     --bg: #ffffff; --bg-2: #f6f7f9; --bg-3: #eceff3; --line: #dfe3e8; --text: #1b1f24; --muted: #5f6872; --accent: #0b5fff;
     --user-bg: #f3f5f8; --code-bg: #f6f8fa; --shadow: 0 12px 40px rgba(20, 30, 50, 0.18); --off: #8a929c;
     --t-kw: #cf222e; --t-str: #0a3069; --t-num: #0550ae; --t-com: #6e7781; --t-fn: #8250df; --t-type: #953800; --t-add: #1a7f37; --t-del: #cf222e;

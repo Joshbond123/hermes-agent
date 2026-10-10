@@ -43,7 +43,7 @@ export default function App() {
   const [toasts, setToasts] = useState<Toast[]>([])
   const runRef = useRef<RunHandle | null>(null)
   const openToken = useRef(0)
-  const [theme, setThemeState] = useState<'system' | 'light' | 'dark'>(() => (localStorage.getItem('bt.theme') as 'light' | 'dark' | null) ?? 'system')
+  const [theme, setThemeState] = useState<'system' | 'light' | 'dark'>(() => (localStorage.getItem('bt.theme') as 'light' | 'dark' | 'system' | null) ?? 'dark')
   const [version, setVersion] = useState<VersionInfo | null>(null)
   useEffect(() => {
     if (theme === 'system') document.documentElement.removeAttribute('data-theme')
