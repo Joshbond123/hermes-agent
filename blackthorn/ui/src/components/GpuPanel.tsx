@@ -69,6 +69,7 @@ export function GpuPanel({ gpu, onClose }: { gpu: GpuView; onClose: () => void }
 
   return (
     <>
+      <div className="gpu-panel-scrim" data-testid="gpu-panel-scrim" aria-hidden onClick={onClose} />
       <Popover onClose={onClose} className="gpu-panel" testId="gpu-panel">
         <div className="panel-head">
           <span className={`dot tone-${sum.tone}`} aria-hidden />
