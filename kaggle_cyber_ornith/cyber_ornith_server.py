@@ -26,7 +26,6 @@ import shutil
 import subprocess
 import zipfile
 import sys
-import threading
 import time
 import urllib.error
 import urllib.request
@@ -1226,63 +1225,6 @@ async def computer_info(_=Depends(verify_api_key)):
     }
 
 @app.post("/computer/exec")
-_JOBS: dict = {}
-_JOBS_LOCK = _asyncio.Lock() if hasattr(_asyncio, "Lock") else None
-_JOB_SEQ = [0]
-
-def _start_background_job(cmd: str, cwd: str, env: dict, timeout: int) -> str:
-    """Launch the command detached, keep its output in memory, and return a job id.
-    Long-running work must never block the agent — results are fetched later."""
-    import subprocess as _sp
-    _JOB_SEQ[0] += 1
-    jid = "job-%d" % _JOB_SEQ[0]
-    proc = _sp.Popen(cmd, shell=True, cwd=cwd, env=env,
-                     stdout=_sp.PIPE, stderr=_sp.STDOUT, text=True)
-    rec = {"id": jid, "cmd": cmd, "cwd": cwd, "status": "running", "exit_code": None,
-           "output": "", "started_at": time.time(), "timeout": timeout, "proc": proc,
-           "finished_at": None}
-    _JOBS[jid] = rec
-
-    def _drain() -> None:
-        try:
-            for line in iter(proc.stdout.readline, ""):
-                if len(rec["output"]) < 200000:
-                    rec["output"] += line
-        except Exception:
-            pass
-        try:
-            proc.wait(timeout=timeout)
-            rec["exit_code"] = proc.returncode
-            rec["status"] = "completed" if proc.returncode == 0 else "failed"
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-            rec["status"] = "timeout"
-            rec["exit_code"] = -9
-            rec["output"] += "\n[background job killed at timeout %ss]" % timeout
-        rec["finished_at"] = time.time()
-
-    threading.Thread(target=_drain, daemon=True, name="bt-" + jid).start()
-    return jid
-
-@app.get("/computer/jobs/{job_id}")
-async def computer_job_status(job_id: str, tail: int = 20000, _=Depends(verify_api_key)):
-    rec = _JOBS.get(job_id)
-    if rec is None:
-        raise HTTPException(status_code=404, detail="unknown job")
-    out = rec["output"][-int(tail):] if rec["output"] else ""
-    return {"ok": True, "id": rec["id"], "status": rec["status"], "exit_code": rec["exit_code"],
-            "cmd": rec["cmd"], "cwd": rec["cwd"], "started_at": rec["started_at"],
-            "finished_at": rec["finished_at"], "output": out or ("(still running)" if rec["status"] == "running" else "(no output)"),
-            "host": "kaggle-computer", "workspace": COMPUTER_ROOT}
-
-@app.get("/computer/jobs")
-async def computer_job_list(_=Depends(verify_api_key)):
-    return {"ok": True, "jobs": [{"id": r["id"], "status": r["status"], "cmd": r["cmd"][:120],
-                                  "exit_code": r["exit_code"]} for r in _JOBS.values()]}
-
 async def computer_exec(request: Request, _=Depends(verify_api_key)):
     body = await request.json()
     cmd = str(body.get("command") or "").strip()
@@ -1303,11 +1245,6 @@ async def computer_exec(request: Request, _=Depends(verify_api_key)):
     # GPU 0 hosts llama-server. Computer work is pinned to physical GPU 1 only.
     env["CUDA_VISIBLE_DEVICES"] = "1"
     env["BLACKTHORN_GPU_ROLE"] = "computer"
-    if body.get("background"):
-        jid = _start_background_job(cmd, cwd, env, timeout)
-        return {"ok": True, "job_id": jid, "status": "running", "cwd": cwd,
-                "output": "[background job started: %s — fetch results via /computer/jobs/%s]" % (jid, jid),
-                "host": "kaggle-computer", "workspace": COMPUTER_ROOT}
     def _run():
         return __import__("subprocess").run(
             cmd, shell=True, cwd=cwd, env=env,
