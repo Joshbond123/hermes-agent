@@ -203,12 +203,13 @@ class GpuService:
         if hasattr(d1, "turn_off_fleet") and accounts_from_env(os.environ):
             out = await asyncio.to_thread(d1.turn_off_fleet)
             st = await self.status(refresh=True)
-            failed = {role: v for role, v in out.items() if isinstance(v, dict) and v.get("status") == "stop_failed"}
+            failed = {role: v for role, v in out.items() if isinstance(v, dict) and v.get("status") in ("stop_failed", "stop_unverified")}
             st["fleet"] = out
             st["turn_off_ok"] = not failed
             if failed:
                 reasons = "; ".join(f"{role}: {v.get('error') or 'stop refused'}" for role, v in failed.items())
-                st["error"] = f"Turn-off did not complete. Kaggle still reports the session running ({reasons}). Stop it on kaggle.com or give the token kernels.delete."
+                st["error"] = (f"Turn-off did not complete: Kaggle did not confirm that the session stopped ({reasons}). "
+                               "Check the session on kaggle.com; if it is still running, stop it there, or give the token kernels.delete.")
             return st
         st = await self._augment(await asyncio.to_thread(d1.turn_off_kaggle_gpu))
         st["turn_off_ok"] = True

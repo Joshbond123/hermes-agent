@@ -109,3 +109,33 @@ def test_computer_readiness_is_checked_separately(monkeypatch):
     out = api._relay_overlay(req, {"online": True, "computer": {"online": True}})
     assert out["online"] is True                       # model is fine
     assert out["computer"]["online"] is False          # computer link is stalled
+
+
+def test_turn_off_message_claims_only_what_was_verified():
+    import inspect
+    from blackthorn import gpu
+    src = inspect.getsource(gpu.GpuService.turn_off)
+    assert "did not confirm" in src and "still reports the session running" not in src
+
+
+def test_an_accepted_delete_that_cannot_be_read_back_is_unverified_not_failed():
+    import time as _t
+    calls = {"status": 0}
+
+    def rpc(account, method, body):
+        if method == "GetKernelSessionStatus":
+            calls["status"] += 1
+            if calls["status"] == 1:
+                return {"status": "RUNNING"}
+            raise FleetError("kernels.get denied")
+        return {}
+
+    import pytest as _p
+    mp = _p.MonkeyPatch()
+    mp.setattr(_t, "sleep", lambda s: None)
+    try:
+        fm = _manager_with_rpc(rpc)
+        result = fm.stop_kernel_result(_acct("Joshbond123"), "Joshbond123/k")
+    finally:
+        mp.undo()
+    assert result["state"] == "unverified"

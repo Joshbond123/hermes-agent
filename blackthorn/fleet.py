@@ -209,9 +209,11 @@ class FleetManager:
         if str(sess.get("status") or "").upper() not in ("RUNNING", "QUEUED", "PENDING"):
             return {"state": "not_running", "error": ""}
         last_error = ""
+        accepted = False
         for _ in range(3):
             try:
                 self.rpc(account, "DeleteKernel", {"userName": account.user, "kernelSlug": name})
+                accepted = True
             except FleetError as exc:
                 last_error = str(exc)[:160]
             import time as _t
@@ -219,9 +221,15 @@ class FleetManager:
             try:
                 again = self.rpc(account, "GetKernelSessionStatus", {"userName": account.user, "kernelSlug": name})
             except FleetError as exc:
+                # Kaggle accepted the delete but will not let us read the result: the stop is unverified,
+                # never reported as a confirmed stop or as a refusal.
+                if accepted:
+                    return {"state": "unverified", "error": f"Kaggle accepted the stop; the status read was refused: {str(exc)[:120]}"}
                 return {"state": "failed", "error": f"could not verify the stop: {str(exc)[:160]}"}
             if str(again.get("status") or "").upper() not in ("RUNNING", "QUEUED", "PENDING"):
                 return {"state": "stopped", "error": ""}
+        if accepted:
+            return {"state": "unverified", "error": "Kaggle accepted the stop but the session still reads as running"}
         return {"state": "failed", "error": last_error or "the session is still running after 3 stop attempts"}
 
     def start_kernel(self, account: Account, *, slug: str, title: str, notebook_text: str,

@@ -1638,6 +1638,10 @@ def turn_off_fleet() -> Dict[str, Any]:
         if result["state"] in ("stopped", "not_running"):
             _write_fleet_row(row_id, "GPU_STOPPED_SAVING_QUOTA", gpu_info="")
             out[role] = {"account": account.user, "status": "stopped" if result["state"] == "stopped" else "not_running"}
+        elif result["state"] == "unverified":
+            # the stop was accepted but cannot be confirmed through the API: say so, do not claim either outcome
+            out[role] = {"account": account.user, "status": "stop_unverified", "error": result.get("error", "")}
+            logger.warning("turn-off unverified for %s on %s: %s", role, account.user, result.get("error"))
         else:
             out[role] = {"account": account.user, "status": "stop_failed", "error": result.get("error", "")}
             logger.error("turn-off refused for %s on %s: %s", role, account.user, result.get("error"))
