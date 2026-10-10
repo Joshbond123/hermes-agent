@@ -378,3 +378,13 @@ body { letter-spacing: -0.01em; }
 :root[data-theme="light"] .gpu-panel.popover {
   background: #ffffff !important;
 }
+
+
+/* stream-reveal — progressive chunks, no typewriter crawl */
+.message[data-role="assistant"][data-live="1"] .md > * {
+  animation: bt-stream-in 180ms ease-out both;
+}
+@keyframes bt-stream-in {
+  from { opacity: 0.35; filter: blur(1.5px); }
+  to { opacity: 1; filter: blur(0); }
+}

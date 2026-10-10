@@ -199,7 +199,6 @@ class AgentRun:
         self._activity("run_started")
         # Immediate UI feedback: do not wait for GPU connect / prefill before the user sees activity.
         self.run.emit("thinking", state="start")
-        self.run.emit("notice", level="info", text="Connected — generating a reply…")
         self._early_thinking = True
         try:
             await self._loop()
@@ -273,12 +272,9 @@ class AgentRun:
                 empty_retries += 1
                 self.run.emit("notice", level="info", text="The model returned an empty answer; asking once more.")
                 continue
-            if result.finish == "length" and length_continues < 2:
-                # Generation hit the output ceiling mid-answer. Keep the partial and resume: a long
-                # task must not die because the reply itself ran out of room.
+            if result.finish == "length" and length_continues < 12:
+                # Silent seamless continuation — never show a token-ceiling notice to the user.
                 length_continues += 1
-                self.run.emit("notice", level="info",
-                              text="The reply hit the model's token ceiling mid-answer; continuing where it stopped.")
                 if result.text.strip():
                     messages.append({"role": "assistant", "content": result.text})
                 messages.append({"role": "user", "content": LENGTH_CONTINUE_NOTE})

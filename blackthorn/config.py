@@ -31,7 +31,7 @@ class Settings:
     # When these disagree the engine rejects long steps (ContextOverflow) and the run
     # thrashes on trimming — one of the real causes of mid-task interruptions.
     context_tokens: int = field(default_factory=lambda: _int("BLACKTHORN_CONTEXT_TOKENS", 8192))
-    completion_reserve_tokens: int = field(default_factory=lambda: _int("BLACKTHORN_COMPLETION_RESERVE", 2048))
+    completion_reserve_tokens: int = field(default_factory=lambda: _int("BLACKTHORN_COMPLETION_RESERVE", 4096))
     chars_per_token: float = 3.2  # conservative for English + code
 
     # ---- agent loop limits ----------------------------------------------------------------
