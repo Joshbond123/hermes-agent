@@ -40,8 +40,12 @@ class ComputerClient:
                 url = url[:-3]
             key = str(row.get("api_key") or "")
             status = str(row.get("status") or "").upper()
-            if url and key and status not in ("", "OFF", "OFFLINE", "GPU_STOPPED_SAVING_QUOTA",
-                                              "STOPPED", "STOPPING_KAGGLE_GPU", "ERROR", "FAILED"):
+            offline = {
+                "", "OFF", "OFFLINE", "GPU_STOPPED_SAVING_QUOTA", "STOPPED", "STOPPING_KAGGLE_GPU",
+                "ERROR", "FAILED", "BOOT_FAILED", "TUNNEL_ERROR", "GPU_UNAVAILABLE",
+            }
+            # Only use the dedicated computer host when it has a live tunnel.
+            if url and key and status not in offline:
                 return url, key
         route = await self._resolver.get()
         return route.url, route.api_key
@@ -151,7 +155,7 @@ async def fetch_url(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
 
 
 async def computer_info(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
-    data = await ctx.computer.call("/computer/info", method="GET", timeout=20.0)
+    data = await ctx.computer.call("/computer/info", method="GET", timeout=60.0)
     keep = {k: data.get(k) for k in ("hostname", "platform", "python", "gpu", "cuda_available", "disk_free_gb",
                                       "disk_total_gb", "workspace") if k in data}
     lines = [f"{k}: {str(v).replace(chr(10), ' + ')}" for k, v in keep.items()]

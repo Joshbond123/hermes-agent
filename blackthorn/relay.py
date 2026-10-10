@@ -193,32 +193,56 @@ async def relay_push(request: Request, job_id: str):
 async def relay_proxy(request: Request, path: str = ""):
     """Any method, any path under /gpu-relay/: pipe it to the notebook gateway and stream back.
 
-    ``/gpu-relay/computer/...`` selects the computer channel (the leading segment is
-    stripped before forwarding); everything else rides the model channel for
-    backward compatibility with the published model URL.
+    Channel selection rules (important):
+    - Explicit ``model/...`` prefix → model channel, prefix stripped.
+    - Paths under ``computer/...`` use the dedicated *computer* relay channel ONLY when
+      that notebook is actually connected. Otherwise they stay on the *model* channel
+      with the full ``/computer/...`` path so a single primary host can serve tools.
+    - Never strip ``computer/`` into a bare path like ``exec`` — the local gateway routes
+      are mounted at ``/computer/exec``, not ``/exec``.
     """
+    raw = (path or "").lstrip("/")
     channel = "model"
-    for candidate in CHANNELS:
-        if path == candidate or path.startswith(candidate + "/"):
-            channel = candidate
-            path = path[len(candidate):].lstrip("/")
-            break
+    forward = raw
+    if raw == "model" or raw.startswith("model/"):
+        channel = "model"
+        forward = raw[len("model"):].lstrip("/")
+    elif raw == "computer" or raw.startswith("computer/"):
+        # Prefer a live dedicated computer host; otherwise the model host answers /computer/*.
+        services = request.app.state.bt
+        hubs = getattr(services, "relay_hubs", None) or {}
+        comp = hubs.get("computer")
+        if comp is not None and comp.alive():
+            channel = "computer"
+            forward = raw  # keep /computer/... for the computer gateway
+        else:
+            channel = "model"
+            forward = raw  # primary notebook serves /computer/* locally
+    path = forward
     if path.startswith("api/kaggle-relay"):
         # the control plane lives on the app origin; asking for it through the data plane
         # would queue a request for the very client that is asking
         raise HTTPException(status_code=404, detail={"code": "relay_path", "message": "control plane is /api/kaggle-relay/*"})
+    if path and not path.startswith("/"):
+        path = "/" + path
     hub = _hub(request, channel)
     if not hub.alive():
-        raise HTTPException(status_code=502,
-                            detail={"code": "gpu_unreachable",
-                                    "message": "The GPU relay is not connected. Wait for the GPU to finish starting, then try again."})
+        # Notebook may be between long-polls after a deploy; wait briefly for a puller.
+        for _ in range(20):
+            await asyncio.sleep(0.5)
+            if hub.alive():
+                break
+        if not hub.alive():
+            raise HTTPException(status_code=502,
+                                detail={"code": "gpu_unreachable",
+                                        "message": "The GPU relay is not connected. Wait for the GPU to finish starting, then try again."})
     body = await request.body()
     headers = {k.lower(): v for k, v in request.headers.items()
                if k.lower() not in DROP_HEADERS and not k.lower().startswith("x-relay-")}
     job = hub.submit(request.method.upper(), path, headers, body)
 
-    # No notebook currently long-polling → do not block the agent for a full minute.
-    wait_s = HEADERS_TIMEOUT_S if hub.waiting_pulls > 0 else min(20.0, HEADERS_TIMEOUT_S)
+    # Between long-polls waiting_pulls can be 0 while the notebook is healthy; use alive().
+    wait_s = HEADERS_TIMEOUT_S if hub.alive() else min(45.0, HEADERS_TIMEOUT_S)
     try:
         await asyncio.wait_for(job.headers_ready.wait(), timeout=wait_s)
     except asyncio.TimeoutError:
