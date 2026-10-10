@@ -773,6 +773,43 @@ def inrok_tunnel_name() -> str:
     return f"{base}-{_INROK_BOOT_SUFFIX}"
 
 
+_INROK_MAX_STALE_RELEASE = 6
+
+
+def stale_inrok_names(status_text: str, role: str, current: str) -> list:
+    """Names of same-role shares left behind by earlier kernels, safe to release before this boot.
+
+    The Inrok beta allows 3 live tunnels per account and a dead kernel's share keeps its slot. Only names
+    this role issues are chosen: the model uses ``blackthorn`` or ``blackthorn-<6 hex>``, the computer uses
+    ``blackthorn-computer-<6 hex>``. The current boot's name is never returned. Bounded to a few names.
+    """
+    if role == "computer":
+        pattern = r"^blackthorn-computer-[0-9a-f]{6}$"
+    else:
+        pattern = r"^blackthorn(-[0-9a-f]{6})?$"
+    found = []
+    for line in (status_text or "").splitlines()[1:]:
+        cols = line.split()
+        if not cols:
+            continue
+        name = cols[0]
+        if name != current and re.match(pattern, name) and name not in found:
+            found.append(name)
+    return found[:_INROK_MAX_STALE_RELEASE]
+
+
+def release_stale_inrok_shares(binary: str, role: str, current: str) -> list:
+    """Stop same-role stale shares so this boot's tunnel fits the account limit. Returns the names stopped."""
+    status = subprocess.run([binary, "status"], capture_output=True, text=True, timeout=60)
+    stopped = []
+    for name in stale_inrok_names(status.stdout, role, current):
+        res = subprocess.run([binary, "stop", name], capture_output=True, text=True, timeout=60)
+        if res.returncode == 0:
+            stopped.append(name)
+        log("inrok: released stale share " + name + " (rc=" + str(res.returncode) + ")")
+    return stopped
+
+
 def _inrok_gateway_answers(public: str) -> bool:
     """True only when the gateway itself answers through the tunnel.
 
@@ -805,6 +842,7 @@ def launch_inrok() -> tuple:
         msg = (login.stderr or login.stdout or "").replace(key, "***")[-300:]
         log("❌ inrok login failed: " + msg)
         return None, ""
+    release_stale_inrok_shares(binary, ROLE, name)
     handle = open("/tmp/inrok_" + name + ".log", "a")
     proc = subprocess.Popen([binary, "http", str(GATEWAY_PORT), "--name", name],
                             stdout=handle, stderr=subprocess.STDOUT)
