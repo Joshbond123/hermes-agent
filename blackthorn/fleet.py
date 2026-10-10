@@ -187,32 +187,42 @@ class FleetManager:
         return None
 
     def stop_kernel_session(self, account: Account, slug: str) -> bool:
-        """Stop a running session so the next push executes the fresh notebook code.
+        """Boolean view of :meth:`stop_kernel_result` (True only when a running session was verified stopped)."""
+        return self.stop_kernel_result(account, slug)["state"] == "stopped"
 
-        Kaggle keeps executing the version a session started with — without this, a
-        re-push is silently ignored and the stale code keeps answering.
+    def stop_kernel_result(self, account: Account, slug: str) -> Dict[str, str]:
+        """Stop a running session and say exactly what happened.
+
+        ``state`` is one of:
+        - ``stopped``     the session was running, deletion was accepted and the status now reads not-running
+        - ``not_running`` there was no running session to stop
+        - ``failed``      Kaggle refused (for example ``kernels.delete`` denied) or the result could not be verified
+
+        Failures are never folded into ``not_running``: a refused stop means the GPU is still billing quota.
+        Kaggle keeps executing the version a session started with, so a re-push also needs this.
         """
         name = slug.split("/", 1)[1] if "/" in slug else slug
         try:
             sess = self.rpc(account, "GetKernelSessionStatus", {"userName": account.user, "kernelSlug": name})
-        except FleetError:
-            return False
+        except FleetError as exc:
+            return {"state": "failed", "error": f"could not read the session status: {str(exc)[:160]}"}
         if str(sess.get("status") or "").upper() not in ("RUNNING", "QUEUED", "PENDING"):
-            return False
+            return {"state": "not_running", "error": ""}
+        last_error = ""
         for _ in range(3):
             try:
                 self.rpc(account, "DeleteKernel", {"userName": account.user, "kernelSlug": name})
-            except FleetError:
-                pass
+            except FleetError as exc:
+                last_error = str(exc)[:160]
             import time as _t
             _t.sleep(4)
             try:
                 again = self.rpc(account, "GetKernelSessionStatus", {"userName": account.user, "kernelSlug": name})
-                if str(again.get("status") or "").upper() not in ("RUNNING", "QUEUED", "PENDING"):
-                    return True
-            except FleetError:
-                return True
-        return False
+            except FleetError as exc:
+                return {"state": "failed", "error": f"could not verify the stop: {str(exc)[:160]}"}
+            if str(again.get("status") or "").upper() not in ("RUNNING", "QUEUED", "PENDING"):
+                return {"state": "stopped", "error": ""}
+        return {"state": "failed", "error": last_error or "the session is still running after 3 stop attempts"}
 
     def start_kernel(self, account: Account, *, slug: str, title: str, notebook_text: str,
                      datasets: Optional[List[str]] = None) -> Dict[str, Any]:

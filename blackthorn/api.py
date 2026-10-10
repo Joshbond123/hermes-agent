@@ -322,12 +322,34 @@ def _gpu_error(exc: Exception) -> HTTPException:
     return _err(502, "gpu_control_failed", f"GPU control failed: {type(exc).__name__}: {str(exc)[:160]}")
 
 
+def _relay_overlay(request: Request, out: dict) -> dict:
+    """Readiness must reflect the link, not just the control-plane row. A GPU whose relay has stopped
+    answering is reported as not ready (with the reason) instead of "online" until someone notices."""
+    hubs = getattr(svc(request), "relay_hubs", None) or {}
+    for role, key in (("model", None), ("computer", "computer")):
+        hub = hubs.get(role)
+        target = out if key is None else out.get(key)
+        if hub is None or not isinstance(target, dict) or not target.get("online"):
+            continue
+        health = hub.health()
+        target["relay"] = health
+        if health["stalled"]:
+            target["online"] = False
+            target["display_status"] = f"{'Model' if key is None else 'Computer'} link stalled — not answering"
+            target["error"] = "The GPU relay did not answer the last requests. Requests are not being sent to a dead link."
+        elif not health["alive"]:
+            target["online"] = False
+            target["display_status"] = "Waiting for the GPU relay to reconnect"
+    return out
+
+
 @router.get("/api/kaggle-gpu/status")
 async def gpu_status(request: Request, refresh: bool = False):
     try:
-        return await svc(request).gpu.status(refresh=refresh)
+        out = await svc(request).gpu.status(refresh=refresh)
     except Exception as exc:
         raise _gpu_error(exc)
+    return _relay_overlay(request, out)
 
 
 @router.post("/api/kaggle-gpu/turn-on")
@@ -380,6 +402,15 @@ async def gpu_logs(request: Request, limit: int = Query(120, ge=1, le=300)):
 
 
 # --------------------------------------------------------------------------- fleet (4-GPU failover)
+_SECRET_ROW_FIELDS = {"api_key", "tunnel_url", "token", "password", "secret"}
+
+
+def _public_row(row: Any) -> dict:
+    if not isinstance(row, dict):
+        return {}
+    return {k: v for k, v in row.items() if k not in _SECRET_ROW_FIELDS and "key" not in k.lower()}
+
+
 @router.get("/api/fleet/status")
 async def fleet_status(request: Request, refresh: bool = False):
     s = svc(request)
@@ -393,7 +424,9 @@ async def fleet_status(request: Request, refresh: bool = False):
             s.fleet.refresh_slots()
         out = {"configured": True, **s.fleet.status()}
         try:
-            out["live"] = {"model": await s.store.gpu_row(), "computer": await s.store.computer_row()}
+            # Public view only: the gateway key and tunnel URL are secrets and must never leave the server.
+            out["live"] = {role: _public_row(row) for role, row in
+                           (("model", await s.store.gpu_row()), ("computer", await s.store.computer_row()))}
         except Exception:  # noqa: BLE001
             out["live"] = {}
         return out

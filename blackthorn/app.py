@@ -11,6 +11,7 @@ from typing import Any, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
+from starlette.datastructures import MutableHeaders
 
 from . import __version__
 from .api import Services, router
@@ -56,6 +57,34 @@ def build_services(settings: Settings, *, executor: Any = None, http: Any = None
                     tavily=TavilyKeys(store), computer=ComputerClient(resolver, http, store=store),
                     runs=RunManager(ttl=settings.run_ttl_s, max_active=settings.max_active_runs),
                     gpu=GpuService(store), static_dir=static_dir or STATIC_DIR, fleet=fleet)
+
+
+
+class SecurityHeadersMiddleware:
+    """Adds the security headers without buffering or wrapping the response body."""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        path = scope.get("path", "") or ""
+
+        async def send_with_headers(message: Any) -> None:
+            if message.get("type") == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                headers.setdefault("X-Content-Type-Options", "nosniff")
+                headers.setdefault("Referrer-Policy", "same-origin")
+                headers.setdefault("X-Frame-Options", "DENY")
+                if not path.startswith("/api/"):
+                    headers.setdefault("Content-Security-Policy", CSP)
+                else:
+                    headers.setdefault("Cache-Control", "no-store")
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
 
 
 def create_app(settings: Optional[Settings] = None, *, services: Optional[Services] = None, gpu_daemon: Optional[bool] = None) -> FastAPI:
@@ -119,17 +148,10 @@ def create_app(settings: Optional[Settings] = None, *, services: Optional[Servic
     app.state.settings = settings
     app.include_router(router)
 
-    @app.middleware("http")
-    async def headers(request: Request, call_next):
-        response = await call_next(request)
-        response.headers.setdefault("X-Content-Type-Options", "nosniff")
-        response.headers.setdefault("Referrer-Policy", "same-origin")
-        response.headers.setdefault("X-Frame-Options", "DENY")
-        if not request.url.path.startswith("/api/"):
-            response.headers.setdefault("Content-Security-Policy", CSP)
-        if request.url.path.startswith("/api/"):
-            response.headers.setdefault("Cache-Control", "no-store")
-        return response
+    # Pure ASGI, not @app.middleware("http"): BaseHTTPMiddleware wraps every response in its own
+    # stream and does not propagate a client disconnect into a streaming body, which left GPU relay
+    # generators running with nobody reading them. Headers are added on the start message only.
+    app.add_middleware(SecurityHeadersMiddleware)
 
     def _file(path: Path, *, immutable: bool) -> Response:
         cache = "public, max-age=31536000, immutable" if immutable else "no-cache"

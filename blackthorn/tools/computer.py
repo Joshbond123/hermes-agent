@@ -51,11 +51,15 @@ class ComputerClient:
         return route.url, route.api_key
 
     async def call(self, path: str, payload: Dict[str, Any] | None = None, *, method: str = "POST",
-                   timeout: float = 90.0) -> Dict[str, Any]:
-        """Call the remote computer through the relay. Retries transient auth/timeout/502 blips.
+                   timeout: float = 90.0, idempotent: bool = True) -> Dict[str, Any]:
+        """Call the remote computer through the relay.
 
-        The GPU relay is in-process on Render: a deploy or a missed long-poll can drop a single
-        request even while the notebook is healthy. Retrying with a refreshed key is the durable fix.
+        ``idempotent=True`` (reads, info, file reads/writes of whole content): transient timeouts and
+        502/503 are retried with bounded backoff.
+        ``idempotent=False`` (shell commands): once a request may have reached the notebook it is
+        **never** re-sent, because a re-run would execute the command twice. Only a connection that
+        never opened is retried. The caller then gets a clear "may still be running" error and can
+        check the outcome through a background job.
         """
         import asyncio
         # Never let a model-chosen short timeout kill a healthy but busy notebook.
@@ -80,7 +84,13 @@ class ComputerClient:
                 await asyncio.sleep(min(4.0, 0.5 * attempt))
                 continue
             except httpx.TimeoutException as exc:
-                last_err = ToolError("timeout", f"The remote computer did not answer within {int(timeout)}s.")
+                last_err = ToolError("timeout", f"The remote computer did not answer within {int(timeout)}s.",
+                                     hint=("The command may still be running on the computer. Start long work as a "
+                                           "background job (run_command with background=true) and poll it with job_status."
+                                           if not idempotent else None))
+                if not idempotent:
+                    self._resolver.invalidate()
+                    raise last_err from exc
                 if attempt >= attempts:
                     raise last_err from exc
                 self._resolver.invalidate()
@@ -112,7 +122,11 @@ class ComputerClient:
             except ValueError:
                 raise ToolError("protocol", f"The remote computer returned a non-JSON response (HTTP {resp.status_code}).") from None
             if resp.status_code >= 400:
-                # 502/503 from the relay are transient — retry.
+                # 502/503 from the relay are transient — retry (reads only; a command may already be running).
+                if not idempotent and resp.status_code in (502, 503, 504):
+                    self._resolver.invalidate()
+                    raise ToolError("timeout", f"The remote computer did not complete the request (HTTP {resp.status_code}).",
+                                    hint="The command may still be running. Check with job_status if it was a background job.")
                 if resp.status_code in (502, 503, 504) and attempt < attempts:
                     self._resolver.invalidate()
                     await asyncio.sleep(min(4.0, 0.6 * attempt))
@@ -132,18 +146,33 @@ def _need(data: Dict[str, Any]) -> Dict[str, Any]:
     return data
 
 
-async def run_command(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
-    cmd = args["command"].strip()
+FOREGROUND_MAX_S = 300          # longer work goes to a background job so one HTTP call never has to hold for minutes
+JOBS_DIR = ".blackthorn_jobs"   # relative to the computer workspace root
+JOB_ID = re.compile(r"^bg-[0-9a-f]{10}$")
+
+
+def _deny(cmd: str) -> Optional[ToolResult]:
     for pat in DENY_PATTERNS:
         if re.search(pat, cmd, re.I):
             return ToolResult.failure("refused: the command matches a destructive pattern and was not run",
                                       hint="Choose a safer command or explain to the user why it cannot be run.",
                                       data={"kind": "denied"})
-    # Floor command timeout: short model-chosen values (e.g. 20s) were the main source of
-    # "did not answer within 20s" while the notebook was merely busy on the shared relay.
-    timeout = max(60, int(args.get("timeout_seconds") or 90))
-    data = await ctx.computer.call("/computer/exec", {"command": cmd, "timeout_seconds": timeout, "cwd": args.get("cwd") or "."},
-                                   timeout=float(timeout + 60))
+    return None
+
+
+async def run_command(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
+    cmd = args["command"].strip()
+    refused = _deny(cmd)
+    if refused is not None:
+        return refused
+    requested = int(args.get("timeout_seconds") or 90)
+    if args.get("background") or requested > FOREGROUND_MAX_S:
+        return await _start_background(cmd, args.get("cwd") or ".", ctx)
+    # Floor command timeout: short model-chosen values were the main source of "did not answer" errors.
+    timeout = max(60, requested)
+    data = await ctx.computer.call("/computer/exec",
+                                   {"command": cmd, "timeout_seconds": timeout, "cwd": args.get("cwd") or "."},
+                                   timeout=float(timeout + 60), idempotent=False)
     out = str(data.get("output") or "")
     code = data.get("exit_code", -1)
     body, cut = clip(out, ctx.settings.tool_result_chars, "ends")
@@ -152,6 +181,55 @@ async def run_command(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
     ui, _ = clip(out.strip(), ctx.settings.ui_result_chars, "ends")
     return ToolResult(ok=True, content=f"{head}\n{body}", summary=head, truncated=cut,
                       data={"exit_code": code, "output": ui, "failed": not ok})
+
+
+async def _start_background(cmd: str, cwd: str, ctx: ToolContext) -> ToolResult:
+    """Run a long command detached on the computer. Output goes to a log file and the exit code to
+    a marker file, so the job survives the agent's HTTP call, a relay drop, or a Render restart."""
+    import shlex
+    import uuid
+    job_id = "bg-" + uuid.uuid4().hex[:10]
+    base = f"{JOBS_DIR}/{job_id}"
+    script = f"#!/usr/bin/env bash\ncd {shlex.quote(cwd)} || exit 97\n{cmd}\n"
+    await ctx.computer.call("/computer/write_file", {"path": f"{base}.sh", "content": script}, idempotent=True)
+    start = (f"mkdir -p {JOBS_DIR} && nohup sh -c 'bash \"$0\"; echo $? > \"$1.exit\"' {base}.sh {base} "
+             f"> {base}.log 2>&1 < /dev/null & echo $! > {base}.pid && echo started")
+    data = await ctx.computer.call("/computer/exec", {"command": start, "timeout_seconds": 60, "cwd": "."},
+                                   timeout=90.0, idempotent=False)
+    if data.get("exit_code", 1) != 0:
+        return ToolResult.failure(f"could not start the background job: {str(data.get('output') or '')[:300]}",
+                                  data={"kind": "failed"})
+    return ToolResult(ok=True, content=(
+        f"Started background job {job_id} on the computer. It keeps running if this step ends. "
+        f"Check it with job_status (job_id={job_id})."),
+        summary=f"background job {job_id} started", data={"job_id": job_id, "state": "RUNNING"})
+
+
+async def job_status(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
+    job_id = str(args.get("job_id") or "").strip()
+    if not JOB_ID.match(job_id):
+        return ToolResult.failure("job_id must look like bg-0123456789", data={"kind": "invalid"})
+    wait = max(0, min(40, int(args.get("wait_seconds") or 0)))
+    base = f"{JOBS_DIR}/{job_id}"
+    check = (f"for i in $(seq 0 {wait}); do "
+             f"if [ -f {base}.exit ]; then break; fi; "
+             f"if [ -f {base}.pid ] && ! kill -0 $(cat {base}.pid) 2>/dev/null; then break; fi; "
+             f"sleep 1; done; "
+             f"if [ -f {base}.exit ]; then echo STATE=EXITED; echo CODE=$(cat {base}.exit); "
+             f"elif [ -f {base}.pid ] && kill -0 $(cat {base}.pid) 2>/dev/null; then echo STATE=RUNNING; "
+             f"else echo STATE=LOST; fi; echo ---; tail -c 4000 {base}.log 2>/dev/null")
+    data = await ctx.computer.call("/computer/exec", {"command": check, "timeout_seconds": 60, "cwd": "."},
+                                   timeout=float(wait + 60), idempotent=True)
+    out = str(data.get("output") or "")
+    state = re.search(r"STATE=(\w+)", out)
+    code = re.search(r"CODE=(-?\d+)", out)
+    state_s = state.group(1) if state else "UNKNOWN"
+    body = out.split("---", 1)[1] if "---" in out else out
+    body, cut = clip(body.strip(), ctx.settings.tool_result_chars, "ends")
+    exit_code = int(code.group(1)) if code else None
+    summary = f"{job_id}: {state_s}" + (f" (exit {exit_code})" if exit_code is not None else "")
+    return ToolResult(ok=True, content=f"{summary}\n{body}", summary=summary, truncated=cut,
+                      data={"job_id": job_id, "state": state_s, "exit_code": exit_code})
 
 
 async def list_files(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
@@ -206,7 +284,14 @@ async def computer_info(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
 SCHEMAS = {
     "run_command": {"type": "object", "properties": {
         "command": {"type": "string", "minLength": 1, "maxLength": 6000, "description": "bash command"},
-        "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 3600, "default": 60}}, "required": ["command"]},
+        "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 3600, "default": 60,
+                            "description": "above 300 the command runs as a background job"},
+        "cwd": {"type": "string", "default": ".", "description": "working directory on the computer"},
+        "background": {"type": "boolean", "default": False,
+                       "description": "true for anything that may take minutes (installs, training, scans, servers)"}}, "required": ["command"]},
+    "job_status": {"type": "object", "properties": {
+        "job_id": {"type": "string", "description": "the bg-... id returned by run_command"},
+        "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 40, "default": 0}}, "required": ["job_id"]},
     "list_files": {"type": "object", "properties": {"path": {"type": "string", "default": ".", "description": "directory"}}},
     "read_file": {"type": "object", "properties": {
         "path": {"type": "string", "minLength": 1}, "offset": {"type": "integer", "minimum": 0, "default": 0},
@@ -223,7 +308,9 @@ SCHEMAS = {
 
 def specs() -> list[ToolSpec]:
     return [
-        ToolSpec("run_command", "Run a bash command on the remote Linux computer (Python, GPU). Time-limited.",
+        ToolSpec("job_status", "Check a background job started by run_command: RUNNING, EXITED (with exit code) or LOST, plus the latest output.",
+                 SCHEMAS["job_status"], job_status, timeout=90.0, describe=lambda a: str(a.get("job_id") or "")),
+        ToolSpec("run_command", "Run a bash command on the remote Linux computer (Python, GPU). Commands over 300s or background=true run as background jobs.",
                  SCHEMAS["run_command"], run_command, timeout=3660.0, kind="exec", describe=lambda a: f"$ {a.get('command', '')}"),
         ToolSpec("list_files", "List a remote workspace directory.", SCHEMAS["list_files"], list_files,
                  timeout=45.0, describe=lambda a: str(a.get("path") or ".")),

@@ -285,7 +285,7 @@ async def test_repeated_length_cuts_end_honestly_after_the_budget(stack):
 
 
 async def test_repeated_drops_beyond_the_recovery_budget_end_in_honest_error(stack):
-    for _ in range(4):                                                                    # one per attempt: the 4th exhausts the budget
+    for _ in range(6):                                                                    # one per attempt: the 6th exhausts the budget (limit 6)
         stack.backend.queue([*say("partial "), {"drop": 1}])
     out = await stack.stream({"message": "hello"})
     assert out.end["status"] == "error" and out.of("error")[0]["code"] == "gpu_dropped"
@@ -302,7 +302,7 @@ async def test_retryable_upstream_failure_recovers_once(stack):
 
 
 async def test_persistent_upstream_failure_ends_in_error_not_a_hang(stack):
-    stack.backend.queue({"http_error": 503, "message": "down"}, {"http_error": 503, "message": "down"})
+    stack.backend.queue(*[{"http_error": 503, "message": "down"}] * 6)                    # the whole retry budget fails
     out = await stack.stream({"message": "hello"})
     assert out.end["status"] == "error"
     assert out.of("error")[0]["retryable"] is True
@@ -483,7 +483,7 @@ async def test_regenerate_replaces_the_last_answer(stack):
 
 
 async def test_failed_answer_can_be_retried(stack):
-    stack.backend.queue({"http_error": 503, "message": "down"}, {"http_error": 503, "message": "down"})
+    stack.backend.queue(*[{"http_error": 503, "message": "down"}] * 6)                    # the whole retry budget fails
     a = await stack.stream({"message": "question"})
     assert a.end["status"] == "error"
     stack.backend.queue([*say("full answer"), finish("stop")])
@@ -542,7 +542,7 @@ async def test_every_run_marks_the_gpu_busy_and_always_releases_it(stack):
     out = await stack.stream({"message": "run something"})
     assert out.end["status"] == "stop" and rec.events == ["start", "touch", "finish"]
     rec.events.clear()
-    stack.backend.queue({"http_error": 503, "message": "down"}, {"http_error": 503, "message": "down"})
+    stack.backend.queue(*[{"http_error": 503, "message": "down"}] * 6)                    # the whole retry budget fails
     bad = await stack.stream({"message": "this one fails"})
     assert bad.end["status"] == "error" and rec.events == ["start", "finish"]            # released even on failure
     rec.events.clear()

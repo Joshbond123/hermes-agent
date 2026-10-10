@@ -183,30 +183,36 @@ class GpuService:
         return model_pub
 
     async def turn_on(self) -> Dict[str, Any]:
+        """Power on the model and computer GPUs from one action. Returns the real status of both roles."""
         d1 = self._module()
-        if hasattr(d1, "turn_on_fleet"):
-            try:
-                import os
-                from .fleet import accounts_from_env
-                if accounts_from_env(os.environ):
-                    out = await asyncio.to_thread(d1.turn_on_fleet)
-                    return {"fleet": out}
-            except Exception:  # noqa: BLE001 - fall back to the single-GPU path
-                pass
+        import os
+        from .fleet import accounts_from_env
+        if hasattr(d1, "turn_on_fleet") and accounts_from_env(os.environ):
+            # Errors propagate: a failed fleet start must not silently fall back to a different code path.
+            out = await asyncio.to_thread(d1.turn_on_fleet)
+            st = await self.status(refresh=True)
+            st["fleet"] = out
+            return st
         return await self._augment(await asyncio.to_thread(d1.turn_on_kaggle_gpu))
 
     async def turn_off(self) -> Dict[str, Any]:
+        """Power off both GPUs. ``turn_off_ok`` is true only when every role was verified stopped."""
         d1 = self._module()
-        if hasattr(d1, "turn_off_fleet"):
-            try:
-                import os
-                from .fleet import accounts_from_env
-                if accounts_from_env(os.environ):
-                    out = await asyncio.to_thread(d1.turn_off_fleet)
-                    return {"fleet": out}
-            except Exception:  # noqa: BLE001
-                pass
-        return await self._augment(await asyncio.to_thread(d1.turn_off_kaggle_gpu))
+        import os
+        from .fleet import accounts_from_env
+        if hasattr(d1, "turn_off_fleet") and accounts_from_env(os.environ):
+            out = await asyncio.to_thread(d1.turn_off_fleet)
+            st = await self.status(refresh=True)
+            failed = {role: v for role, v in out.items() if isinstance(v, dict) and v.get("status") == "stop_failed"}
+            st["fleet"] = out
+            st["turn_off_ok"] = not failed
+            if failed:
+                reasons = "; ".join(f"{role}: {v.get('error') or 'stop refused'}" for role, v in failed.items())
+                st["error"] = f"Turn-off did not complete. Kaggle still reports the session running ({reasons}). Stop it on kaggle.com or give the token kernels.delete."
+            return st
+        st = await self._augment(await asyncio.to_thread(d1.turn_off_kaggle_gpu))
+        st["turn_off_ok"] = True
+        return st
 
     async def activity(self) -> Dict[str, Any]:
         d1 = self._module()

@@ -83,7 +83,7 @@ async def test_registry_unknown_invalid_timeout_and_crash():
 
 def test_default_registry_has_the_expected_native_tools():
     reg = default_registry()
-    assert set(reg.names()) == {"web_search", "run_command", "list_files", "read_file", "write_file", "fetch_url", "computer_info", "remember"}
+    assert set(reg.names()) == {"web_search", "run_command", "list_files", "read_file", "write_file", "fetch_url", "computer_info", "job_status", "remember"}
     for tool in reg.schemas():
         assert tool["type"] == "function" and tool["function"]["description"] and tool["function"]["parameters"]["type"] == "object"
 

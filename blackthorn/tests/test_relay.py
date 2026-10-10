@@ -65,7 +65,7 @@ async def test_relay_round_trip_preserves_method_path_body_status_and_streams_th
     assert resp.content == b'{"upstream": "busy"}'
     assert resp.headers["content-type"].startswith("application/json")
     job = nb.seen[0]
-    assert job["method"] == "POST" and job["path"] == "v1/chat/completions"
+    assert job["method"] == "POST" and job["path"] == "/v1/chat/completions"
     import base64
     assert base64.b64decode(job["body_b64"]) == b'{"stream": true}'
     assert job["headers"].get("authorization") == "Bearer test-key"      # the gateway key passes through
@@ -128,24 +128,79 @@ async def test_relay_quiet_poll_returns_204(stack, monkeypatch):
     assert await nb.run_once() == 204
 
 
-async def test_model_and_computer_channels_never_share_jobs(stack):
+async def test_model_and_computer_channels_never_share_jobs(stack, monkeypatch):
+    monkeypatch.setattr(relay_mod, "PULL_WAIT_S", 0.2)
     nb_model = Notebook(stack)
     nb_model.respond = {"status": 200, "content_type": "application/json", "body": b'{"who":"model"}'}
     nb_comp = Notebook(stack, channel="computer")
     nb_comp.respond = {"status": 200, "content_type": "application/json", "body": b'{"who":"computer"}'}
+    # the computer channel only exists once its notebook has polled; until then /computer/* stays on the model host
+    await nb_comp.run_once()
 
     async def call(path):
         async with httpx.AsyncClient(timeout=30) as c:
             return await c.get(f"{stack.url}/gpu-relay/{path}")
 
-    # the published computer base is /gpu-relay/computer, so gateway paths arrive doubled
     jobs = [asyncio.create_task(call("v1/models")),
-            asyncio.create_task(call("computer/computer/info"))]
+            asyncio.create_task(call("computer/info"))]
     await asyncio.sleep(0.05)
     await nb_model.run_once()
     await nb_comp.run_once()
     resp_model, resp_comp = await jobs[0], await jobs[1]
-    # each notebook got exactly the job of its own channel
-    assert nb_model.seen and nb_model.seen[0]["path"] == "v1/models"
-    assert nb_comp.seen and nb_comp.seen[0]["path"] == "computer/info"
+    # each notebook got exactly the job of its own channel, with the full gateway path
+    assert nb_model.seen and nb_model.seen[0]["path"] == "/v1/models"
+    assert nb_comp.seen and nb_comp.seen[0]["path"] == "/computer/info"
     assert b"model" in resp_model.content and b"computer" in resp_comp.content
+
+
+# --------------------------------------------------------------------------- regressions found in production
+async def test_abandoned_job_is_never_executed_by_the_notebook(stack, monkeypatch):
+    """A caller that timed out must not leave a job for the GPU to burn minutes on."""
+    monkeypatch.setattr(relay_mod, "HEADERS_TIMEOUT_S", 0.3)
+    nb = Notebook(stack)
+    nb.push = False
+    hub_call = asyncio.create_task(_proxy(stack))
+    await asyncio.sleep(0.05)
+    hub = stack.services.relay_hubs["model"]
+    queued = hub.inflight and list(hub.inflight.values())[0]
+    resp = await hub_call
+    assert resp.status_code == 502
+    # the job the caller abandoned is no longer deliverable; the next pull must come back empty
+    assert queued.closed
+    nb.push = True
+    assert await nb.run_once() == 204
+
+
+async def test_push_does_not_block_forever_after_the_consumer_disconnects(stack, monkeypatch):
+    """Reproduces the worker-starvation deadlock: 300 chunks (> queue of 256) and a vanished reader."""
+    monkeypatch.setattr(relay_mod, "PUSH_PUT_SLICE_S", 0.05)
+    nb = Notebook(stack)
+    nb.respond = {"status": 200, "content_type": "text/event-stream",
+                  "chunks": [b"data: x\n\n"] * 300, "body": b""}
+
+    async def consumer_reads_one_then_vanishes():
+        async with httpx.AsyncClient(timeout=10) as c:
+            async with c.stream("POST", f"{stack.url}/gpu-relay/v1/chat/completions", json={"stream": True}) as r:
+                assert r.status_code == 200
+                await r.aiter_bytes().__anext__()
+
+    consumer = asyncio.create_task(consumer_reads_one_then_vanishes())
+    await asyncio.sleep(0.05)
+    push = asyncio.create_task(nb.run_once())
+    await consumer
+    # the notebook's push must be released (answered, 410 = dropped) instead of blocking forever
+    status = await asyncio.wait_for(push, timeout=15)
+    assert status in (200, 410)
+
+
+async def test_relay_health_reports_stall_after_repeated_timeouts(stack, monkeypatch):
+    monkeypatch.setattr(relay_mod, "HEADERS_TIMEOUT_S", 0.2)
+    nb = Notebook(stack)
+    nb.push = False
+    for _ in range(relay_mod.STALL_AFTER_TIMEOUTS):
+        call = asyncio.create_task(_proxy(stack))
+        await asyncio.sleep(0.05)
+        await nb.run_once()
+        assert (await call).status_code == 502
+    hub = stack.services.relay_hubs["model"]
+    assert hub.stalled() and hub.health()["stalled"] is True

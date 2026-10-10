@@ -47,6 +47,9 @@ class Settings:
 
     # ---- network timeouts -----------------------------------------------------------------
     llm_connect_timeout_s: float = 20.0
+    # Chain-of-thought is off by default: a trivial reply took ~9 s to first token, ~8.7 s of which was hidden
+    # reasoning. Set BLACKTHORN_THINKING=1 to restore it for hard reasoning tasks.
+    thinking: bool = field(default_factory=lambda: os.environ.get("BLACKTHORN_THINKING", "0").strip() == "1")
     llm_idle_timeout_s: float = field(default_factory=lambda: _float("BLACKTHORN_LLM_IDLE_TIMEOUT", 240.0))
     tool_timeout_s: float = 180.0
     heartbeat_s: float = 12.0

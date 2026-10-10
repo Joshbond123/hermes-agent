@@ -359,20 +359,19 @@ class AgentRun:
                     raise
                 self.deps.resolver.invalidate()
                 partial = "".join(part["text"] for part in self.parts if part["type"] == "text")[before:]
+                # Every recovery is visible with a bounded attempt count: a silent wait of minutes
+                # looked like a hang, and an unbounded "retrying" loop is what this replaces.
                 if partial.strip():
                     if self._recoveries >= 5:
                         raise
                     self._recoveries += 1
-                    # Only surface a notice after the first silent recovery.
-                    if self._recoveries >= 2:
-                        self.run.emit("notice", level="info",
-                                      text="Reconnected to the GPU; continuing the answer.")
+                    self.run.emit("notice", level="info",
+                                  text=f"Connection dropped mid-answer; continuing from the cut point (attempt {attempt + 1} of {limit}).")
                     messages.append({"role": "assistant", "content": partial})
                     messages.append({"role": "user", "content": CONTINUE_NOTE})
                 else:
-                    # Silent on first blips — "hiccup" notices felt like failures during healthy retries.
-                    if attempt >= 3:
-                        self.run.emit("notice", level="info", text="Reconnecting to the GPU…")
+                    self.run.emit("notice", level="info",
+                                  text=f"Reconnecting to the GPU — retrying (attempt {attempt + 1} of {limit})…")
                 await asyncio.sleep(min(6.0, 0.6 * (2 ** (attempt - 1))))
                 continue
 
@@ -411,8 +410,9 @@ class AgentRun:
             text_chunks.append(text)
             self._emit_text(text)
 
+        extra = None if s.thinking else {"chat_template_kwargs": {"enable_thinking": False}}
         async for ev in stream_chat(route, messages, client=self.deps.http, tools=tools, idle_timeout=s.llm_idle_timeout_s,
-                                    connect_timeout=s.llm_connect_timeout_s):
+                                    connect_timeout=s.llm_connect_timeout_s, extra=extra):
             self._check()
             kind = ev["t"]
             if kind == "reasoning":

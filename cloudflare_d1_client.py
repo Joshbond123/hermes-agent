@@ -1610,7 +1610,12 @@ def failover_fleet_role(role: str, from_slot: str, to_slot: str) -> Dict[str, An
 
 
 def turn_off_fleet() -> Dict[str, Any]:
-    """Stop the running kernels of both roles (best effort, honest per-role result)."""
+    """Stop the running kernels of both roles. Honest per-role result.
+
+    A role is written as GPU_STOPPED only after Kaggle confirms the session is not running. A refused
+    or unverifiable stop is reported as ``stop_failed`` with Kaggle's reason and the row is left alone,
+    so the controller never claims a GPU is off while it still bills quota.
+    """
     from blackthorn.fleet import FleetManager, accounts_from_env, kernel_slug_for
     accounts = accounts_from_env(os.environ)
     if not accounts:
@@ -1627,38 +1632,38 @@ def turn_off_fleet() -> Dict[str, Any]:
         found = fleet.find_role_kernel(account)
         slug = (found or {}).get("slug") or kernel_slug_for(account)
         try:
-            stopped = fleet.stop_kernel_session(account, slug)
-            out[role] = {"account": account.user, "status": "stopped" if stopped else "not_running"}
-        except Exception as exc:  # noqa: BLE001
-            out[role] = {"account": account.user, "status": "stop_failed", "error": str(exc)[:160]}
-        _write_fleet_row(row_id, "GPU_STOPPED_SAVING_QUOTA", gpu_info="")
+            result = fleet.stop_kernel_result(account, slug)
+        except Exception as exc:  # noqa: BLE001 - reported per role, never hidden
+            result = {"state": "failed", "error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+        if result["state"] in ("stopped", "not_running"):
+            _write_fleet_row(row_id, "GPU_STOPPED_SAVING_QUOTA", gpu_info="")
+            out[role] = {"account": account.user, "status": "stopped" if result["state"] == "stopped" else "not_running"}
+        else:
+            out[role] = {"account": account.user, "status": "stop_failed", "error": result.get("error", "")}
+            logger.error("turn-off refused for %s on %s: %s", role, account.user, result.get("error"))
     return out
 
 
 def turn_off_kaggle_gpu() -> Dict[str, Any]:
-    """Immediately turn OFF the Kaggle GPU session to save weekly GPU quota."""
+    """Turn the Kaggle GPU session OFF to save weekly GPU quota.
+
+    The stop is verified before the row is written: if Kaggle refuses the delete, or the session
+    still reads as running afterwards, this raises with Kaggle's reason and the row is not marked off.
+    """
     global _STATUS_CACHE_TS
     _ensure_kaggle_credentials()
     ensure_d1_schema()
-    # Surface "stopping" immediately so the UI shows real progress.
-    try:
-        d1_query(
-            """INSERT INTO kaggle_gpu_state (id, status, tunnel_url, api_key, model, gpu_info, updated_at)
-               VALUES ('primary', 'STOPPING_KAGGLE_GPU', '', ?, ?, 'Stopping Kaggle GPU…', ?)
-               ON CONFLICT(id) DO UPDATE SET status = excluded.status, tunnel_url = excluded.tunnel_url, model = excluded.model, gpu_info = excluded.gpu_info, updated_at = excluded.updated_at;""",
-            [CYBER_ORNITH_API_KEY, CYBER_ORNITH_MODEL, time.time()],
-        )
-        _STATUS_CACHE_TS = 0.0
-    except Exception:
-        pass
-    try:
-        _kaggle_rpc(
-            "DeleteKernel",
-            {"userName": KAGGLE_USERNAME, "kernelSlug": KAGGLE_KERNEL_SLUG},
-        )
-    except Exception as exc:
-        logger.debug("DeleteKernel note: %s", exc)
-
+    running_before = _kaggle_session_running()
+    if running_before is None:
+        raise RuntimeError("Could not read the Kaggle session status, so the stop cannot be verified.")
+    if running_before:
+        try:
+            _kaggle_rpc("DeleteKernel", {"userName": KAGGLE_USERNAME, "kernelSlug": KAGGLE_KERNEL_SLUG})
+        except Exception as exc:
+            raise RuntimeError(f"Kaggle refused to stop the GPU session: {str(exc)[:200]}") from exc
+        still = _kaggle_session_running()
+        if still is None or still:
+            raise RuntimeError("Kaggle accepted the stop but the session still reads as running. It was not marked off.")
     now = time.time()
     d1_query(
         """INSERT INTO kaggle_gpu_state (id, status, tunnel_url, api_key, model, gpu_info, updated_at)
@@ -1669,6 +1674,16 @@ def turn_off_kaggle_gpu() -> Dict[str, Any]:
     mark_activity("turn-off")
     _STATUS_CACHE_TS = 0.0
     return get_kaggle_gpu_status(force_refresh=True)
+
+
+def _kaggle_session_running() -> Optional[bool]:
+    """True/False when Kaggle answers; None when the answer cannot be read (never guessed)."""
+    try:
+        sess = _kaggle_rpc("GetKernelSessionStatus", {"userName": KAGGLE_USERNAME, "kernelSlug": KAGGLE_KERNEL_SLUG})
+    except Exception as exc:  # noqa: BLE001 - surfaced by the caller, not treated as "stopped"
+        logger.warning("kernel status unreadable: %s", exc)
+        return None
+    return str((sess or {}).get("status") or "").upper() in ("RUNNING", "QUEUED", "PENDING")
 
 
 _DAEMON_STARTED = False
