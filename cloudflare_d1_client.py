@@ -587,6 +587,15 @@ def _published_status() -> str:
         return ""
 
 
+def _auto_off_stop() -> Dict[str, Any]:
+    """Stop every GPU the controller runs: the fleet (primary and backup accounts) when configured, else the
+    single primary session. Auto-off used to call only the primary path, so a backup GPU kept running."""
+    from blackthorn.fleet import accounts_from_env
+    if accounts_from_env(os.environ):
+        return turn_off_fleet(blocking=True)
+    return turn_off_kaggle_gpu()
+
+
 def auto_off_decision() -> Dict[str, Any]:
     """Pure decision helper: should the GPU be stopped right now?"""
     minutes = get_auto_off_minutes()
@@ -1834,9 +1843,9 @@ def start_permanent_gpu_daemon() -> None:
                         and (time.monotonic() - last_ready_ts) > 60.0
                         and d1_state not in ("GPU_STOPPED_SAVING_QUOTA", "OFF", "STOPPING_KAGGLE_GPU")
                     ):
-                        logger.info("Blackthorn auto-off: %s — stopping Kaggle GPU", decision.get("reason"))
+                        logger.info("Blackthorn auto-off: %s — stopping Kaggle GPUs", decision.get("reason"))
                         _record_auto_off(str(decision.get("reason") or "inactivity"))
-                        turn_off_kaggle_gpu()
+                        _auto_off_stop()
                         consecutive_dead = 0
                         time.sleep(20.0)
                         continue
