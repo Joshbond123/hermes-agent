@@ -415,6 +415,7 @@ class AgentRun:
 
         extra = None if s.thinking else {"chat_template_kwargs": {"enable_thinking": False}}
         async for ev in stream_chat(route, messages, client=self.deps.http, tools=tools, idle_timeout=s.llm_idle_timeout_s,
+                                    first_byte_timeout=s.llm_first_byte_timeout_s,
                                     connect_timeout=s.llm_connect_timeout_s, extra=extra):
             self._check()
             kind = ev["t"]

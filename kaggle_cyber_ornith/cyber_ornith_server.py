@@ -735,7 +735,82 @@ def ensure_ollama_serving() -> str:
     return binary
 
 
+INROK_BIN_DIR = "/tmp/inrok_bin"
+INROK_BIN = os.path.join(INROK_BIN_DIR, "inrok")
+# Inrok shows a browser interstitial on shared sites unless non-browser clients send this header.
+INROK_INTERSTITIAL_HEADERS = {"skip_zrok_interstitial": "true"}
+
+
+def inrok_enabled() -> bool:
+    return bool((os.environ.get("INROK_API_KEY") or "").strip())
+
+
+def ensure_inrok() -> str:
+    """Install the Inrok CLI (official installer, SHA-256 verified downloads) into /tmp."""
+    if os.path.exists(INROK_BIN):
+        return INROK_BIN
+    os.makedirs(INROK_BIN_DIR, exist_ok=True)
+    log("🌐 Installing the Inrok CLI...")
+    subprocess.run(["sh", "-c", "curl -fsSL https://inrok.in/install.sh | INROK_BIN_DIR=" + INROK_BIN_DIR + " sh"],
+                   check=True, timeout=300, capture_output=True)
+    if not os.path.exists(INROK_BIN):
+        raise RuntimeError("inrok install did not produce " + INROK_BIN)
+    return INROK_BIN
+
+
+def inrok_tunnel_name() -> str:
+    explicit = (os.environ.get("INROK_TUNNEL_NAME") or "").strip()
+    if explicit:
+        return explicit
+    return "blackthorn" if ROLE != "computer" else "blackthorn-computer"
+
+
+def launch_inrok() -> tuple:
+    """Expose the local gateway at https://<name>.share.inrok.in and return (proc, url).
+
+    The key goes to `inrok login` on stdin (never argv, never logged). Returns (None, "") when the
+    tunnel does not answer in time, so the caller can report TUNNEL_ERROR instead of guessing.
+    """
+    key = (os.environ.get("INROK_API_KEY") or "").strip()
+    name = inrok_tunnel_name()
+    binary = ensure_inrok()
+    login = subprocess.run([binary, "login"], input=key + "\n", capture_output=True, text=True, timeout=90)
+    if login.returncode != 0:
+        msg = (login.stderr or login.stdout or "").replace(key, "***")[-300:]
+        log("❌ inrok login failed: " + msg)
+        return None, ""
+    handle = open("/tmp/inrok_" + name + ".log", "a")
+    proc = subprocess.Popen([binary, "http", str(GATEWAY_PORT), "--name", name],
+                            stdout=handle, stderr=subprocess.STDOUT)
+    public = "https://" + name + ".share.inrok.in"
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            log("❌ inrok tunnel exited early (see /tmp/inrok_" + name + ".log)")
+            return None, ""
+        try:
+            req = urllib.request.Request(public + "/health", headers=dict(INROK_INTERSTITIAL_HEADERS))
+            with urllib.request.urlopen(req, timeout=8):
+                pass
+            log("Inrok tunnel up: " + public)
+            return proc, public
+        except urllib.error.HTTPError:
+            # Any HTTP answer means the tunnel reached the gateway (auth/booting codes are fine here).
+            log("Inrok tunnel up: " + public)
+            return proc, public
+        except Exception:
+            time.sleep(2)
+    log("❌ inrok tunnel did not answer within 120s: " + public)
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    return None, ""
+
+
 def ensure_cloudflared() -> str:
+    if inrok_enabled():
+        return "inrok"  # Inrok replaces cloudflared; nothing to download
     for candidate in ("/tmp/cloudflared", "/usr/local/bin/cloudflared"):
         if os.path.exists(candidate):
             log(f"✅ cloudflared present: {candidate}")
@@ -749,90 +824,6 @@ def ensure_cloudflared() -> str:
     ], check=True)
     os.chmod(binary, 0o755)
     return binary
-
-
-def ensure_ngrok() -> str:
-    """Download the ngrok agent binary (used instead of ephemeral trycloudflare tunnels)."""
-    for candidate in ("/tmp/ngrok", "/usr/local/bin/ngrok"):
-        if os.path.exists(candidate) and os.access(candidate, os.X_OK):
-            log(f"✅ ngrok present: {candidate}")
-            return candidate
-    binary = "/tmp/ngrok"
-    log("🌐 Fetching ngrok...")
-    # Official stable linux amd64 tarball
-    archive = "/tmp/ngrok.tgz"
-    subprocess.run([
-        "curl", "-fsSL",
-        "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz",
-        "-o", archive,
-    ], check=True)
-    subprocess.run(["tar", "-xzf", archive, "-C", "/tmp"], check=True)
-    if not os.path.exists(binary):
-        # tarball extracts as ./ngrok
-        if os.path.exists("/tmp/ngrok"):
-            pass
-        else:
-            raise RuntimeError("ngrok binary missing after extract")
-    os.chmod(binary, 0o755)
-    return binary
-
-
-def launch_ngrok(port: int):
-    """Start an ngrok HTTP tunnel to the local gateway. Returns (proc, public_url).
-
-    Auth token: NGROK_AUTHTOKEN or BLACKTHORN_NGROK_AUTHTOKEN.
-    Optional fixed domain: NGROK_DOMAIN or BLACKTHORN_NGROK_DOMAIN (e.g. blackthorn.ngrok.app).
-    """
-    token = (os.environ.get("NGROK_AUTHTOKEN") or os.environ.get("BLACKTHORN_NGROK_AUTHTOKEN") or "").strip()
-    # Fallback authtoken provided for Blackthorn when Render env is not yet updated.
-    if not token:
-        token = "inrok_PxoKt_ma6T9SP_sXKb-EbopTxZvgQ8LFY6pqYl3hcvI"
-    if not token:
-        return None, ""
-    domain = (os.environ.get("NGROK_DOMAIN") or os.environ.get("BLACKTHORN_NGROK_DOMAIN") or "").strip()
-    binary = ensure_ngrok()
-    # Configure authtoken (idempotent)
-    try:
-        subprocess.run([binary, "config", "add-authtoken", token], check=False, capture_output=True, timeout=30)
-    except Exception as exc:
-        log(f"ngrok authtoken note: {exc}")
-    log_path = "/tmp/ngrok.log"
-    handle = open(log_path, "w")
-    # ngrok v3: `ngrok http <port> [--url=https://host]`
-    cmd = [binary, "http", f"127.0.0.1:{port}", "--log=stdout", "--log-format=logfmt"]
-    if domain:
-        host = domain if domain.startswith("http") else f"https://{domain}"
-        cmd.extend([f"--url={host}"])
-    proc = subprocess.Popen(cmd, stdout=handle, stderr=subprocess.STDOUT)
-    public = ""
-    # Poll local ngrok inspector API for the public URL
-    for _ in range(40):
-        time.sleep(0.5)
-        if proc.poll() is not None:
-            log(f"ngrok exited early; see {log_path}")
-            break
-        try:
-            with urllib.request.urlopen("http://127.0.0.1:4040/api/tunnels", timeout=2) as resp:
-                data = json.loads(resp.read().decode())
-            for tun in data.get("tunnels") or []:
-                url = str(tun.get("public_url") or "")
-                if url.startswith("https://"):
-                    public = url.rstrip("/")
-                    break
-            if public:
-                break
-        except Exception:
-            continue
-    if public:
-        log(f"✅ ngrok online: {public}")
-    else:
-        log("⚠️ ngrok started but no public URL yet")
-        try:
-            proc.terminate()
-        except Exception:
-            pass
-        return None, ""
-    return proc, public
 
 
 def ollama_model_present() -> bool:
@@ -1487,15 +1478,15 @@ def launch_cloudflared(cloudflared_bin: str):
     """Start the public tunnel and return (proc, public_url).
 
     Order:
-    1. ngrok (NGROK_AUTHTOKEN / BLACKTHORN_NGROK_AUTHTOKEN) — preferred stable edge
-    2. Cloudflare named tunnel token (CLOUDFLARED_TUNNEL_TOKEN)
-    3. Render long-poll relay (BLACKTHORN_RELAY_URL)
-    4. Ephemeral trycloudflare quick tunnel (last resort)
+    1. Inrok (INROK_API_KEY): https://<name>.share.inrok.in, the only production path.
+    2. Legacy, only when no Inrok key is set: Cloudflare named tunnel, Render relay, quick tunnel.
     """
-    ngrok_proc, ngrok_url = launch_ngrok(GATEWAY_PORT)
-    if ngrok_url:
-        return ngrok_proc, ngrok_url
-
+    if inrok_enabled():
+        try:
+            return launch_inrok()
+        except Exception as exc:
+            log("❌ inrok launch failed: " + type(exc).__name__ + ": " + str(exc)[:200])
+            return None, ""
     cf_log_path = "/tmp/cloudflared.log"
     handle = open(cf_log_path, "w")
     relay_base = (os.environ.get("BLACKTHORN_RELAY_URL") or "").strip().rstrip("/")
@@ -1999,7 +1990,7 @@ def main() -> None:
     while time.time() - loop_start < MAX_RUNTIME_SECONDS:
         time.sleep(15)
         # 1) Process dead → always restart cloudflared and publish new URL
-        if cf_proc.poll() is not None:
+        if cf_proc is None or cf_proc.poll() is not None:
             log("⚠️ cloudflared exited; restarting tunnel")
             cf_proc, new_url = launch_cloudflared(cloudflared_bin)
             if new_url:
@@ -2017,7 +2008,8 @@ def main() -> None:
             try:
                 req = urllib.request.Request(
                     f"{tunnel_url.rstrip('/')}/health",
-                    headers={"User-Agent": "BlackthornTunnelSelfCheck/1.0"},
+                    headers={"User-Agent": "BlackthornTunnelSelfCheck/1.0",
+                             **(INROK_INTERSTITIAL_HEADERS if "inrok.in" in tunnel_url else {})},
                 )
                 with urllib.request.urlopen(req, timeout=8) as resp:
                     body = resp.read()
@@ -2047,7 +2039,7 @@ def main() -> None:
                     pass
                 time.sleep(1)
                 try:
-                    if cf_proc.poll() is None:
+                    if cf_proc is not None and cf_proc.poll() is None:
                         cf_proc.kill()
                 except Exception:
                     pass

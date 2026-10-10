@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 
 import httpx
 
+from ..llm import tunnel_headers
 from ..route import RouteError, RouteResolver
 from .base import ToolContext, ToolError, ToolResult, ToolSpec, clip
 
@@ -74,7 +75,7 @@ class ComputerClient:
             try:
                 resp = await self._http.request(
                     method, f"{base_url}{path}", json=payload if method == "POST" else None, timeout=timeout,
-                    headers={"Authorization": f"Bearer {api_key}"})
+                    headers={**tunnel_headers(base_url), "Authorization": f"Bearer {api_key}"})
             except httpx.ConnectError as exc:
                 self._resolver.invalidate()
                 last_err = ToolError("offline", "Could not reach the remote computer (the tunnel may have stopped).",

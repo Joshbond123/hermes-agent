@@ -12,6 +12,8 @@ import json
 import time
 from typing import Any, Dict, Optional
 
+from .llm import tunnel_headers
+
 # Ordered boot stages the notebook really reports (status → stage number). The UI shows "Step n of N" and the
 # stage label — never a made-up percentage.
 STAGE_OF = {
@@ -246,7 +248,7 @@ class GpuService:
         key = await asyncio.to_thread(d1._gateway_api_key)
         try:
             async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.get(f"{url}/logs", headers={"Authorization": f"Bearer {key}"})
+                resp = await client.get(f"{url}/logs", headers={**tunnel_headers(url), "Authorization": f"Bearer {key}"})
             lines = list(resp.json().get("lines") or [])
         except Exception as exc:
             return {"lines": [], "error": f"{type(exc).__name__}: {str(exc)[:120]}"}
