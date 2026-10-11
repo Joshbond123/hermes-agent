@@ -240,7 +240,7 @@ class AgentRun:
 
     # ------------------------------------------------------------------ the loop
     def _tools_for_step(self, step: int):
-        """Omit tool schemas on tiny chit-chat turns to cut prompt prefill latency."""
+        """Omit tool schemas on tiny chit-chat to cut prefill latency."""
         if not self._schemas:
             return None
         text = (self.user_message or "").strip().lower()
