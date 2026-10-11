@@ -1231,6 +1231,14 @@ async def list_models(dependencies=[Depends(verify_api_key)]):
             "backing_gguf": OLLAMA_MODEL}]}
 
 
+def thinking_disabled(body: dict) -> bool:
+    """True when the caller asked for no private reasoning (Blackthorn sends chat_template_kwargs.enable_thinking=false)."""
+    kwargs = body.get("chat_template_kwargs")
+    if isinstance(kwargs, dict) and kwargs.get("enable_thinking") is False:
+        return True
+    return body.get("think") is False
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request, dependencies=[Depends(verify_api_key)]):
     body = await request.json()
@@ -1250,6 +1258,10 @@ async def chat_completions(request: Request, dependencies=[Depends(verify_api_ke
         body["model"] = OLLAMA_MODEL
         body.setdefault("keep_alive", -1)
     body["messages"] = messages
+    if thinking_disabled(body):
+        # Ollama's OpenAI-compatible route ignores chat_template_kwargs and "think"; reasoning_effort="none" is honoured
+        # (measured: 151 tokens / 12.4 s instead of 262 tokens / 20.6 s for the same answer, tool calls intact).
+        body["reasoning_effort"] = "none"
     if body.get("stream"):
         async def event_generator():
             # Cloudflare edges cut an origin that stays silent for ~100s (HTTP 524).

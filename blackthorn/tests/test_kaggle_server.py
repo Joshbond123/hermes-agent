@@ -146,3 +146,18 @@ def test_ollama_pull_reports_the_growing_model_store(srv, monkeypatch):
 
 def test_server_source_has_no_literal_credentials_and_generates_a_per_boot_key(srv):
     assert srv.API_KEY.startswith("bt-") and len(srv.API_KEY) >= 40
+
+
+def test_thinking_disabled_maps_blackthorn_flags(srv):
+    """Blackthorn sends chat_template_kwargs.enable_thinking=false. The helper lives in the generated gateway source
+    (which needs FastAPI on Kaggle), so extract just that function with ast and run it."""
+    import ast
+    tree = ast.parse(srv.gateway_code())
+    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "thinking_disabled")
+    ns = {}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), "<gateway>", "exec"), ns)
+    f = ns["thinking_disabled"]
+    assert f({"chat_template_kwargs": {"enable_thinking": False}}) is True
+    assert f({"think": False}) is True
+    assert f({"messages": []}) is False
+    assert f({"chat_template_kwargs": {"enable_thinking": True}}) is False
