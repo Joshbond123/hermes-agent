@@ -186,7 +186,8 @@ async def _sse(run: Run, after: int, heartbeat: float) -> AsyncIterator[bytes]:
     yield b": " + (b" " * 2048) + b"\n\n"
     await asyncio.sleep(0)
     try:
-        for seq, event in list(getattr(run, "_log", []) or []):
+        for event in list(getattr(run, "events", []) or []):
+            seq = int(event.get("seq") or 0)
             if seq > after:
                 after = seq
                 yield _sse_bytes(event)
