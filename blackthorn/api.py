@@ -26,7 +26,7 @@ log = logging.getLogger("blackthorn.api")
 router = APIRouter()
 
 MAX_MESSAGE_CHARS = 20_000
-SSE_HEADERS = {"Cache-Control": "no-cache, no-transform", "Connection": "keep-alive", "X-Accel-Buffering": "no"}
+SSE_HEADERS = {"Cache-Control": "no-cache, no-transform", "Connection": "keep-alive", "X-Accel-Buffering": "no", "Content-Encoding": "identity"}
 
 
 @dataclass
@@ -183,7 +183,7 @@ def _sse_bytes(event: Dict[str, Any]) -> bytes:
 async def _sse(run: Run, after: int, heartbeat: float) -> AsyncIterator[bytes]:
     # Force proxy flush + immediately drain pre-emitted events (run.start / thinking).
     yield b"retry: 1000\n\n"
-    yield b": " + (b" " * 2048) + b"\n\n"
+    yield b": " + (b" " * 16384) + b"\n\n"
     await asyncio.sleep(0)
     try:
         for event in list(getattr(run, "events", []) or []):
