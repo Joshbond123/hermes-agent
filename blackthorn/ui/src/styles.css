@@ -381,7 +381,7 @@ body { letter-spacing: -0.01em; }
 
 
 /* stream-reveal — progressive chunks, no typewriter crawl */
-.message[data-role="assistant"][data-live="1"] .md > * {
+.message[data-role="assistant"][data-live="true"] .md > * {
   animation: bt-stream-in 180ms ease-out both;
 }
 @keyframes bt-stream-in {

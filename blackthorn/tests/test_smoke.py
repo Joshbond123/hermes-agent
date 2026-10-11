@@ -16,6 +16,5 @@ async def test_greeting_streams_without_tools(stack):
     assert out.text == "Hello there! How can I help?"
     assert out.end["status"] == "stop"
     assert not out.of("tool.start")
-    # tools were offered to the model, but it chose not to use any
-    assert stack.backend.requests[0]["tools"]
-    assert stack.backend.requests[0]["tool_choice"] == "auto"
+    # a greeting is sent without tool schemas: fewer prompt tokens = faster first token (see agent._tools_for_step)
+    assert "tools" not in stack.backend.requests[0]

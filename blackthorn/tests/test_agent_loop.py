@@ -37,7 +37,8 @@ async def test_streaming_is_incremental_not_buffered(stack):
     assert "text/event-stream" in out.headers["content-type"]
     assert "no-transform" in out.headers["cache-control"]
     assert out.headers.get("x-accel-buffering") == "no"
-    assert "content-encoding" not in out.headers
+    # identity encoding is deliberate: it stops compressing proxies from buffering the event stream
+    assert out.headers.get("content-encoding", "identity") == "identity"
 
 
 async def test_heartbeat_keeps_idle_connection_alive(stack):
@@ -270,19 +271,19 @@ async def test_length_cut_mid_answer_is_continued_not_killed(stack):
     out = await stack.stream({"message": "hello"})
     assert out.end["status"] == "stop"
     assert "Part one of the answer, " in out.text and "and part two finishes it." in out.text
-    assert any("token ceiling" in n["text"] for n in out.of("notice"))
+    assert not any("token ceiling" in n["text"] for n in out.of("notice"))   # continuation is silent by design
     data = await session_messages(stack, out.session_id)
     assert data["messages"][-1]["status"] == "stop"
     assert "Part one of the answer, " in data["messages"][-1]["content"]
 
 
 async def test_repeated_length_cuts_end_honestly_after_the_budget(stack):
-    for _ in range(4):
+    for _ in range(14):
         stack.backend.queue([*say("cut "), finish("length")])
     out = await stack.stream({"message": "hello"})
     assert out.end["status"] == "length"
     assert any("cut off by the model" in n["text"] for n in out.of("notice"))
-    assert len(stack.backend.requests) == 3                                   # 1 + 2 continuations, never a loop
+    assert len(stack.backend.requests) == 13                                  # 1 + 12 continuations (the budget), never a loop
 
 
 async def test_repeated_drops_beyond_the_recovery_budget_end_in_honest_error(stack):
@@ -390,8 +391,16 @@ async def test_stop_cancels_the_backend_generation_and_keeps_the_partial(stack):
 
 
 async def test_cancel_during_tool_execution_marks_the_tool_cancelled(stack):
+    """A cancel must stop the running tool itself (not just the model), finish promptly, and mark the tool cancelled."""
+    seen = {"cancelled_inside_tool": False}
+
     async def slow_exec(*a, **k):
-        await asyncio.sleep(30)
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            seen["cancelled_inside_tool"] = True
+            raise
+        return {"ok": True, "exit_code": 0, "output": "done"}
 
     stack.services.computer.call = slow_exec
     stack.backend.queue([sh("sleep 100", cid="z1"), finish("tool_calls")])
@@ -399,12 +408,18 @@ async def test_cancel_during_tool_execution_marks_the_tool_cancelled(stack):
         async with c.stream("POST", f"{stack.url}/api/chat/stream", json={"message": "sleep"}) as resp:
             from .conftest import Streamed
             got = Streamed()
-            await got.consume(resp, stop_after=4)  # run.start + immediate thinking + connected notice + tool.start
-            assert got.of("tool.start"), "tool must have started before the cancel"
+            # read until the tool has started (the tool itself then runs for 30 s)
+            while not got.of("tool.start"):
+                await got.consume(resp, stop_after=len(got.events) + 1)
             run_id = got.of("run.start")[0]["run_id"]
-            await c.post(f"{stack.url}/api/chat/runs/{run_id}/cancel")
+            t0 = time.perf_counter()
+            r = await c.post(f"{stack.url}/api/chat/runs/{run_id}/cancel")
+            assert r.status_code == 200
             await got.consume(resp)
+            stopped_in = time.perf_counter() - t0
     assert got.end["status"] == "cancelled"
+    assert seen["cancelled_inside_tool"], "the running tool must receive the cancellation, not finish in the background"
+    assert stopped_in < 5, f"cancel took {stopped_in:.1f}s; a running tool must not hold the stop"
     data = await session_messages(stack, got.of("run.start")[0]["session_id"])
     assert data["messages"][-1]["parts"][0]["status"] == "cancelled"
 
@@ -527,7 +542,10 @@ async def test_system_prompt_is_short_and_has_no_keyword_rules(stack):
     assert len(system) < 1400
     for banned in ("NEVER call", "greetings:", "<tool_call>", "AUTONOMY"):
         assert banned not in system
-    schemas = json.dumps(stack.backend.requests[0]["tools"])
+    # a short greeting gets no tool schemas (prefill cost); a real task does
+    stack.backend.queue([*say("Working."), finish("stop")])
+    await stack.stream({"message": "please run a command on the computer and list the files"})
+    schemas = json.dumps(stack.backend.requests[-1]["tools"])
     assert "minLength" not in schemas and "maximum" not in schemas       # validation-only keys stay server-side
 
 

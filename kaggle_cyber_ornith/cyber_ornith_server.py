@@ -732,8 +732,15 @@ def start_ollama_daemon(ollama_bin: str) -> None:
     env["OLLAMA_ORIGINS"] = "*"
     env["OLLAMA_KEEP_ALIVE"] = "-1"
     env["OLLAMA_MODELS"] = PERSIST_MODELS_DIR
-    # GPU split: the model engine may never touch GPU 1 — that card belongs to the agent computer.
-    env["CUDA_VISIBLE_DEVICES"] = "0"
+    # Engine placement. The model is the only thing this engine serves, and it needs both T4s: the 27B Q4_K_M
+    # weights (~17.5 GB) do not fit on one 15 GB T4. Pinning the daemon to GPU 0 left ~23% of the weights in system
+    # RAM and GPU 1 idle, which measured ~3 tokens/s. Spread the layers across both cards instead.
+    env.pop("CUDA_VISIBLE_DEVICES", None)
+    env["OLLAMA_SCHED_SPREAD"] = "1"
+    # The Modelfile's num_ctx only applies to models created from it. A registry pull (the fallback path) ran at
+    # 4096 tokens while the agent budgets for DEFAULT_NUM_CTX, so set the window for every model the daemon loads.
+    env["OLLAMA_CONTEXT_LENGTH"] = str(DEFAULT_NUM_CTX)
+    env["OLLAMA_NUM_PARALLEL"] = str(OLLAMA_NUM_PARALLEL)
     subprocess.Popen([ollama_bin, "serve"], env=env,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for _ in range(60):
