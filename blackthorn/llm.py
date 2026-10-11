@@ -93,6 +93,7 @@ async def stream_chat(route: Route, messages: List[Dict[str, Any]], *, client: h
                       tools: Optional[List[Dict[str, Any]]] = None, idle_timeout: float = 150.0,
                       first_byte_timeout: float = 45.0,
                       connect_timeout: float = 20.0, temperature: Optional[float] = None,
+                      max_tokens: Optional[int] = None,
                       extra: Optional[Dict[str, Any]] = None) -> AsyncIterator[Dict[str, Any]]:
     """Yield normalised events: content | reasoning | tool | finish | usage.
 
