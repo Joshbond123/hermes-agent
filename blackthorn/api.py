@@ -246,35 +246,25 @@ async def chat_stream(body: StreamRequest, request: Request):
             begin = await s.store.begin_regeneration(body.session_id or "", model=route.model, history_limit=cfg.history_messages)
             model_text = begin["user_text"]
         else:
-            # Stream-first: open SSE before DB/GPU so the UI is never blank for ~10s.
-            async def _generate():
-                yield b"retry: 1000\n\n"
-                yield b": " + (b" " * 16384) + b"\n\n"
-                yield b"data: {\"seq\":0,\"type\":\"thinking\",\"state\":\"start\"}\n\n"
-                try:
-                    attachments = await _stage_attachments(s, body.attachments) if body.attachments else []
-                    model_text = prompts.user_message_with_attachments(text, attachments)
-                    begin = await s.store.begin_user_message(body.session_id, text, attachments=attachments or None)
-                    memories, system = await asyncio.gather(s.memories(), s.user_prompt())
-                except NotFound:
-                    yield b"data: {\"seq\":0,\"type\":\"error\",\"code\":\"not_found\",\"message\":\"That conversation no longer exists.\"}\n\n"
-                    return
-                except Exception as exc:
-                    log.error("could not start turn: %s", exc)
-                    yield b"data: {\"seq\":0,\"type\":\"error\",\"code\":\"turn_start_failed\",\"message\":\"Could not start the turn. Try again.\"}\n\n"
-                    return
-                run = s.runs.create(begin["session_id"], begin["assistant_uid"])
-                run.emit("run.start", run_id=run.id, session_id=begin["session_id"], assistant_id=begin["assistant_uid"],
-                         model=s.settings.model)
-                run.emit("thinking", state="start")
-                agent = Agent(run=run, deps=s, session_id=begin["session_id"], user_message=model_text,
-                              history=prompts.history_from_rows(begin["history_rows"]),
-                              system_prompt=system, memories=memories)
-                s.runs.start_agent(run, agent.execute())
-                async for event in run.subscribe(after=0, heartbeat=cfg.heartbeat_s):
-                    yield b": ping\n\n" if event is None else _sse_bytes(event)
+            attachments = await _stage_attachments(s, body.attachments) if body.attachments else []
+            display = [{"name": a["name"], "chars": a["chars"], "workspace_path": a["workspace_path"]} for a in attachments]
+            begin = await s.store.begin_turn(body.session_id, text, model=route.model, attachments=display or None,
+                                             history_limit=cfg.history_messages)
+            model_text = prompts.user_message_with_attachments(text, attachments)
+    except NotFound:
+        raise _err(404, "not_found", "That conversation no longer exists.")
+    except ValueError as exc:
+        raise _err(422, "invalid", str(exc))
+    except Exception as exc:
+        log.error("could not start turn: %s", exc)
+        raise _err(502, "storage_unavailable", "Could not save your message (history storage is unavailable). Nothing was sent; try again.")
 
-            return StreamingResponse(_generate(), media_type="text/event-stream", headers=SSE_HEADERS)
+    run = s.runs.create(begin["session_id"], begin["assistant_uid"])
+    run.emit("run.start", run_id=run.id, session_id=begin["session_id"], assistant_id=begin["assistant_uid"],
+             user_id=begin.get("user_uid"), model=route.model, session=begin["session"], created=begin["created"])
+    agent = AgentRun(run, s.deps(), system=system, history=begin["history"], user_message=model_text, model=route.model)
+    run.task = asyncio.create_task(agent.execute(), name=f"blackthorn-{run.id}")
+    return StreamingResponse(_sse(run, 0, cfg.heartbeat_s), media_type="text/event-stream", headers=SSE_HEADERS)
 
 
 @router.get("/api/chat/runs/{run_id}/events")
