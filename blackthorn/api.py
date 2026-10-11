@@ -181,12 +181,22 @@ def _sse_bytes(event: Dict[str, Any]) -> bytes:
 
 
 async def _sse(run: Run, after: int, heartbeat: float) -> AsyncIterator[bytes]:
-    # A closed connection only stops *this* iterator; the run itself keeps going until it finishes or is cancelled.
-    # Force proxies (Render/Cloudflare) to flush immediately: comment retry + 2KB padding.
+    # Force proxy flush + immediately drain pre-emitted events (run.start / thinking).
     yield b"retry: 1000\n\n"
     yield b": " + (b" " * 2048) + b"\n\n"
+    await asyncio.sleep(0)
+    try:
+        for seq, event in list(getattr(run, "_log", []) or []):
+            if seq > after:
+                after = seq
+                yield _sse_bytes(event)
+    except Exception:
+        pass
     async for event in run.subscribe(after=after, heartbeat=heartbeat):
         yield b": ping\n\n" if event is None else _sse_bytes(event)
+
+
+
 
 
 async def _stage_attachments(s: Services, items: List[AttachmentIn]) -> List[Dict[str, Any]]:
