@@ -235,3 +235,21 @@ def test_fleet_watchdog_does_not_resurrect_a_user_stopped_computer(monkeypatch):
     assert d1._role_intended_online("computer") is True
     # The startup watchdog must use the same guard, not just this helper.
     assert "if _d1._role_intended_online(role):" in (Path(__file__).parents[1] / "app.py").read_text()
+
+
+def test_watchdog_reuses_live_backup_instead_of_interrupting_computer(monkeypatch):
+    from blackthorn import fleet as fm
+    accounts = [fm.Account("p", "bad", "computer", "primary"),
+                fm.Account("b", "good", "computer", "backup")]
+    def fake_rpc(self, account, method, body=None):
+        if method == "GetKernelSessionStatus" and account.user == "b":
+            return {"status": "RUNNING"}
+        raise AssertionError("existing backup must not be re-pushed or stopped")
+    monkeypatch.setattr(fm, "accounts_from_env", lambda env: accounts)
+    monkeypatch.setattr(fm.FleetManager, "find_role_kernel", lambda self, account: (
+        {"slug": "b/blackthorn-computer-b", "title": "Blackthorn computer (b)"} if account.user == "b" else None))
+    monkeypatch.setattr(fm.FleetManager, "rpc", fake_rpc)
+    monkeypatch.setattr(d1, "_role_intended_online", lambda role: True)
+    monkeypatch.setattr(d1, "_fleet_role_online", lambda role: True)
+    out = d1.failover_fleet_role("computer", "primary", "backup")
+    assert out["status"] == "already_online" and out["account"] == "b"

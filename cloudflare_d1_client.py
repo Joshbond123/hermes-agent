@@ -1767,6 +1767,18 @@ def failover_fleet_role(role: str, from_slot: str, to_slot: str) -> Dict[str, An
     if new is None:
         return {"ok": False, "error": "no account for the new active slot"}
     out: Dict[str, Any] = {"role": role, "from": from_slot, "to": to_slot, "account": new.user}
+    # A Render restart forgets its in-memory active slot. If the desired backup
+    # already hosts the public healthy role, do NOT re-push it (that would stop
+    # an active agent task just because the primary account's key is invalid).
+    try:
+        existing = fleet.find_role_kernel(new)
+        if existing and _fleet_role_online(role):
+            slug = str(existing.get("slug") or "").split("/")[-1]
+            session = fleet.rpc(new, "GetKernelSessionStatus", {"userName": new.user, "kernelSlug": slug})
+            if str(session.get("status") or "").upper() == "RUNNING":
+                return {**out, "ok": True, "status": "already_online", "slug": existing["slug"]}
+    except Exception as exc:
+        logger.info("failover reuse probe unavailable: %s", type(exc).__name__)
 
     # 1) bring the pair as close as possible before switching (computer state only)
     if role == "computer" and old is not None and from_slot == "primary":
