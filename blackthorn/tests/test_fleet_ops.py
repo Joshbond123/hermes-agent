@@ -101,6 +101,7 @@ def test_failover_syncs_state_before_booting_the_backup(ops):
     try:
         import unittest.mock as mock
         with mock.patch.object(_d, "_role_intended_online", lambda role: True), \
+             mock.patch.object(_d, "_role_boot_in_progress", lambda role: False), \
              mock.patch.object(FleetManager, "start_kernel", fake_start), \
              mock.patch.object(FleetManager, "rpc",
                                lambda self, account, method, body=None: order.append(f"{method}:{account.user}") or {"ok": True}):

@@ -1747,6 +1747,20 @@ def _role_intended_online(role: str) -> bool:
         return False
 
 
+def _role_boot_in_progress(role: str) -> bool:
+    """A recent queued boot is not a reason to push a competing notebook version."""
+    try:
+        row_id = "computer" if role == "computer" else "primary"
+        rows = d1_query("SELECT status, updated_at FROM kaggle_gpu_state WHERE id=? LIMIT 1;", [row_id])
+        row = rows[0] if rows else {}
+        return (str(row.get("status") or "").upper() in {
+            "BOOTING_KAGGLE_GPU", "CHECKING_ENVIRONMENT", "INSTALLING_DEPS",
+            "STARTING_GATEWAY", "TUNNEL_ONLINE", "DOWNLOADING_MODEL", "WARMING_GPU"}
+                and time.time() - float(row.get("updated_at") or 0) < 900)
+    except (OSError, ValueError, RuntimeError, urllib.error.URLError):
+        return True   # fail closed when D1 cannot prove that boot is stale
+
+
 def failover_fleet_role(role: str, from_slot: str, to_slot: str) -> Dict[str, Any]:
     """Execute a failover the fleet engine decided: sync state, boot the new active, retire the old.
 
@@ -1760,6 +1774,8 @@ def failover_fleet_role(role: str, from_slot: str, to_slot: str) -> Dict[str, An
     if not _role_intended_online(role):
         return {"ok": False, "status": "skipped_off", "role": role,
                 "reason": "role intentionally stopped or control-plane state unavailable"}
+    if _role_boot_in_progress(role):
+        return {"ok": False, "status": "already_booting", "role": role}
     accounts = accounts_from_env(os.environ)
     fleet = FleetManager(accounts)
     old = fleet.by_slot.get((role, from_slot))
@@ -1787,6 +1803,10 @@ def failover_fleet_role(role: str, from_slot: str, to_slot: str) -> Dict[str, An
         except Exception as exc:  # noqa: BLE001
             out["sync"] = {"ok": False, "error": str(exc)[:160]}
 
+    # The user may have shut this role down while the dataset mirror was running.
+    # Re-check immediately before any chargeable Kaggle kernel push.
+    if not _role_intended_online(role):
+        return {**out, "ok": False, "status": "skipped_off"}
     # 2) boot the new active (this is when the backup starts running)
     row_id = "computer" if role == "computer" else "primary"
     try:

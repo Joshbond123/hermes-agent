@@ -132,7 +132,7 @@ def create_app(settings: Optional[Settings] = None, *, services: Optional[Servic
                                     # A watchdog on Render startup sees "primary" as its
                                     # initial slot. Invalid primary credentials must not
                                     # resurrect a user-stopped backup computer/model.
-                                    if _d1._role_intended_online(role):
+                                    if _d1._role_intended_online(role) and not _d1._role_boot_in_progress(role):
                                         _d1.failover_fleet_role(role, before, st.active)
                                     else:
                                         log.info("fleet %s switched standby slot without booting an off role", role)

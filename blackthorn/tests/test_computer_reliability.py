@@ -234,7 +234,7 @@ def test_fleet_watchdog_does_not_resurrect_a_user_stopped_computer(monkeypatch):
     monkeypatch.setattr(d1, "d1_query", lambda sql, params=None: [{"status": "HEARTBEAT_ONLINE"}])
     assert d1._role_intended_online("computer") is True
     # The startup watchdog must use the same guard, not just this helper.
-    assert "if _d1._role_intended_online(role):" in (Path(__file__).parents[1] / "app.py").read_text()
+    assert "_d1._role_boot_in_progress(role)" in (Path(__file__).parents[1] / "app.py").read_text()
 
 
 def test_watchdog_reuses_live_backup_instead_of_interrupting_computer(monkeypatch):
@@ -250,6 +250,13 @@ def test_watchdog_reuses_live_backup_instead_of_interrupting_computer(monkeypatc
         {"slug": "b/blackthorn-computer-b", "title": "Blackthorn computer (b)"} if account.user == "b" else None))
     monkeypatch.setattr(fm.FleetManager, "rpc", fake_rpc)
     monkeypatch.setattr(d1, "_role_intended_online", lambda role: True)
+    monkeypatch.setattr(d1, "_role_boot_in_progress", lambda role: False)
     monkeypatch.setattr(d1, "_fleet_role_online", lambda role: True)
     out = d1.failover_fleet_role("computer", "primary", "backup")
     assert out["status"] == "already_online" and out["account"] == "b"
+
+
+def test_queued_boot_is_not_restarted_by_the_failover_watchdog(monkeypatch):
+    monkeypatch.setattr(d1, "d1_query", lambda sql, params=None: [{"status": "BOOTING_KAGGLE_GPU", "updated_at": time.time()}])
+    assert d1._role_boot_in_progress("computer")
+    assert d1.failover_fleet_role("computer", "primary", "backup")["status"] == "already_booting"
