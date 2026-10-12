@@ -30,8 +30,12 @@ class Settings:
     # ---- model context budget (MUST match the Kaggle engine window: QWEN38_NUM_CTX, default 8192) ----
     # When these disagree the engine rejects long steps (ContextOverflow) and the run
     # thrashes on trimming — one of the real causes of mid-task interruptions.
+    # completion_reserve is what is kept free for the answer *inside* that same window
+    # (llama.cpp budgets n_ctx = prompt + prediction). 4096 (the old default) left only ~2k tokens
+    # for tool schemas + system + history, which silently truncated the conversation after a couple
+    # of turns; 2048 doubles the usable history and a hit-the-limit answer is continued seamlessly.
     context_tokens: int = field(default_factory=lambda: _int("BLACKTHORN_CONTEXT_TOKENS", 8192))
-    completion_reserve_tokens: int = field(default_factory=lambda: _int("BLACKTHORN_COMPLETION_RESERVE", 4096))
+    completion_reserve_tokens: int = field(default_factory=lambda: _int("BLACKTHORN_COMPLETION_RESERVE", 2048))
     chars_per_token: float = 3.2  # conservative for English + code
 
     # ---- agent loop limits ----------------------------------------------------------------
@@ -43,6 +47,8 @@ class Settings:
     max_calls_per_step: int = field(default_factory=lambda: _int("BLACKTHORN_MAX_CALLS_PER_STEP", 16))  # concurrency
     max_repeat_calls: int = 2          # identical (tool, args) executions allowed per run
     max_malformed_calls: int = 8
+    # Bounded continuation nudges when the model stops while its own task list is still open.
+    max_completion_nudges: int = field(default_factory=lambda: _int("BLACKTHORN_COMPLETION_NUDGES", 3))
     run_timeout_s: float = field(default_factory=lambda: _float("BLACKTHORN_RUN_TIMEOUT", 14400.0))
 
     # ---- network timeouts -----------------------------------------------------------------

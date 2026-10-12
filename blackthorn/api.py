@@ -20,7 +20,7 @@ from .agent import AgentRun, Deps
 from .route import RouteError, RouteResolver
 from .runs import Run, RunManager
 from .store import ChatStore, NotFound
-from .tools import ToolError, ToolRegistry
+from .tools import TaskBoard, ToolError, ToolRegistry
 
 log = logging.getLogger("blackthorn.api")
 router = APIRouter()
@@ -262,7 +262,21 @@ async def chat_stream(body: StreamRequest, request: Request):
     run = s.runs.create(begin["session_id"], begin["assistant_uid"])
     run.emit("run.start", run_id=run.id, session_id=begin["session_id"], assistant_id=begin["assistant_uid"],
              user_id=begin.get("user_uid"), model=route.model, session=begin["session"], created=begin["created"])
-    agent = AgentRun(run, s.deps(), system=system, history=begin["history"], user_message=model_text, model=route.model)
+    # The session's task list is restored before the run starts, so a follow-up ("continue"), a restart
+    # or a compacted context all resume the same plan instead of restarting it.
+    board = await TaskBoard.load(s.store, begin["session_id"])
+    if board.items and not board.is_open():
+        # The previous plan is finished: drop it so a new request is not steered by a stale list.
+        # The evidence of what ran is not lost — it lives in each turn's execution ledger.
+        board.write([], merge=False)
+        await board.save()
+    resume_hint = ""
+    if begin.get("previous_attempt"):
+        resume_hint = ("The previous answer to this request was discarded by the user. Steps it had already run are "
+                       "listed above: do not repeat them unless a check shows they failed.")
+    agent = AgentRun(run, s.deps(), system=system, history=begin["history"], user_message=model_text, model=route.model,
+                     turns=begin.get("turns"), board=board, previous_attempt=begin.get("previous_attempt"),
+                     resume_hint=resume_hint)
     run.task = asyncio.create_task(agent.execute(), name=f"blackthorn-{run.id}")
     return StreamingResponse(_sse(run, 0, cfg.heartbeat_s), media_type="text/event-stream", headers=SSE_HEADERS)
 

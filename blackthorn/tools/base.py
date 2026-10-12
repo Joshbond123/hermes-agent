@@ -149,6 +149,7 @@ class ToolContext:
     tavily: Any
     session_id: str = ""
     run_id: str = ""
+    board: Any = None              # the run's TaskBoard (persistent task list); None outside a run
 
 
 Handler = Callable[[Dict[str, Any], ToolContext], Awaitable[ToolResult]]

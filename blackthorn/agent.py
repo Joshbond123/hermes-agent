@@ -36,6 +36,19 @@ LENGTH_CONTINUE_NOTE = ("Your reply was cut off by the model's output token limi
 CONTINUE_NOTE = ("Your previous reply was cut off by a network error before it finished. Continue exactly from the "
                  "end of that reply: do not repeat any text that was already written, just finish the thought.")
 
+# Server-generated notes. They are appended as user messages because that is what the wire protocol
+# needs, but they are NOT user intent: the last *real* user message always outranks them for history
+# protection and for the model's sense of what was asked (upstream issue #14665).
+GATE_NOTE = ("[server] Some items on your task list are still open. Continue with the next one now, using tools. "
+             "Do not repeat a step already marked completed. If you really cannot continue, say exactly what is "
+             "blocking you instead of reporting success.")
+RESUME_NOTE = ("[server] The earliest part of this turn was compacted to fit the model's context window. "
+               "Keep working from the tool results above until the user's request is genuinely complete, then "
+               "report only what the recorded results show.")
+NOTE_PREFIXES = (FINALIZE_NOTE[:40], LENGTH_CONTINUE_NOTE[:40], CONTINUE_NOTE[:40], GATE_NOTE[:40], RESUME_NOTE[:40],
+                 prompts.COMPACT_HEADER[:40])
+GATE_STEPS = 6                      # extra steps a run may spend on the completion gate
+
 
 class ThinkFilter:
     """Split streamed content into visible text and ``<think>…</think>`` text without ever swallowing normal text.
@@ -107,15 +120,33 @@ class RunFailure(Exception):
 
 class AgentRun:
     def __init__(self, run: Run, deps: Deps, *, system: str, history: List[Dict[str, str]], user_message: str,
-                 model: str = "", flush_interval: float = 1.5):
+                 model: str = "", flush_interval: float = 1.5, turns: Optional[List[Dict[str, Any]]] = None,
+                 board: Any = None, previous_attempt: Optional[Dict[str, Any]] = None, resume_hint: str = ""):
         self.run, self.deps = run, deps
         self.system, self.history, self.user_message = system, history, user_message
+        # Rich history: every stored turn with its finish status and the ledger of what its tools really
+        # did. Falls back to the plain role/content history for callers that do not pass it.
+        self.turns: List[Dict[str, Any]] = list(turns) if turns is not None else [
+            {"role": m.get("role"), "content": m.get("content") or "", "status": "", "ledger": []} for m in (history or [])]
+        self.board = board                                  # persistent task list (TaskBoard)
+        self.previous_attempt = previous_attempt            # ledger of a discarded regenerate attempt
+        self.resume_hint = resume_hint
         self.model = model
         self.parts: List[Dict[str, Any]] = []
+        self.ledger: List[Dict[str, Any]] = []              # what ran in THIS turn, in completion order
+        self._epoch = 0                                     # bumped by a successful write
+        # A re-run after a real change is legitimate (edit, then re-run the tests), but the same call
+        # must not be repeatable for ever: the lifetime cap stops a loop that keeps re-running one
+        # command and calling each attempt "new work".
+        self._repeat_total_cap = max(4, int(deps.settings.max_repeat_calls) * 4)
+        self._nudges = 0
+        self._state_cache = ""
+        self._messages: List[Dict[str, Any]] = []
         self.tool_calls_total = 0
         self.strikes = 0
         self.malformed = 0
-        self.seen: Dict[Tuple[str, str], int] = {}
+        self.seen: Dict[Tuple[str, str, int], int] = {}
+        self.seen_total: Dict[Tuple[str, str], int] = {}   # lifetime cap per (tool, args), all epochs
         self.steps = 0
         self.usage = {"prompt": 0, "completion": 0}
         self.finish_reason: Optional[str] = None
@@ -170,7 +201,122 @@ class AgentRun:
     async def _persist(self, status: str, error: Optional[Dict[str, Any]] = None) -> None:
         await self.deps.store.update_assistant(
             self.run.assistant_uid, text=self.text(), parts=self.parts, status=status, meta=self._meta(status, error),
-            tokens=self.usage["completion"] or None)
+            tokens=self.usage["completion"] or None, ledger=list(self.ledger))
+
+    async def _flush_now(self) -> None:
+        """Force a save (used after each tool batch so a restart resumes from real results)."""
+        try:
+            if self._flush_task and not self._flush_task.done():
+                await asyncio.shield(self._flush_task)
+            else:
+                await self._safe_flush()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("tool-batch save failed: %s", exc)
+
+    # ------------------------------------------------------------------ memory / task state
+    def _prior_steps(self, limit: int = 8) -> List[Dict[str, Any]]:
+        """The most recent ledger entries from earlier turns of this session.
+
+        Kept in the state layer so "what is already done" survives even when the turn that did it has
+        been compacted out of the history tail.
+        """
+        out: List[Dict[str, Any]] = []
+        for turn in reversed(self.turns):
+            for entry in reversed(turn.get("ledger") or []):
+                if not isinstance(entry, dict):
+                    continue
+                out.append(entry)
+                if len(out) >= limit:
+                    return list(reversed(out))
+        return list(reversed(out))
+
+    def _state_block(self) -> str:
+        """Ephemeral machine-generated state layer, injected per API call (Hermes does the same)."""
+        todos = self.board.read() if self.board is not None else []
+        return prompts.task_state_block(goal=self.user_message, todos=todos, ledger=self.ledger,
+                                        prior_steps=self._prior_steps(),
+                                        previous_attempt=self.previous_attempt, resume_hint=self.resume_hint)
+
+    def _system_content(self) -> str:
+        block = self._state_block()
+        return f"{self.system}\n\n{block}" if block else self.system
+
+    def _sync_state(self) -> None:
+        """Refresh the injected state in place; unchanged state leaves the prompt prefix untouched."""
+        if not self._messages:
+            return
+        content = self._system_content()
+        if content != self._state_cache:
+            self._state_cache = content
+            self._messages[0] = {"role": "system", "content": content}
+
+    def _force_compact(self) -> None:
+        """The server rejected a prompt our estimator thought fitted: shrink it for real.
+
+        Two passes — whole tool groups / whole turns at half the current estimate, then (because the
+        estimator is the thing that was wrong) literally drop the oldest half of the unprotected
+        messages. The system prompt and the user's real request always survive.
+        """
+        cpt = self.deps.settings.chars_per_token
+        msgs = self._messages
+        if len(msgs) < 3:
+            return
+        protect = sorted(self._protected_indices())
+        prompts.shrink_tool_messages(msgs, int(prompts.estimate_messages(msgs, cpt) * 0.5), cpt, protect=protect)
+        removable = [i for i in range(1, len(msgs)) if i not in set(self._protected_indices())]
+        if removable:
+            for i in sorted(removable[:max(1, len(removable) // 2)], reverse=True):
+                msgs.pop(i)
+        prompts._sanitize_pairs(msgs)
+
+    def _protected_indices(self) -> List[int]:
+        """Indices compaction must never drop: the system prompt and the user's real request(s)."""
+        out = {0}
+        for i in range(len(self._messages) - 1, 0, -1):
+            msg = self._messages[i]
+            if msg.get("role") != "user":
+                continue
+            content = (msg.get("content") or "").strip()
+            if any(content.startswith(p) for p in NOTE_PREFIXES if p):
+                continue                                    # a server note is expendable
+            out.add(i)
+            break
+        return sorted(out)
+
+    def _emit_unfinished(self, status: str) -> None:
+        """Tell the user (and the next turn) when the plan did not finish. Never silent."""
+        if self.board is None or status not in ("stop", "length"):
+            return
+        pending = self.board.pending()
+        if not pending:
+            return
+        listing = "; ".join(f"{i['id']}: {prompts.one_line(i.get('content') or '', 60)}" for i in pending[:4])
+        self.run.emit("notice", level="warn",
+                      text=f"This response ended with {len(pending)} unfinished task(s): {listing}. "
+                           "Ask me to continue and I will resume from here.")
+
+    def _continuation_note(self) -> Optional[str]:
+        """Ask the model to keep going while its own task list still has open items."""
+        s = self.deps.settings
+        if self.board is None or self._nudges >= int(getattr(s, "max_completion_nudges", 3)):
+            return None
+        if self.tool_calls_total >= s.max_tool_calls or self.strikes >= 3:
+            return None
+        pending = self.board.pending()
+        if not pending:
+            return None
+        self._nudges += 1
+        listing = "\n".join(f"- {i['id']}: {prompts.one_line(i.get('content') or '', 90)} [{i.get('status')}]"
+                            for i in pending[:8])
+        return f"{GATE_NOTE}\nStill open:\n{listing}\nUpdate the list with todo_list as each one finishes."
+
+    def _finalize_note(self) -> str:
+        pending = self.board.pending() if self.board is not None else []
+        if not pending:
+            return FINALIZE_NOTE
+        listing = "\n".join(f"- {i['id']}: {prompts.one_line(i.get('content') or '', 80)}" for i in pending[:8])
+        return (FINALIZE_NOTE + f"\nThese items are still open: \n{listing}\n"
+                "Say plainly which of them are not done and why. Do not imply they were completed.")
 
     def _maybe_flush(self) -> None:
         now = time.monotonic()
@@ -222,6 +368,8 @@ class AgentRun:
                 self.run.emit("error", **error)
             if status == "length":
                 self.run.emit("notice", level="warn", text="The answer was cut off by the model's context/token limit.")
+            # Honest close-out: an unfinished plan is reported as unfinished, not as success.
+            self._emit_unfinished(status)
             saved = True
             try:
                 if self._flush_task and not self._flush_task.done():
@@ -240,9 +388,15 @@ class AgentRun:
 
     # ------------------------------------------------------------------ the loop
     def _tools_for_step(self, step: int):
-        """Omit tool schemas on tiny chit-chat to cut prefill latency."""
+        """Omit tool schemas on tiny chit-chat to cut prefill latency.
+
+        Only the very first turn of a brand-new conversation can lose its tools: on a follow-up such as
+        "continue", "yes" or "do it" the model must still be able to act on the work in progress.
+        """
         if not self._schemas:
             return None
+        if self._history_len or (self.board is not None and self.board.is_open()):
+            return self._schemas
         text = (self.user_message or "").strip().lower()
         if step <= 1 and len(text) < 48:
             keys = ("run", "file", "search", "code", "install", "browse", "skill", "computer",
@@ -254,12 +408,19 @@ class AgentRun:
     async def _loop(self) -> None:
         s = self.deps.settings
         cpt = s.chars_per_token
-        messages: List[Dict[str, Any]] = [{"role": "system", "content": self.system}]
-        used = prompts.estimate_tokens(self.system, cpt) + prompts.estimate_tokens(self.user_message, cpt) + 24
-        history = prompts.fit_history(self.history, self._budget - self._schema_cost - used, cpt)
+        messages: List[Dict[str, Any]] = [{"role": "system", "content": self._system_content()}]
+        self._state_cache = messages[0]["content"]
+        used = prompts.estimate_tokens(messages[0]["content"], cpt) + prompts.estimate_tokens(self.user_message, cpt) + 24
+        # Head (the session's opening request) + a budgeted tail of whole turns + a server-built summary
+        # of whatever does not fit — Hermes' context layout, instead of a silent newest-first truncation.
+        history, dropped, _summary = prompts.compile_history(self.turns, self._budget - self._schema_cost - used, cpt)
         messages += history
         self._history_len = len(history)
+        if dropped:
+            self.run.emit("notice", level="info",
+                          text=f"Earlier turns were summarised to fit the model window ({dropped} compacted).")
         messages.append({"role": "user", "content": self.user_message})
+        self._messages = messages
 
         force_final = False
         empty_retries = 0
@@ -273,10 +434,10 @@ class AgentRun:
                 reason = ("repeated identical tool calls" if self.strikes >= 3 else
                           "invalid tool arguments" if self.malformed >= s.max_malformed_calls else "the tool-call limit")
                 self.run.emit("notice", level="warn", text=f"Stopped using tools ({reason}); writing the answer from what was gathered.")
-                messages.append({"role": "user", "content": FINALIZE_NOTE})
-            result = await self._model_step(messages, None if force_final else self._tools_for_step(self.steps))
+                self._messages.append({"role": "user", "content": self._finalize_note()})
+            result = await self._model_step(self._messages, None if force_final else self._tools_for_step(self.steps))
             if result.calls and not force_final:
-                await self._run_tools(result, messages)
+                await self._run_tools(result, self._messages)
                 continue
             if not result.text.strip() and empty_retries < 1:
                 # The model produced nothing visible (an intermittent quirk: reasoning, then stop). Nothing was shown or
@@ -288,8 +449,20 @@ class AgentRun:
                 # Silent seamless continuation — never show a token-ceiling notice to the user.
                 length_continues += 1
                 if result.text.strip():
-                    messages.append({"role": "assistant", "content": result.text})
-                messages.append({"role": "user", "content": LENGTH_CONTINUE_NOTE})
+                    self._messages.append({"role": "assistant", "content": result.text})
+                self._messages.append({"role": "user", "content": LENGTH_CONTINUE_NOTE})
+                continue
+            # Completion gate: a stop with open tasks is not a finished task. Give the model a bounded
+            # number of chances to continue instead of letting it declare victory over a half-done plan.
+            note = self._continuation_note()
+            if note is not None and self.steps < s.max_steps + GATE_STEPS:
+                open_count = len(self.board.pending()) if self.board is not None else 0
+                self.run.emit("notice", level="info",
+                              text=f"{open_count} task(s) from the list are still open — continuing instead of stopping.")
+                if result.text.strip():
+                    self._messages.append({"role": "assistant", "content": result.text})
+                self._messages.append({"role": "user", "content": note})
+                self.steps += 1
                 continue
             self.finish_reason = result.finish or "stop"
             self._last_step_text = result.text
@@ -308,39 +481,22 @@ class AgentRun:
             attempt += 1
             self._check()
             budget = self._budget - (self._schema_cost if tools else 0)
-            if not prompts.shrink_tool_messages(messages, budget, s.chars_per_token):
-                # Last resort: keep system + latest user only and continue (do not force a new chat).
-                if len(messages) > 2:
-                    messages[:] = [messages[0], messages[-1]]
-                    self.run.emit(
-                        "notice",
-                        level="info",
-                        text="Earlier turns were compacted so this conversation can continue in the model window.",
-                    )
-                    if not prompts.shrink_tool_messages(messages, budget, s.chars_per_token):
-                        raise RunFailure(
-                            "context_full",
-                            "This single message is too large for the model window even after compaction. "
-                            "Shorten the message or clear attachments and try again.",
-                            True,
-                        )
-                    # Mid-task resume after compaction (Hermes-style).
-                    if messages and messages[-1].get("role") == "tool":
-                        messages.append({
-                            "role": "user",
-                            "content": (
-                                "Continue the task from the last tool result. "
-                                "Do not stop to summarize progress unless the user asked. "
-                                "Call tools as needed until the user request is complete."
-                            ),
-                        })
-                else:
-                    raise RunFailure(
-                        "context_full",
-                        "This single message is too large for the model window even after compaction. "
-                        "Shorten the message or clear attachments and try again.",
-                        True,
-                    )
+            self._sync_state()
+            before = len(messages)
+            if not prompts.shrink_tool_messages(messages, budget, s.chars_per_token,
+                                                protect=self._protected_indices()):
+                raise RunFailure(
+                    "context_full",
+                    "This single message is too large for the model window even after compaction. "
+                    "Shorten the message or clear attachments and try again.",
+                    True,
+                )
+            if len(messages) < before:
+                self.run.emit("notice", level="info",
+                              text="Earlier turns were compacted so this conversation can continue in the model window.")
+                # Mid-task resume after compaction (Hermes-style): the model must not answer from a hole.
+                if messages[-1].get("role") == "tool":
+                    messages.append({"role": "user", "content": RESUME_NOTE})
             route = await self.deps.resolver.get()
             self.model = route.model
             self._produced = False
@@ -352,17 +508,21 @@ class AgentRun:
             try:
                 return await self._consume(route, messages, tools)
             except ContextOverflow:
-                # The server's window is smaller than our estimate. 1st: drop prior history. 2nd: clip tool output hard.
+                # The server's window is smaller than our estimate, so the server wins: compact for real
+                # (whole tool groups first, then whole turns) and keep the user's request. Nothing is
+                # silently deleted, and a summary of what was dropped replaces it wherever possible —
+                # Hermes' contract: compact and continue, never restart the session.
                 if attempt >= 3:
                     raise
-                if attempt == 1 and self._history_len:
-                    del messages[1: 1 + self._history_len]
-                    self._history_len = 0
-                else:
+                if attempt >= 2:
                     for m in messages:
                         if m.get("role") == "tool" and len(m["content"]) > 400:
                             m["content"] = m["content"][:400] + "\n[… clipped to fit the context window …]"
-                self.run.emit("notice", level="info", text="The conversation was too long for the model window; trimmed it and retried.")
+                self._force_compact()
+                self.run.emit("notice", level="info",
+                              text="The conversation was too long for the model window; trimmed and compacted it, then retried.")
+                if messages[-1].get("role") == "tool":
+                    messages.append({"role": "user", "content": RESUME_NOTE})
                 continue
             except LLMError as exc:
                 # Transport faults (edge timeout 524, dropped tunnel, stalled stream) are not
@@ -489,7 +649,8 @@ class AgentRun:
         messages.append({"role": "assistant", "content": step.text or "", "tool_calls": wire_calls})
 
         ctx = ToolContext(settings=s, store=self.deps.store, computer=self.deps.computer, http=self.deps.http,
-                          tavily=self.deps.tavily, session_id=self.run.session_id, run_id=self.run.id)
+                          tavily=self.deps.tavily, session_id=self.run.session_id, run_id=self.run.id,
+                          board=self.board)
         # Every call the model asked for is executed — none are ever dropped or skipped.
         # max_calls_per_step bounds *concurrency* (protects the GPU computer from a stampede),
         # not how much work a step may do. Each call reports its result the moment it finishes
@@ -509,14 +670,20 @@ class AgentRun:
                 return ToolResult.failure(f"invalid arguments for {name}: {parse_error}", hint="Send valid JSON arguments.")
             if self.deps.registry.get(name) is None:
                 return await self.deps.registry.run(name, args, ctx)
-            key = (name, json.dumps(args, sort_keys=True, default=str))
+            # Duplicate suppression is keyed on (tool, args, epoch): the epoch advances whenever a
+            # write/exec succeeds, so a legitimate re-run after a real change (edit a file, then run the
+            # tests again) is allowed, while a stuck loop on an unchanged world is still stopped.
+            key = (name, json.dumps(args, sort_keys=True, default=str), self._epoch)
             async with seen_lock:
                 count = self.seen.get(key, 0)
-                if count >= s.max_repeat_calls:
+                total = self.seen_total.get(key[:2], 0)
+                if count >= s.max_repeat_calls or total >= self._repeat_total_cap:
                     return ToolResult.failure(
-                        f"duplicate call suppressed: {name} was already run with these exact arguments {count} times",
+                        f"duplicate call suppressed: {name} was already run with these exact arguments "
+                        f"{max(count, total)} times",
                         hint="Use the earlier result in the conversation to answer, or try different arguments.")
                 self.seen[key] = count + 1
+                self.seen_total[key[:2]] = total + 1
             async with sem:
                 return await self.deps.registry.run(name, args, ctx)
 
@@ -573,6 +740,25 @@ class AgentRun:
                 raise
             except Exception as exc:  # a tool bug must never kill the run
                 result = ToolResult.failure(f"{type(exc).__name__}: {exc}")
+            # The execution ledger: what ran, with which arguments, and what came back. It is the only
+            # evidence of work, so it is written before the model ever sees the result and is persisted
+            # with the message — the model's later claims are checked against it, not trusted.
+            try:
+                preview = json.dumps(loads_args(call["args"]), ensure_ascii=False, sort_keys=True, default=str)
+            except ValueError:
+                preview = str(call.get("args") or "")
+            self.ledger.append({
+                "n": part["name"], "a": redact(preview)[:400], "ok": bool(result.ok),
+                "s": "ok" if result.ok else "error",
+                "e": redact(str(result.error or ""))[:300],
+                "o": redact(str((result.data or {}).get("output") or ""))[:200] if result.ok else "",
+            })
+            # Only a write advances the epoch. A shell command that fails the same way five times is the
+            # classic stuck loop, so exec does not refill the repeat budget on its own; re-running a
+            # command after a *file change* is verification, and that stays allowed.
+            spec = self.deps.registry.get(call["name"])
+            if result.ok and spec is not None and spec.kind == "write":
+                self._epoch += 1      # the world changed: re-running the same call is now meaningful
             err = str(result.error or "")
             if err.startswith("invalid arguments") or err.startswith("unknown tool"):
                 self.malformed += 1
@@ -588,3 +774,6 @@ class AgentRun:
         for call, _part, _t in pending:
             messages.append({"role": "tool", "tool_call_id": call["id"],
                              "content": contents.get(call["id"], "ERROR: tool produced no result")})
+        # Flush now: the ledger + parts must be durable before the model's next step, so a restart or a
+        # crash resumes from results that really happened instead of an empty turn.
+        await self._flush_now()

@@ -26,6 +26,7 @@ from .sql import Result, SqlError, Statement, dumps
 KIND = "bt.v1"
 STREAMING = "streaming"
 TERMINAL = ("stop", "length", "cancelled", "error", "interrupted")
+TODO_KEY = "bt_todo:"          # state_meta key prefix for a session's persisted task list
 
 SQLITE_SCHEMA: Tuple[str, ...] = (
     """CREATE TABLE IF NOT EXISTS sessions (
@@ -94,6 +95,35 @@ def _parse_meta(raw: Any) -> Dict[str, Any]:
         return data if isinstance(data, dict) else {}
     except (TypeError, ValueError):
         return {}
+
+
+def ledger_from_row(row: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The server-side execution ledger of an assistant row.
+
+    New rows carry an explicit ``ledger`` list (written by the agent as each tool finishes). Rows
+    written before that existed — and rows whose process died mid-batch — still hold their tool parts,
+    so the ledger is rebuilt from them: no historic conversation loses its record.
+    """
+    meta = _parse_meta(row.get("display_metadata")) if row.get("display_kind") == KIND else {}
+    entries = meta.get("ledger")
+    if isinstance(entries, list) and entries:
+        return [e for e in entries if isinstance(e, dict)]
+    out: List[Dict[str, Any]] = []
+    for part in meta.get("parts") or []:
+        if not isinstance(part, dict) or part.get("type") != "tool":
+            continue
+        status = str(part.get("status") or "unknown")
+        out.append({"n": str(part.get("name") or "tool"), "a": str(part.get("args") or ""),
+                    "ok": status == "ok", "s": status, "e": str(part.get("error") or "")[:300],
+                    "o": str(part.get("output") or "")[:200]})
+    return out
+
+
+def _turn_record(row: Dict[str, Any]) -> Dict[str, Any]:
+    """A stored row as the agent needs it: content + how the turn ended + what it actually ran."""
+    status = str(row.get("finish_reason") or "")
+    return {"role": row.get("role"), "content": row.get("content") or "", "status": status,
+            "ledger": ledger_from_row(row) if row.get("role") == "assistant" else []}
 
 
 def message_dict(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -246,9 +276,12 @@ class ChatStore:
         meta_user = dumps({"v": 1, "attachments": attachments}) if attachments else None
         guard = "EXISTS (SELECT 1 FROM sessions WHERE id = ? AND source = ?)"
         stmts: List[Statement] = [
-            # 0: history strictly BEFORE this turn (statements in a batch run in order)
-            ("SELECT role, content FROM messages WHERE session_id = ? AND role IN ('user','assistant') "
-             "AND COALESCE(active,1) = 1 AND COALESCE(finish_reason,'') <> 'streaming' AND COALESCE(content,'') <> '' "
+            # 0: history strictly BEFORE this turn (statements in a batch run in order).
+            # finish_reason + display_metadata come back too: without them the model never learns what
+            # its tools actually did in earlier turns (the root cause of repeated/invented work).
+            ("SELECT role, content, finish_reason, display_kind, display_metadata FROM messages WHERE session_id = ? "
+             "AND role IN ('user','assistant') AND COALESCE(active,1) = 1 "
+             "AND COALESCE(finish_reason,'') <> 'streaming' "
              "ORDER BY id DESC LIMIT ?", [sid, int(history_limit)]),
             # 1: create the session when it does not exist yet
             ("INSERT INTO sessions (id, source, created_source, session_key, display_name, title, title_source, model, "
@@ -277,27 +310,33 @@ class ChatStore:
         out = await self.db.batch(stmts)
         if out[2].changes == 0 or not out[5].rows:
             raise NotFound(sid)
-        history = [{"role": r["role"], "content": r["content"]} for r in reversed(out[0].rows)]
+        rows = list(reversed(out[0].rows))
+        history = [{"role": r["role"], "content": r["content"]} for r in rows if (r["content"] or "").strip()]
+        turns = [_turn_record(r) for r in rows]
         return {"session": _session_dict(out[5].rows[0]), "session_id": sid, "created": created,
-                "user_uid": user_uid, "assistant_uid": asst_uid, "history": history}
+                "user_uid": user_uid, "assistant_uid": asst_uid, "history": history, "turns": turns}
 
     async def begin_regeneration(self, session_id: str, *, model: str, history_limit: int = 24) -> Dict[str, Any]:
         """Replace the last assistant answer: drop it and add a fresh ``streaming`` placeholder."""
         await self.ensure_schema()
         sess = await self.get_session(session_id)  # raises NotFound
         rows = await self.db.query(
-            "SELECT id, role, content FROM messages WHERE session_id = ? AND role IN ('user','assistant') "
-            "AND COALESCE(active,1) = 1 ORDER BY id DESC LIMIT ?", [session_id, int(history_limit) + 2])
+            "SELECT id, role, content, finish_reason, display_kind, display_metadata FROM messages WHERE session_id = ? "
+            "AND role IN ('user','assistant') AND COALESCE(active,1) = 1 ORDER BY id DESC LIMIT ?",
+            [session_id, int(history_limit) + 2])
         ordered = list(rows.rows)  # newest first
         removed = 0
+        previous: Optional[Dict[str, Any]] = None
         if ordered and ordered[0]["role"] == "assistant":
             removed = 1
+            previous = _turn_record(ordered[0])
             ordered = ordered[1:]
         if not ordered or ordered[0]["role"] != "user":
             raise ValueError("nothing to regenerate: the conversation has no user message")
         user_text = ordered[0]["content"] or ""
         history = [{"role": r["role"], "content": r["content"]} for r in reversed(ordered[1:])
                    if (r["content"] or "").strip()]
+        turns = [_turn_record(r) for r in reversed(ordered[1:])]
         now = time.time()
         asst_uid = new_id("m")
         stmts: List[Statement] = []
@@ -311,11 +350,16 @@ class ChatStore:
         await self.db.batch(stmts)
         sess["archived"] = False
         return {"session": sess, "session_id": session_id, "created": False, "user_uid": None,
-                "assistant_uid": asst_uid, "history": history, "user_text": user_text}
+                "assistant_uid": asst_uid, "history": history, "turns": turns, "user_text": user_text,
+                "previous_attempt": previous}
 
     async def update_assistant(self, uid: str, *, text: str, parts: List[Dict[str, Any]], status: str,
-                               meta: Optional[Dict[str, Any]] = None, tokens: Optional[int] = None) -> None:
-        payload = {"v": 1, "parts": parts}
+                               meta: Optional[Dict[str, Any]] = None, tokens: Optional[int] = None,
+                               ledger: Optional[List[Dict[str, Any]]] = None) -> None:
+        payload: Dict[str, Any] = {"v": 1, "parts": parts}
+        if ledger is not None:
+            # Server-side only: message_dict() does not expose it, so the client payload is unchanged.
+            payload["ledger"] = ledger[-200:]
         if meta:
             payload["meta"] = meta
         await self.db.query(
@@ -348,10 +392,31 @@ class ChatStore:
         await self.db.batch([("DELETE FROM state_meta WHERE key = ?", [key]),
                              ("INSERT INTO state_meta (key, value) VALUES (?, ?)", [key, value])])
 
+    # ------------------------------------------------------------------ task state (todo / checkpoint)
+    async def load_todos(self, session_id: str) -> List[Dict[str, Any]]:
+        """Persisted task list for a session (Hermes keeps goals in ``state_meta`` too)."""
+        raw = await self.get_setting(f"{TODO_KEY}{session_id}")
+        if not raw:
+            return []
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            return []
+        return [i for i in data if isinstance(i, dict)] if isinstance(data, list) else []
+
+    async def save_todos(self, session_id: str, items: List[Dict[str, Any]]) -> None:
+        await self.set_setting(f"{TODO_KEY}{session_id}", dumps(items[:256]))
+
     async def list_memories(self, limit: int = 8) -> List[str]:
+        # ``hermes_memories`` is shared with the rest of the Hermes install. Only this product's rows
+        # may reach Blackthorn's prompt: unscoped reads pulled another profile's memories into a chat,
+        # which is exactly the "invented memory / cross-conversation contamination" failure mode.
         res = await self.db.query(
-            "SELECT content FROM hermes_memories WHERE target = 'memory' ORDER BY importance DESC, updated_at DESC LIMIT ?",
-            [int(limit)])
+            "SELECT content FROM hermes_memories WHERE target = 'memory' "
+            "AND COALESCE(user_id,'') IN ('blackthorn', 'default') "
+            "AND (COALESCE(session_id,'') = '' OR session_id LIKE ?) "
+            "ORDER BY importance DESC, updated_at DESC LIMIT ?",
+            [f"{self.source}-%", int(limit)])
         return [str(r.get("content") or "").strip() for r in res.rows if (r.get("content") or "").strip()]
 
     async def add_memory(self, note: str) -> str:
