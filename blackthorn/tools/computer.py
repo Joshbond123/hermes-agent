@@ -9,14 +9,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
-from ..route import Route, RouteError
+from ..route import RouteError
 from .base import ToolContext, ToolError, ToolResult, ToolSpec, clip
 
 log = logging.getLogger("blackthorn.tools.computer")
 
-# Permanent tunnel death codes (refresh URL still helps once).
 DEAD = {404, 410, 521, 522, 523, 530}
-# Recoverable edge/gateway failures during long agent tasks.
 TRANSIENT = {401, 502, 503, 504}
 
 _LAST_COMPUTER_OK: float = 0.0
@@ -27,101 +25,81 @@ def computer_recently_active(window_s: float = 300.0) -> bool:
 
 
 class ComputerClient:
-    """Call the agent computer with dual-channel failover.
+    """Dual-channel computer client: prefer D1 computer row, fall back to model host.
 
-    Preferred order:
-      1) dedicated computer tunnel (D1 id=computer)
-      2) model host /computer/* fallback (D1 id=primary)
-
-    On HTTP 502/503/504 the client invalidates caches, switches channel, and
-    retries with exponential backoff so mid-task tunnel blips do not fail the agent.
+    App wiring: ComputerClient(http, store=store) — store= kwarg is required by app.py.
     """
 
-    def __init__(self, http: httpx.AsyncClient, resolver: Any) -> None:
+    def __init__(self, http: httpx.AsyncClient, store: Any = None, resolver: Any = None) -> None:
         self.http = http
+        self.store = store
         self.resolver = resolver
-        self._cache: Dict[str, Tuple[float, str, str]] = {}  # role -> (ts, url, key)
+        self._cache: Dict[str, Tuple[float, str, str]] = {}
 
     def invalidate(self) -> None:
         self._cache.clear()
-        inv = getattr(self.resolver, "invalidate", None)
-        if callable(inv):
-            try:
-                inv()
-            except Exception:
-                pass
-        inv_c = getattr(self.resolver, "invalidate_computer", None)
-        if callable(inv_c):
-            try:
-                inv_c()
-            except Exception:
-                pass
+
+    async def _from_row(self, row: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+        if not row:
+            return None
+        url = str(row.get("tunnel_url") or row.get("url") or "").rstrip("/")
+        key = str(row.get("api_key") or "")
+        if url and key:
+            return url, key
+        return None
 
     async def _route_for(self, role: str, *, force: bool = False) -> Tuple[str, str]:
         now = time.time()
-        if not force and role in self._cache and (now - self._cache[role][0]) < 20.0:
+        if not force and role in self._cache and (now - self._cache[role][0]) < 15.0:
             _, url, key = self._cache[role]
             return url, key
-        route: Optional[Route] = None
-        if role == "computer":
-            getter = getattr(self.resolver, "get_computer", None)
-            if getter is not None:
-                route = await getter(force=force) if asyncio.iscoroutinefunction(getter) else getter()
-        if route is None:
-            route = await self.resolver.get(force=force)
-        url = str(getattr(route, "base_url", "") or "").rstrip("/")
-        key = str(getattr(route, "api_key", "") or "")
-        if not url:
-            raise RouteError("offline", f"No {role} tunnel URL published.", retryable=True)
-        self._cache[role] = (now, url, key)
-        return url, key
+        pair: Optional[Tuple[str, str]] = None
+        try:
+            if role == "computer" and self.store is not None and hasattr(self.store, "computer_row"):
+                pair = await self._from_row(await self.store.computer_row() or {})
+            if pair is None and self.store is not None and hasattr(self.store, "gpu_row"):
+                pair = await self._from_row(await self.store.gpu_row() or {})
+            if pair is None and self.resolver is not None:
+                if role == "computer" and hasattr(self.resolver, "get_computer"):
+                    route = await self.resolver.get_computer(force=force)
+                else:
+                    route = await self.resolver.get(force=force)
+                url = str(getattr(route, "base_url", "") or "").rstrip("/")
+                key = str(getattr(route, "api_key", "") or "")
+                if url:
+                    pair = (url, key)
+        except RouteError:
+            raise
+        except Exception as exc:
+            log.warning("endpoint resolve (%s): %s", role, exc)
+            pair = None
+        if not pair:
+            raise RouteError("offline", f"No {role} tunnel is published.", retryable=True)
+        self._cache[role] = (now, pair[0], pair[1])
+        return pair
 
-    async def _channels(self) -> List[str]:
-        """Ordered channel list: dedicated computer first when available."""
-        channels = ["computer", "model"]
-        # If get_computer just falls back to model, still try once then model.
-        return channels
-
-    async def post(
-        self,
-        path: str,
-        body: Optional[Dict[str, Any]] = None,
-        *,
-        timeout: float = 60.0,
-    ) -> Dict[str, Any]:
+    async def post(self, path: str, body: Optional[Dict[str, Any]] = None, *, timeout: float = 60.0) -> Dict[str, Any]:
         timeout = max(float(timeout), 60.0)
         http_timeout = timeout + 90.0
         attempts = 10
         last_err: Optional[ToolError] = None
-        channels = await self._channels()
+        channels = ["computer", "model"]
         for attempt in range(1, attempts + 1):
             role = channels[(attempt - 1) % len(channels)]
-            force = attempt > 1
             try:
-                url, api_key = await self._route_for(role, force=force)
+                url, api_key = await self._route_for(role, force=attempt > 1)
             except RouteError as exc:
                 last_err = ToolError("computer_offline", str(exc), retryable=True)
                 await asyncio.sleep(min(0.4 * attempt, 8.0))
                 continue
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Accept": "application/json",
-                
-            }
+            headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
             try:
                 resp = await self.http.request(
-                    "POST",
-                    f"{url}{path}",
-                    headers=headers,
-                    json=body or {},
+                    "POST", f"{url}{path}", headers=headers, json=body or {},
                     timeout=httpx.Timeout(http_timeout, connect=25.0),
                 )
             except httpx.TimeoutException:
-                last_err = ToolError(
-                    "timeout",
-                    f"The remote computer did not answer within {int(timeout)}s.",
-                    retryable=True,
-                )
+                last_err = ToolError("timeout", f"The remote computer did not answer within {int(timeout)}s.", retryable=True)
                 self._cache.pop(role, None)
                 await asyncio.sleep(min(0.5 * (2 ** (attempt - 1)), 15.0))
                 continue
@@ -130,17 +108,10 @@ class ComputerClient:
                 self._cache.pop(role, None)
                 await asyncio.sleep(min(0.5 * (2 ** (attempt - 1)), 15.0))
                 continue
-
             ctype = (resp.headers.get("content-type") or "").lower()
             code = resp.status_code
             if code in TRANSIENT or code in DEAD or "text/html" in ctype:
                 self._cache.pop(role, None)
-                # Force resolver refresh next time
-                if hasattr(self.resolver, "invalidate"):
-                    try:
-                        self.resolver.invalidate()
-                    except Exception:
-                        pass
                 detail = ""
                 try:
                     detail = str((resp.json() or {}).get("detail") or "")[:180]
@@ -148,35 +119,23 @@ class ComputerClient:
                     detail = (resp.text or "")[:120]
                 last_err = ToolError(
                     "offline",
-                    detail
-                    or f"The remote computer tunnel is down (HTTP {code}) via {role}; retrying.",
+                    detail or f"The remote computer tunnel is down (HTTP {code}) via {role}; retrying.",
                     retryable=True,
                 )
-                log.warning(
-                    "computer %s failed HTTP %s on %s (attempt %s/%s)",
-                    path, code, role, attempt, attempts,
-                )
+                log.warning("computer %s HTTP %s on %s attempt %s/%s", path, code, role, attempt, attempts)
                 if attempt >= attempts:
                     raise last_err
                 await asyncio.sleep(min(0.6 * (2 ** (attempt - 1)), 15.0))
                 continue
             if code >= 400:
-                raise ToolError(
-                    "computer_error",
-                    f"Computer returned HTTP {code}: {(resp.text or '')[:300]}",
-                    retryable=code >= 500,
-                )
+                raise ToolError("computer_error", f"Computer returned HTTP {code}: {(resp.text or '')[:300]}", retryable=code >= 500)
             try:
                 global _LAST_COMPUTER_OK
                 data = resp.json()
                 _LAST_COMPUTER_OK = time.time()
                 return data
             except ValueError as exc:
-                raise ToolError(
-                    "computer_error",
-                    f"Computer returned non-JSON: {(resp.text or '')[:200]}",
-                    retryable=False,
-                ) from exc
+                raise ToolError("computer_error", f"Computer returned non-JSON: {(resp.text or '')[:200]}", retryable=False) from exc
         assert last_err is not None
         raise last_err
 
@@ -224,15 +183,7 @@ def tool_specs() -> List[ToolSpec]:
         ToolSpec(
             "run_command",
             "Run a shell command on the remote Kaggle computer workspace.",
-            {
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string"},
-                    "timeout": {"type": "number"},
-                    "cwd": {"type": "string"},
-                },
-                "required": ["command"],
-            },
+            {"type": "object", "properties": {"command": {"type": "string"}, "timeout": {"type": "number"}, "cwd": {"type": "string"}}, "required": ["command"]},
             run_command,
             timeout=300.0,
             describe=lambda a: str(a.get("command") or "")[:80],
