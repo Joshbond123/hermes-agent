@@ -7,7 +7,6 @@ notebook reports it, and which actions are currently sensible.
 """
 
 
-from .tools.computer import computer_recently_active
 
 import asyncio
 import json
