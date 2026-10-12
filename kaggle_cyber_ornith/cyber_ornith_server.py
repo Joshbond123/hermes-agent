@@ -2172,6 +2172,13 @@ def main_computer(started: float) -> None:
                     continue
                 _recover_attempts = 0
                 _next_recover = 0.0
+                # A healthy origin behind the existing tunnel is again routable.
+                # Do not leave D1 on SERVICE_DOWN with an empty URL until the next
+                # 90-second heartbeat; clients must be able to resume immediately.
+                if tunnel_url and _tunnel_answers(tunnel_url):
+                    notify_workspace("HEARTBEAT_ONLINE", tunnel_url=tunnel_url,
+                                     extra={"role": "computer", "service_recovered": True})
+                    _last_heartbeat = now
             else:
                 continue
 
