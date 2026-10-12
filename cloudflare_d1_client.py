@@ -1736,6 +1736,17 @@ def turn_on_fleet(blocking: bool = False) -> Dict[str, Any]:
     return results
 
 
+def _role_intended_online(role: str) -> bool:
+    """Fail closed: quota failover must never reverse a deliberate user shutdown."""
+    row_id = "computer" if role == "computer" else "primary"
+    try:
+        rows = d1_query("SELECT status FROM kaggle_gpu_state WHERE id=? LIMIT 1;", [row_id])
+        status = str((rows[0] if rows else {}).get("status") or "").upper()
+        return bool(status) and status not in ("OFF", "OFFLINE", "GPU_STOPPED_SAVING_QUOTA", "STOPPING_KAGGLE_GPU")
+    except (OSError, ValueError, RuntimeError, urllib.error.URLError):
+        return False
+
+
 def failover_fleet_role(role: str, from_slot: str, to_slot: str) -> Dict[str, Any]:
     """Execute a failover the fleet engine decided: sync state, boot the new active, retire the old.
 
@@ -1746,6 +1757,9 @@ def failover_fleet_role(role: str, from_slot: str, to_slot: str) -> Dict[str, An
                                   mirror_state_dataset, notebook_env_for)
     from blackthorn.kaggle_bundle import build_computer_notebook_text, build_notebook_text
 
+    if not _role_intended_online(role):
+        return {"ok": False, "status": "skipped_off", "role": role,
+                "reason": "role intentionally stopped or control-plane state unavailable"}
     accounts = accounts_from_env(os.environ)
     fleet = FleetManager(accounts)
     old = fleet.by_slot.get((role, from_slot))

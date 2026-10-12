@@ -224,3 +224,14 @@ async def test_explicit_model_only_control_never_targets_computer(monkeypatch):
     result = await gpu.turn_off(role="model")
     assert result["turn_off_ok"] is True
     assert calls == [(True, "user turn-off", ("model",))]
+
+
+def test_fleet_watchdog_does_not_resurrect_a_user_stopped_computer(monkeypatch):
+    from pathlib import Path
+    monkeypatch.setattr(d1, "d1_query", lambda sql, params=None: [{"status": "GPU_STOPPED_SAVING_QUOTA"}])
+    assert d1._role_intended_online("computer") is False
+    assert d1.failover_fleet_role("computer", "primary", "backup")["status"] == "skipped_off"
+    monkeypatch.setattr(d1, "d1_query", lambda sql, params=None: [{"status": "HEARTBEAT_ONLINE"}])
+    assert d1._role_intended_online("computer") is True
+    # The startup watchdog must use the same guard, not just this helper.
+    assert "if _d1._role_intended_online(role):" in (Path(__file__).parents[1] / "app.py").read_text()

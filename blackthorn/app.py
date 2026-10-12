@@ -129,7 +129,13 @@ def create_app(settings: Optional[Settings] = None, *, services: Optional[Servic
                                 log.warning("fleet failover: %s %s -> %s (%s)", role, before, st.active, st.reason)
                                 try:
                                     import cloudflare_d1_client as _d1
-                                    _d1.failover_fleet_role(role, before, st.active)
+                                    # A watchdog on Render startup sees "primary" as its
+                                    # initial slot. Invalid primary credentials must not
+                                    # resurrect a user-stopped backup computer/model.
+                                    if _d1._role_intended_online(role):
+                                        _d1.failover_fleet_role(role, before, st.active)
+                                    else:
+                                        log.info("fleet %s switched standby slot without booting an off role", role)
                                 except Exception:  # noqa: BLE001
                                     log.exception("failover execution failed for %s", role)
                     except Exception:  # noqa: BLE001 - a watchdog must survive anything
