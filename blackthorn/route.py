@@ -41,6 +41,7 @@ class RouteResolver:
 
     def invalidate(self) -> None:
         self._cached = None
+        self._cached_computer = None
 
     async def get(self, *, force: bool = False) -> Route:
         now = time.monotonic()
@@ -67,3 +68,35 @@ class RouteResolver:
             route = Route(url=url, api_key=key, model=str(row.get("model") or self._default_model), status=status)
             self._cached = (now, route)
             return route
+
+
+    async def get_computer(self, *, force: bool = False) -> Route:
+        """Prefer the dedicated computer host; fall back to the model host.
+
+        Computer tools must not share fate with a busy model-only tunnel when a
+        separate computer row exists in kaggle_gpu_state (id='computer').
+        """
+        now = time.monotonic()
+        cached = getattr(self, "_cached_computer", None)
+        if not force and cached and (now - cached[0]) < self._ttl:
+            return cached[1]
+        row: Dict[str, Any] = {}
+        try:
+            if self._store is not None and hasattr(self._store, "computer_row"):
+                row = await self._store.computer_row() or {}
+        except Exception as exc:
+            log.warning("computer_row failed: %s", exc)
+        url = str(row.get("tunnel_url") or row.get("url") or "").rstrip("/")
+        key = str(row.get("api_key") or "")
+        status = str(row.get("status") or "")
+        if url and key:
+            route = Route(base_url=url, api_key=key, model=str(row.get("model") or "computer"),
+                          status=status or "online")
+            self._cached_computer = (now, route)
+            return route
+        # Fallback: model host often exposes /computer/* as well
+        return await self.get(force=force)
+
+    def invalidate_computer(self) -> None:
+        self._cached_computer = None
+
