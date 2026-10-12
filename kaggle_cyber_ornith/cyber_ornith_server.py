@@ -917,6 +917,103 @@ def ollama_model_present() -> bool:
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# Tunnel watchdog: detect dead public URL and relaunch inrok/cloudflared.
+# A 502 on the public edge usually means the tunnel process died while the
+# local uvicorn is still healthy — restart the tunnel without wiping workspace.
+# ---------------------------------------------------------------------------
+_tunnel_watch_stop = threading.Event()
+_tunnel_watch_thread = None
+_tunnel_restart_lock = threading.Lock()
+
+
+def _local_health_ok() -> bool:
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{PORT}/health",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status == 200
+    except Exception:
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{PORT}/healthz", method="GET")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
+
+
+def _public_tunnel_ok(url: str) -> bool:
+    if not url:
+        return False
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            url.rstrip("/") + "/health",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            return resp.status == 200
+    except Exception:
+        try:
+            import urllib.request
+            req = urllib.request.Request(url.rstrip("/") + "/healthz", method="GET")
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                return resp.status < 500
+        except Exception:
+            return False
+
+
+def restart_tunnel_safe(reason: str = "") -> str:
+    """Restart the public tunnel once; never deletes COMPUTER_WORKSPACE."""
+    with _tunnel_restart_lock:
+        print(f"[tunnel-watch] restarting tunnel ({reason})", flush=True)
+        try:
+            url = start_tunnel()
+            print(f"[tunnel-watch] tunnel up: {url}", flush=True)
+            return url
+        except Exception as exc:
+            print(f"[tunnel-watch] restart failed: {exc}", flush=True)
+            return ""
+
+
+def start_tunnel_watchdog(interval_s: float = 45.0) -> None:
+    global _tunnel_watch_thread
+    if _tunnel_watch_thread and _tunnel_watch_thread.is_alive():
+        return
+
+    def _loop() -> None:
+        consecutive_fail = 0
+        while not _tunnel_watch_stop.is_set():
+            try:
+                url = globals().get("PUBLIC_URL") or globals().get("TUNNEL_URL") or ""
+                if not url:
+                    # try env / module state
+                    url = os.environ.get("BLACKTHORN_PUBLIC_URL", "")
+                local_ok = _local_health_ok()
+                if local_ok and url and not _public_tunnel_ok(url):
+                    consecutive_fail += 1
+                    print(f"[tunnel-watch] public URL unhealthy ({consecutive_fail}) url={url[:60]}", flush=True)
+                    if consecutive_fail >= 2:
+                        restart_tunnel_safe("public health failed")
+                        consecutive_fail = 0
+                elif local_ok:
+                    consecutive_fail = 0
+            except Exception as exc:
+                print(f"[tunnel-watch] error: {exc}", flush=True)
+            _tunnel_watch_stop.wait(interval_s)
+
+    _tunnel_watch_thread = threading.Thread(target=_loop, name="tunnel-watch", daemon=True)
+    _tunnel_watch_thread.start()
+    print("[tunnel-watch] started", flush=True)
+
+
 def ensure_llama_server_bin() -> str:
     """Build or reuse a CUDA-enabled llama-server for dual T4."""
     binary = "/tmp/llama-server"
@@ -2267,6 +2364,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    try:
+        start_tunnel_watchdog()
+    except Exception as _tw_exc:
+        print("tunnel watchdog failed to start:", _tw_exc, flush=True)
+
     try:
         main()
     except Exception as exc:  # never leave the dashboard stuck on "starting"

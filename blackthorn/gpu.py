@@ -1,3 +1,4 @@
+from __future__ import annotations
 """GPU control facade: honest, secret-free status + the turn-on / turn-off / auto-off actions.
 
 The heavy lifting (Kaggle API, tunnel health, watchdog, quota) stays in ``cloudflare_d1_client``; this module
@@ -5,7 +6,8 @@ adds what the UI needs to tell the truth: the real boot stage with elapsed time,
 notebook reports it, and which actions are currently sensible.
 """
 
-from __future__ import annotations
+
+from .tools.computer import computer_recently_active
 
 import asyncio
 import json

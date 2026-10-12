@@ -1,326 +1,224 @@
-"""Tools that act on the remote Kaggle computer through the gateway's /computer/* API."""
+"""Tools that act on the remote Kaggle computer through the gateway /computer/* API."""
 
 from __future__ import annotations
 
-import re
-from typing import Any, Dict, Optional
+import asyncio
+import logging
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
-from ..llm import tunnel_headers
-from ..route import RouteError, RouteResolver
+from ..route import RouteError
 from .base import ToolContext, ToolError, ToolResult, ToolSpec, clip
 
-DEAD = {404, 410, 502, 503, 504, 521, 522, 523, 524, 530}
+log = logging.getLogger("blackthorn.tools.computer")
 
-# Commands that could destroy the host or the deployment are refused outright (kept from the original agent).
-DENY_PATTERNS = (
-    r"rm\s+-rf\s+/(\s|$)", r"rm\s+-rf\s+/\*", r"\bmkfs", r"\bdd\s+if=", r"\bshutdown\b", r"\breboot\b",
-    r":\(\)\s*\{", r">\s*/dev/sd", r"chmod\s+-R\s+777\s+/(\s|$)", r"\bmv\s+/(\s|$)", r"kill\s+-9\s+1\b", r"\bkillall5\b",
-    r"(sudo\s+)?rm\s+(-[a-zA-Z]*\s+)*\/(\s|$)",  # wiping the root filesystem, with or without sudo
-)
+# Permanent tunnel death (do not keep retrying the same stale URL forever without refresh).
+DEAD = {404, 410, 521, 522, 523, 530}
+# Recoverable tunnel/gateway failures — refresh endpoint and retry with backoff.
+TRANSIENT = {401, 502, 503, 504}
+
+# Updated on every successful computer call — GPU auto-off consults this.
+_LAST_COMPUTER_OK: float = 0.0
+
+
+def computer_recently_active(window_s: float = 300.0) -> bool:
+    """True if a computer tool succeeded within ``window_s`` seconds."""
+    return _LAST_COMPUTER_OK > 0 and (time.time() - _LAST_COMPUTER_OK) < window_s
 
 
 class ComputerClient:
-    """Talks to the agent's personal computer. A dedicated computer host (id='computer' in
-    kaggle_gpu_state) is preferred; when none is enrolled the model host answers instead."""
+    """HTTP client for the agent's personal computer (Kaggle tunnel).
 
-    def __init__(self, resolver: RouteResolver, http: httpx.AsyncClient, store: Any = None):
-        self._resolver = resolver
-        self._http = http
-        self._store = store
+    A dedicated computer host (id='computer' in kaggle_gpu_state) is preferred; when it is
+    offline the model host may expose /computer/* as a fallback.
+    """
 
-    async def _endpoint(self) -> tuple:
-        if self._store is not None:
+    def __init__(self, http: httpx.AsyncClient, resolver: Any) -> None:
+        self.http = http
+        self.resolver = resolver
+        self._cached_url: Optional[str] = None
+        self._cached_key: Optional[str] = None
+        self._cached_at: float = 0.0
+
+    def invalidate(self) -> None:
+        self._cached_url = None
+        self._cached_key = None
+        self._cached_at = 0.0
+
+    async def _endpoint(self) -> Tuple[str, str]:
+        now = time.time()
+        if self._cached_url and self._cached_key and (now - self._cached_at) < 30.0:
+            return self._cached_url, self._cached_key
+        # Prefer dedicated computer route when resolver supports it.
+        route = None
+        err: Optional[Exception] = None
+        for getter in ("get_computer", "computer", "get"):
+            fn = getattr(self.resolver, getter, None)
+            if fn is None:
+                continue
             try:
-                row = await self._store.computer_row()
-            except Exception:  # noqa: BLE001 - fall back to the model host
-                row = {}
-            url = str(row.get("tunnel_url") or "").rstrip("/")
-            if url.endswith("/v1"):
-                url = url[:-3]
-            key = str(row.get("api_key") or "")
-            status = str(row.get("status") or "").upper()
-            offline = {
-                "", "OFF", "OFFLINE", "GPU_STOPPED_SAVING_QUOTA", "STOPPED", "STOPPING_KAGGLE_GPU",
-                "ERROR", "FAILED", "BOOT_FAILED", "TUNNEL_ERROR", "GPU_UNAVAILABLE",
-            }
-            # Only use the dedicated computer host when it has a live tunnel.
-            if url and key and status not in offline:
-                return url, key
-        route = await self._resolver.get()
-        return route.url, route.api_key
+                route = await fn() if asyncio.iscoroutinefunction(fn) else fn()
+                if route:
+                    break
+            except Exception as exc:
+                err = exc
+                continue
+        if route is None:
+            raise RouteError("offline", f"No computer route available: {err}", retryable=True)
+        url = str(getattr(route, "base_url", None) or getattr(route, "url", "") or "").rstrip("/")
+        key = str(getattr(route, "api_key", None) or getattr(route, "key", "") or "")
+        if not url:
+            raise RouteError("offline", "Computer route has no URL.", retryable=True)
+        self._cached_url, self._cached_key, self._cached_at = url, key, now
+        return url, key
 
-    async def call(self, path: str, payload: Dict[str, Any] | None = None, *, method: str = "POST",
-                   timeout: float = 90.0, idempotent: bool = True) -> Dict[str, Any]:
-        """Call the remote computer through the relay.
-
-        ``idempotent=True`` (reads, info, file reads/writes of whole content): transient timeouts and
-        502/503 are retried with bounded backoff.
-        ``idempotent=False`` (shell commands): once a request may have reached the notebook it is
-        **never** re-sent, because a re-run would execute the command twice. Only a connection that
-        never opened is retried. The caller then gets a clear "may still be running" error and can
-        check the outcome through a background job.
-        """
-        import asyncio
-        # Never let a model-chosen short timeout kill a healthy but busy notebook.
-        timeout = max(45.0, float(timeout))
-        last_err: Optional[Exception] = None
-        attempts = 4
+    async def post(self, path: str, body: Optional[Dict[str, Any]] = None, *, timeout: float = 60.0) -> Dict[str, Any]:
+        timeout = max(float(timeout), 60.0)
+        http_timeout = timeout + 60.0
+        attempts = 8
+        last_err: Optional[ToolError] = None
         for attempt in range(1, attempts + 1):
             try:
-                base_url, api_key = await self._endpoint()
+                url, api_key = await self._endpoint()
             except RouteError as exc:
-                raise ToolError("offline", "The remote computer is offline.", hint=exc.message) from exc
+                raise ToolError("computer_offline", str(exc), retryable=True) from exc
+            headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
             try:
-                resp = await self._http.request(
-                    method, f"{base_url}{path}", json=payload if method == "POST" else None, timeout=timeout,
-                    headers={**tunnel_headers(base_url), "Authorization": f"Bearer {api_key}"})
-            except httpx.ConnectError as exc:
-                self._resolver.invalidate()
-                last_err = ToolError("offline", "Could not reach the remote computer (the tunnel may have stopped).",
-                                     hint="Open the GPU panel and check that the GPU is Ready.")
-                if attempt >= attempts:
-                    raise last_err from exc
-                await asyncio.sleep(min(4.0, 0.5 * attempt))
-                continue
-            except httpx.TimeoutException as exc:
-                last_err = ToolError("timeout", f"The remote computer did not answer within {int(timeout)}s.",
-                                     hint=("The command may still be running on the computer. Start long work as a "
-                                           "background job (run_command with background=true) and poll it with job_status."
-                                           if not idempotent else None))
-                if not idempotent:
-                    self._resolver.invalidate()
-                    raise last_err from exc
-                if attempt >= attempts:
-                    raise last_err from exc
-                self._resolver.invalidate()
-                await asyncio.sleep(min(4.0, 0.6 * attempt))
+                resp = await self.http.request(
+                    "POST",
+                    f"{url}{path}",
+                    headers=headers,
+                    json=body or {},
+                    timeout=httpx.Timeout(http_timeout, connect=20.0),
+                )
+            except httpx.TimeoutException:
+                last_err = ToolError(
+                    "timeout",
+                    f"The remote computer did not answer within {int(timeout)}s.",
+                    retryable=True,
+                )
+                self.invalidate()
+                await asyncio.sleep(min(0.5 * (2 ** (attempt - 1)), 12.0))
                 continue
             except httpx.HTTPError as exc:
-                raise ToolError("network", f"Network error talking to the remote computer: {type(exc).__name__}") from exc
+                last_err = ToolError("network", f"Computer request failed: {exc}", retryable=True)
+                self.invalidate()
+                await asyncio.sleep(min(0.5 * (2 ** (attempt - 1)), 12.0))
+                continue
 
             ctype = (resp.headers.get("content-type") or "").lower()
+            if resp.status_code in TRANSIENT:
+                self.invalidate()
+                last_err = ToolError(
+                    "offline",
+                    f"The remote computer tunnel is down (HTTP {resp.status_code}); retrying.",
+                    retryable=True,
+                )
+                if attempt >= attempts:
+                    raise last_err
+                await asyncio.sleep(min(0.5 * (2 ** (attempt - 1)), 12.0))
+                continue
             if resp.status_code in DEAD or "text/html" in ctype:
-                self._resolver.invalidate()
-                last_err = ToolError("offline", f"The remote computer tunnel is down (HTTP {resp.status_code}).",
-                                     hint="Open the GPU panel and turn the GPU on again if it is not Ready.")
+                self.invalidate()
+                detail = ""
+                try:
+                    detail = str((resp.json() or {}).get("detail") or "")[:180]
+                except Exception:
+                    detail = (resp.text or "")[:120]
+                msg = detail or f"The remote computer tunnel is down (HTTP {resp.status_code})."
+                last_err = ToolError("offline", msg, retryable=True)
                 if attempt >= attempts:
                     raise last_err
-                await asyncio.sleep(min(4.0, 0.5 * attempt))
+                await asyncio.sleep(min(0.5 * (2 ** (attempt - 1)), 12.0))
                 continue
-            if resp.status_code in (401, 403):
-                # Key rotation / multi-worker race: refresh D1 key and retry.
-                self._resolver.invalidate()
-                last_err = ToolError("auth", "The remote computer rejected the access key.",
-                                     hint="Turn the GPU off and on to refresh it.")
-                if attempt >= attempts:
-                    raise last_err
-                await asyncio.sleep(0.4 * attempt)
-                continue
-            try:
-                data = resp.json()
-            except ValueError:
-                raise ToolError("protocol", f"The remote computer returned a non-JSON response (HTTP {resp.status_code}).") from None
             if resp.status_code >= 400:
-                # 502/503 from the relay are transient — retry (reads only; a command may already be running).
-                if not idempotent and resp.status_code in (502, 503, 504):
-                    self._resolver.invalidate()
-                    raise ToolError("timeout", f"The remote computer did not complete the request (HTTP {resp.status_code}).",
-                                    hint="The command may still be running. Check with job_status if it was a background job.")
-                if resp.status_code in (502, 503, 504) and attempt < attempts:
-                    self._resolver.invalidate()
-                    await asyncio.sleep(min(4.0, 0.6 * attempt))
-                    continue
-                raise ToolError("rejected", str(data.get("detail") or data.get("error") or f"HTTP {resp.status_code}")[:300])
-            if not isinstance(data, dict):
-                raise ToolError("protocol", "Unexpected response shape from the remote computer.")
-            return data
-        if last_err:
-            raise last_err
-        raise ToolError("offline", "The remote computer is offline.")
+                raise ToolError(
+                    "computer_error",
+                    f"Computer returned HTTP {resp.status_code}: {(resp.text or '')[:300]}",
+                    retryable=resp.status_code >= 500,
+                )
+            try:
+                global _LAST_COMPUTER_OK
+                data = resp.json()
+                _LAST_COMPUTER_OK = time.time()
+                return data
+            except ValueError as exc:
+                raise ToolError(
+                    "computer_error",
+                    f"Computer returned non-JSON: {(resp.text or '')[:200]}",
+                    retryable=False,
+                ) from exc
+        assert last_err is not None
+        raise last_err
+
+    async def exec(self, command: str, timeout: float = 120.0, cwd: Optional[str] = None) -> Dict[str, Any]:
+        body: Dict[str, Any] = {"command": command, "timeout": int(timeout)}
+        if cwd:
+            body["cwd"] = cwd
+        return await self.post("/computer/exec", body, timeout=timeout)
+
+    async def info(self) -> Dict[str, Any]:
+        return await self.post("/computer/info", {}, timeout=60.0)
 
 
-def _need(data: Dict[str, Any]) -> Dict[str, Any]:
-    if data.get("ok") is False:
-        raise ToolError("failed", str(data.get("error") or data.get("output") or "operation failed")[:400])
-    return data
-
-
-FOREGROUND_MAX_S = 300          # longer work goes to a background job so one HTTP call never has to hold for minutes
-JOBS_DIR = ".blackthorn_jobs"   # relative to the computer workspace root
-JOB_ID = re.compile(r"^bg-[0-9a-f]{10}$")
-
-
-def _deny(cmd: str) -> Optional[ToolResult]:
-    for pat in DENY_PATTERNS:
-        if re.search(pat, cmd, re.I):
-            return ToolResult.failure("refused: the command matches a destructive pattern and was not run",
-                                      hint="Choose a safer command or explain to the user why it cannot be run.",
-                                      data={"kind": "denied"})
-    return None
+async def _client(ctx: ToolContext) -> ComputerClient:
+    client = getattr(ctx, "computer", None)
+    if client is None:
+        raise ToolError("computer_offline", "Computer client is not configured.", retryable=False)
+    return client
 
 
 async def run_command(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
-    cmd = args["command"].strip()
-    refused = _deny(cmd)
-    if refused is not None:
-        return refused
-    requested = int(args.get("timeout_seconds") or 90)
-    if args.get("background") or requested > FOREGROUND_MAX_S:
-        return await _start_background(cmd, args.get("cwd") or ".", ctx)
-    # Floor command timeout: short model-chosen values were the main source of "did not answer" errors.
-    timeout = max(60, requested)
-    data = await ctx.computer.call("/computer/exec",
-                                   {"command": cmd, "timeout_seconds": timeout, "cwd": args.get("cwd") or "."},
-                                   timeout=float(timeout + 60), idempotent=False)
-    out = str(data.get("output") or "")
-    code = data.get("exit_code", -1)
-    body, cut = clip(out, ctx.settings.tool_result_chars, "ends")
+    cmd = str(args.get("command") or "").strip()
+    if not cmd:
+        raise ToolError("bad_args", "command is required")
+    timeout = float(args.get("timeout") or 120)
+    cwd = args.get("cwd")
+    client = await _client(ctx)
+    data = await client.exec(cmd, timeout=timeout, cwd=str(cwd) if cwd else None)
+    code = int(data.get("exit_code") or data.get("code") or 0)
+    out = str(data.get("stdout") or data.get("output") or "")
+    err = str(data.get("stderr") or "")
+    text = out if not err else (out + ("\n" if out else "") + err)
+    text = clip(text, ctx.settings.tool_result_chars, "ends")
     ok = bool(data.get("ok", True)) and code == 0
-    head = f"exit code {code}" + ("" if ok else " (command failed)")
-    ui, _ = clip(out.strip(), ctx.settings.ui_result_chars, "ends")
-    return ToolResult(ok=True, content=f"{head}\n{body}", summary=head, truncated=cut,
-                      data={"exit_code": code, "output": ui, "failed": not ok})
-
-
-async def _start_background(cmd: str, cwd: str, ctx: ToolContext) -> ToolResult:
-    """Run a long command detached on the computer. Output goes to a log file and the exit code to
-    a marker file, so the job survives the agent's HTTP call, a relay drop, or a Render restart."""
-    import shlex
-    import uuid
-    job_id = "bg-" + uuid.uuid4().hex[:10]
-    base = f"{JOBS_DIR}/{job_id}"
-    script = f"#!/usr/bin/env bash\ncd {shlex.quote(cwd)} || exit 97\n{cmd}\n"
-    await ctx.computer.call("/computer/write_file", {"path": f"{base}.sh", "content": script}, idempotent=True)
-    start = (f"mkdir -p {JOBS_DIR} && nohup sh -c 'bash \"$0\"; echo $? > \"$1.exit\"' {base}.sh {base} "
-             f"> {base}.log 2>&1 < /dev/null & echo $! > {base}.pid && echo started")
-    data = await ctx.computer.call("/computer/exec", {"command": start, "timeout_seconds": 60, "cwd": "."},
-                                   timeout=90.0, idempotent=False)
-    if data.get("exit_code", 1) != 0:
-        return ToolResult.failure(f"could not start the background job: {str(data.get('output') or '')[:300]}",
-                                  data={"kind": "failed"})
-    return ToolResult(ok=True, content=(
-        f"Started background job {job_id} on the computer. It keeps running if this step ends. "
-        f"Check it with job_status (job_id={job_id})."),
-        summary=f"background job {job_id} started", data={"job_id": job_id, "state": "RUNNING"})
-
-
-async def job_status(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
-    job_id = str(args.get("job_id") or "").strip()
-    if not JOB_ID.match(job_id):
-        return ToolResult.failure("job_id must look like bg-0123456789", data={"kind": "invalid"})
-    wait = max(0, min(40, int(args.get("wait_seconds") or 0)))
-    base = f"{JOBS_DIR}/{job_id}"
-    check = (f"for i in $(seq 0 {wait}); do "
-             f"if [ -f {base}.exit ]; then break; fi; "
-             f"if [ -f {base}.pid ] && ! kill -0 $(cat {base}.pid) 2>/dev/null; then break; fi; "
-             f"sleep 1; done; "
-             f"if [ -f {base}.exit ]; then echo STATE=EXITED; echo CODE=$(cat {base}.exit); "
-             f"elif [ -f {base}.pid ] && kill -0 $(cat {base}.pid) 2>/dev/null; then echo STATE=RUNNING; "
-             f"else echo STATE=LOST; fi; echo ---; tail -c 4000 {base}.log 2>/dev/null")
-    data = await ctx.computer.call("/computer/exec", {"command": check, "timeout_seconds": 60, "cwd": "."},
-                                   timeout=float(wait + 60), idempotent=True)
-    out = str(data.get("output") or "")
-    state = re.search(r"STATE=(\w+)", out)
-    code = re.search(r"CODE=(-?\d+)", out)
-    state_s = state.group(1) if state else "UNKNOWN"
-    body = out.split("---", 1)[1] if "---" in out else out
-    body, cut = clip(body.strip(), ctx.settings.tool_result_chars, "ends")
-    exit_code = int(code.group(1)) if code else None
-    summary = f"{job_id}: {state_s}" + (f" (exit {exit_code})" if exit_code is not None else "")
-    return ToolResult(ok=True, content=f"{summary}\n{body}", summary=summary, truncated=cut,
-                      data={"job_id": job_id, "state": state_s, "exit_code": exit_code})
-
-
-async def list_files(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
-    data = _need(await ctx.computer.call("/computer/list_files", {"path": args.get("path") or "."}))
-    lines = str(data.get("listing") or "(empty)").splitlines()
-    shown = lines[:80]
-    text = "\n".join(shown) + (f"\n[… {len(lines) - 80} more entries …]" if len(lines) > 80 else "")
-    return ToolResult(ok=True, content=f"{data.get('path')}\n{text}", summary=f"{len(lines)} entries", truncated=len(lines) > 80,
-                      data={"output": "\n".join(lines[:30])})
-
-
-async def read_file(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
-    data = _need(await ctx.computer.call("/computer/read_file", {"path": args["path"]}))
-    text = str(data.get("content") or "")
-    offset, limit = int(args.get("offset") or 0), int(args.get("max_chars") or ctx.settings.tool_result_chars)
-    piece = text[offset: offset + limit]
-    more = len(text) - (offset + len(piece))
-    note = f"\n[… {more} more characters; call again with offset={offset + len(piece)} …]" if more > 0 else ""
-    return ToolResult(ok=True, content=f"{data.get('path')} (characters {offset}-{offset + len(piece)} of {len(text)})\n{piece}{note}",
-                      summary=f"{len(text)} characters", truncated=more > 0, data={"chars": len(text)})
-
-
-async def write_file(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
-    content = args["content"]
-    data = _need(await ctx.computer.call("/computer/write_file", {"path": args["path"], "content": content}))
-    return ToolResult(ok=True, content=f"Wrote {data.get('bytes', len(content.encode()))} bytes to {data.get('path')}",
-                      summary=f"{data.get('bytes', len(content.encode()))} bytes written", data={"bytes": data.get("bytes")})
-
-
-async def fetch_url(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
-    url = args["url"].strip()
-    if not re.match(r"^https?://", url, re.I):
-        return ToolResult.failure("url must start with http:// or https://")
-    data = _need(await ctx.computer.call("/computer/fetch_url", {"url": url}, timeout=60.0))
-    text = str(data.get("text") or "")
-    offset, limit = int(args.get("offset") or 0), int(args.get("max_chars") or ctx.settings.tool_result_chars)
-    piece = text[offset: offset + limit]
-    more = len(text) - (offset + len(piece))
-    note = f"\n[… {more} more characters; call again with offset={offset + len(piece)} to continue …]" if more > 0 else ""
-    return ToolResult(ok=True, content=f"{url} (characters {offset}-{offset + len(piece)} of {len(text)})\n{piece}{note}",
-                      summary=f"{len(text)} characters of text", truncated=more > 0, data={"chars": len(text)})
+    return ToolResult(ok, text or f"(exit {code})", {"exit_code": code})
 
 
 async def computer_info(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
-    data = await ctx.computer.call("/computer/info", method="GET", timeout=60.0)
-    keep = {k: data.get(k) for k in ("hostname", "platform", "python", "gpu", "cuda_available", "disk_free_gb",
-                                      "disk_total_gb", "workspace") if k in data}
-    lines = [f"{k}: {str(v).replace(chr(10), ' + ')}" for k, v in keep.items()]
-    return ToolResult(ok=True, content="\n".join(lines), summary=str(keep.get("gpu") or "online").replace("\n", " + ")[:120], data=keep)
+    client = await _client(ctx)
+    data = await client.info()
+    keys = ("hostname", "cwd", "workspace", "disk_free_gb", "disk_total_gb", "python", "platform")
+    summary = {k: data.get(k) for k in keys if k in data}
+    return ToolResult(True, str(summary or data)[:2000], data if isinstance(data, dict) else {})
 
 
-SCHEMAS = {
-    "run_command": {"type": "object", "properties": {
-        "command": {"type": "string", "minLength": 1, "maxLength": 6000, "description": "bash command"},
-        "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 3600, "default": 60,
-                            "description": "above 300 the command runs as a background job"},
-        "cwd": {"type": "string", "default": ".", "description": "working directory on the computer"},
-        "background": {"type": "boolean", "default": False,
-                       "description": "true for anything that may take minutes (installs, training, scans, servers)"}}, "required": ["command"]},
-    "job_status": {"type": "object", "properties": {
-        "job_id": {"type": "string", "description": "the bg-... id returned by run_command"},
-        "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 40, "default": 0}}, "required": ["job_id"]},
-    "list_files": {"type": "object", "properties": {"path": {"type": "string", "default": ".", "description": "directory"}}},
-    "read_file": {"type": "object", "properties": {
-        "path": {"type": "string", "minLength": 1}, "offset": {"type": "integer", "minimum": 0, "default": 0},
-        "max_chars": {"type": "integer", "minimum": 200, "maximum": 6000}}, "required": ["path"]},
-    "write_file": {"type": "object", "properties": {
-        "path": {"type": "string", "minLength": 1, "maxLength": 300},
-        "content": {"type": "string", "maxLength": 120000}}, "required": ["path", "content"]},
-    "fetch_url": {"type": "object", "properties": {
-        "url": {"type": "string", "minLength": 8, "maxLength": 2000}, "offset": {"type": "integer", "minimum": 0, "default": 0},
-        "max_chars": {"type": "integer", "minimum": 200, "maximum": 6000}}, "required": ["url"]},
-    "computer_info": {"type": "object", "properties": {}},
-}
-
-
-def specs() -> list[ToolSpec]:
+def tool_specs() -> List[ToolSpec]:
     return [
-        ToolSpec("job_status", "Check a background job started by run_command: RUNNING, EXITED (with exit code) or LOST, plus the latest output.",
-                 SCHEMAS["job_status"], job_status, timeout=90.0, describe=lambda a: str(a.get("job_id") or "")),
-        ToolSpec("run_command", "Run a bash command on the remote Linux computer (Python, GPU). Commands over 300s or background=true run as background jobs.",
-                 SCHEMAS["run_command"], run_command, timeout=3660.0, kind="exec", describe=lambda a: f"$ {a.get('command', '')}"),
-        ToolSpec("list_files", "List a remote workspace directory.", SCHEMAS["list_files"], list_files,
-                 timeout=45.0, describe=lambda a: str(a.get("path") or ".")),
-        ToolSpec("read_file", "Read a remote text file (offset to page).", SCHEMAS["read_file"], read_file,
-                 timeout=45.0, describe=lambda a: str(a.get("path") or "")),
-        ToolSpec("write_file", "Write a remote text file.", SCHEMAS["write_file"], write_file,
-                 timeout=60.0, kind="write", describe=lambda a: f"{a.get('path', '')} ({len(str(a.get('content') or ''))} characters)"),
-        ToolSpec("fetch_url", "Open a web page as text (offset to page).", SCHEMAS["fetch_url"], fetch_url,
-                 timeout=75.0, kind="net", describe=lambda a: str(a.get("url") or "")),
-        ToolSpec("computer_info", "Remote computer GPU, disk, OS.", SCHEMAS["computer_info"], computer_info,
-                 timeout=90.0, describe=lambda a: ""),
+        ToolSpec(
+            "run_command",
+            "Run a shell command on the remote Kaggle computer workspace.",
+            {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "timeout": {"type": "number"},
+                    "cwd": {"type": "string"},
+                },
+                "required": ["command"],
+            },
+            run_command,
+            timeout=300.0,
+            describe=lambda a: str(a.get("command") or "")[:80],
+        ),
+        ToolSpec(
+            "computer_info",
+            "Return hostname, workspace path, and disk usage for the remote computer.",
+            {"type": "object", "properties": {}},
+            computer_info,
+            timeout=90.0,
+            describe=lambda a: "",
+        ),
     ]
