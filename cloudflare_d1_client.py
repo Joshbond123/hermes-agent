@@ -604,12 +604,27 @@ def _record_stop_event(source: str, detail: str = "") -> None:
         logger.warning("stop audit not written: %s", type(exc).__name__)
 
 
+def _durable_active_runs() -> Optional[int]:
+    """Fail closed when D1 cannot verify active runs (other Render processes included)."""
+    try:
+        rows = d1_query("SELECT value FROM state_meta WHERE key LIKE 'bt_run:%';")
+        now = time.time()
+        return sum(1 for row in rows if (row.get("value") or "").strip()
+                   and float(json.loads(row["value"]).get("expires") or 0) > now)
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:
+        logger.warning("active run lease check unavailable: %s", type(exc).__name__)
+        return None
+
+
 def _auto_off_stop() -> Dict[str, Any]:
-    """Stop every GPU the controller runs: the fleet (primary and backup accounts) when configured, else the
-    single primary session. Auto-off used to call only the primary path, so a backup GPU kept running."""
+    """Auto-off applies only to model accounts. The computer has an independent lifecycle."""
     from blackthorn.fleet import accounts_from_env
+    leases = _durable_active_runs()
+    if leases is None or leases:
+        return {"model": {"status": "stop_refused", "error": "active run or activity unavailable"}}
     if accounts_from_env(os.environ):
-        return turn_off_fleet(blocking=True, source="auto-off")
+        # Model inactivity must NEVER power off the independently hosted computer.
+        return turn_off_fleet(blocking=True, source="auto-off", roles=("model",))
     return turn_off_kaggle_gpu()
 
 
@@ -724,14 +739,8 @@ def auto_off_decision() -> Dict[str, Any]:
         return decided
     comp = dict(_COMPUTER_ACTIVITY)
     decided["computer_jobs"] = int(comp.get("active_jobs") or 0)
-    if decided["computer_jobs"] > 0:
-        decided["reason"] = f"{decided['computer_jobs']} background job(s) running on the computer"
-        return decided
-    unknown_for = time.time() - float(comp.get("unknown_since") or 0) if not comp.get("known") else 0.0
-    if not comp.get("known") and comp.get("unknown_since") and unknown_for < COMPUTER_ACTIVITY_MAX_UNKNOWN_S:
-        decided["reason"] = (f"computer activity unknown for {unknown_for:.0f}s ({comp.get('error') or 'probe failed'}) "
-                             f"— not stopping until {COMPUTER_ACTIVITY_MAX_UNKNOWN_S:.0f}s")
-        return decided
+    # Computer jobs and reachability are reported, but do not consume model GPU quota.
+    # The computer role is excluded from model auto-off and has its own explicit shutdown.
     remaining = minutes * 60 - snap["idle_seconds"]
     if remaining <= 0:
         decided["should_stop"] = True
@@ -1754,8 +1763,8 @@ def failover_fleet_role(role: str, from_slot: str, to_slot: str) -> Dict[str, An
     return out
 
 
-def turn_off_fleet(blocking: bool = True, source: str = "") -> Dict[str, Any]:
-    """Stop both roles' kernels. Honest per-role result: a row is written GPU_STOPPED only
+def turn_off_fleet(blocking: bool = True, source: str = "", roles: tuple = ("model", "computer")) -> Dict[str, Any]:
+    """Stop requested roles' kernels. Honest per-role result: a row is written GPU_STOPPED only
     after Kaggle confirms; a refused stop is reported stop_failed.
 
     Default is blocking so the API does not report success while kernels are still running.
@@ -1769,10 +1778,28 @@ def turn_off_fleet(blocking: bool = True, source: str = "") -> Dict[str, Any]:
         return turn_off_kaggle_gpu()
     fleet = FleetManager(accounts)
     out: Dict[str, Any] = {}
-    # Save the computer's workspace first (before its tunnel row is cleared below). Best effort, bounded.
-    checkpoint = checkpoint_computer()
+    # Explicit shutdown is refused when a task or a tagged computer job is active, or
+    # activity is unknown. A refused checkpoint likewise MUST NOT discard the computer.
+    # Auto-off only targets model; it does not need (or risk) a computer checkpoint.
+    checkpoint = {"ok": False, "skipped": "computer not targeted"}
+    leases = _durable_active_runs()
+    if leases is None or leases:
+        return {role: {"status": "stop_refused", "error": "active run or activity unavailable"} for role in roles}
+    if "computer" in roles:
+        activity = activity_snapshot()
+        comp = refresh_computer_activity(force=True)
+        if activity["active_tasks"] or not comp.get("known") or int(comp.get("active_jobs") or 0):
+            return {"computer": {"status": "stop_refused", "error": "active or unverified computer work"},
+                    "model": {"status": "stop_refused", "error": "finish or cancel active work first"},
+                    "computer_checkpoint": checkpoint}
+        checkpoint = checkpoint_computer()
+        if not checkpoint.get("ok") and not checkpoint.get("skipped"):
+            return {"computer": {"status": "stop_refused", "error": "workspace checkpoint failed"},
+                    "model": {"status": "stop_refused", "error": "computer state could not be saved"},
+                    "computer_checkpoint": checkpoint}
     targets = []
-    for role in ("model", "computer"):
+    previous = {}
+    for role in roles:
         st = fleet.state[role]
         account = fleet.by_slot.get((role, st.active)) or fleet.by_slot.get((role, "primary"))
         row_id = "computer" if role == "computer" else "primary"
@@ -1780,9 +1807,14 @@ def turn_off_fleet(blocking: bool = True, source: str = "") -> Dict[str, Any]:
             out[role] = {"status": "unconfigured"}
             continue
         out[role] = {"account": account.user, "status": "stopping"}
+        try:
+            found = d1_query("SELECT status, tunnel_url, api_key, model, gpu_info FROM kaggle_gpu_state WHERE id = ? LIMIT 1;", [row_id])
+            previous[role] = found[0] if found else {}
+        except Exception:
+            previous[role] = {}
         # Mark stopping immediately so heartbeats do not look "ready" during the stop.
         try:
-            _write_fleet_row(row_id, "STOPPING_KAGGLE_GPU", tunnel_url="", gpu_info="")
+            _write_fleet_row(row_id, "STOPPING_KAGGLE_GPU", gpu_info="")
         except Exception:
             pass
         targets.append((fleet, account, role, row_id))
@@ -1824,22 +1856,22 @@ def turn_off_fleet(blocking: bool = True, source: str = "") -> Dict[str, Any]:
         # Best-effort Kaggle stops already ran; a denied kernels.get must not leave the
         # computer row mid-stop forever while the session is gone or unreachable.
         for role, row_id in (("model", "primary"), ("computer", "computer")):
-            if role not in out:
+            if role not in roles or role not in out:
                 continue
             st = out[role].get("status")
-            if st in ("stopped", "not_running", "unconfigured", "stop_unverified"):
+            if st in ("stopped", "not_running", "unconfigured"):
                 try:
                     _write_fleet_row(row_id, "GPU_STOPPED_SAVING_QUOTA", tunnel_url="", api_key="", gpu_info="")
                 except Exception:
                     pass
-            elif st == "stop_failed":
-                # Still clear the tunnel so the agent does not route traffic to a dead link.
-                try:
-                    _write_fleet_row(row_id, "GPU_STOPPED_SAVING_QUOTA", tunnel_url="", api_key="", gpu_info="")
-                    out[role]["status"] = "stopped_forced"
-                    out[role]["note"] = (out[role].get("error") or "stop could not be verified; control plane cleared")
-                except Exception:
-                    pass
+            elif st in ("stop_failed", "stop_unverified"):
+                # Never report a failed/unverified stop as OFF. Restore the pre-stop
+                # endpoint so the tunnel can be health checked or recovered.
+                old = previous.get(role) or {}
+                if old:
+                    _write_fleet_row(row_id, old.get("status") or "TUNNEL_ERROR",
+                                     old.get("tunnel_url") or "", old.get("api_key") or "",
+                                     old.get("model") or "Qwen3.8-27B-Uncensored", old.get("gpu_info") or "")
 
     out["computer_checkpoint"] = checkpoint
     if blocking:

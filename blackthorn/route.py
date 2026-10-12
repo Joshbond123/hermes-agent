@@ -59,7 +59,7 @@ class RouteResolver:
         url = str(row.get("tunnel_url") or row.get("url") or "").rstrip("/")
         key = str(row.get("api_key") or "")
         if url and key:
-            route = Route(base_url=url, api_key=key, model=str(row.get("model") or "computer"),
+            route = Route(url=url, api_key=key, model=str(row.get("model") or "computer"),
                           status=str(row.get("status") or "online"))
             self._cached_computer = (now, route)
             return route

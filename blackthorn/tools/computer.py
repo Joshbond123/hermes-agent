@@ -45,10 +45,15 @@ class ComputerClient:
                 "", "OFF", "OFFLINE", "GPU_STOPPED_SAVING_QUOTA", "STOPPED", "STOPPING_KAGGLE_GPU",
                 "ERROR", "FAILED", "BOOT_FAILED", "TUNNEL_ERROR", "GPU_UNAVAILABLE",
             }
-            # Only use the dedicated computer host when it has a live tunnel.
-            if url and key and status not in offline:
-                return url, key
-        route = await self._resolver.get()
+            # Once a computer is enrolled, NEVER silently fall back to the model GPU:
+            # it has a different ephemeral filesystem. A fallback can report success
+            # while writing files to the wrong machine and destroy task continuity.
+            if row:
+                if url and key and status not in offline:
+                    return url, key
+                raise RouteError("computer_offline", "The dedicated computer is offline or recovering; "
+                                 "its workspace has not been replaced. Retry after health is verified.")
+        route = await self._resolver.get()  # legacy single-kernel deployment only
         return route.url, route.api_key
 
     async def call(self, path: str, payload: Dict[str, Any] | None = None, *, method: str = "POST",
@@ -71,7 +76,11 @@ class ComputerClient:
             try:
                 base_url, api_key = await self._endpoint()
             except RouteError as exc:
-                raise ToolError("offline", "The remote computer is offline.", hint=exc.message) from exc
+                last_err = ToolError("offline", "The remote computer is offline or recovering.", hint=exc.message)
+                if attempt >= attempts:
+                    raise last_err from exc
+                await asyncio.sleep(min(8.0, 0.5 * 2 ** min(attempt, 5)))
+                continue
             try:
                 resp = await self._http.request(
                     method, f"{base_url}{path}", json=payload if method == "POST" else None, timeout=timeout,

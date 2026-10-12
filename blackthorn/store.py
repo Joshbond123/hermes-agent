@@ -392,6 +392,9 @@ class ChatStore:
         await self.db.batch([("DELETE FROM state_meta WHERE key = ?", [key]),
                              ("INSERT INTO state_meta (key, value) VALUES (?, ?)", [key, value])])
 
+    async def delete_setting(self, key: str) -> None:
+        await self.db.query("DELETE FROM state_meta WHERE key = ?", [key])
+
     # ------------------------------------------------------------------ task state (todo / checkpoint)
     async def load_todos(self, session_id: str) -> List[Dict[str, Any]]:
         """Persisted task list for a session (Hermes keeps goals in ``state_meta`` too)."""

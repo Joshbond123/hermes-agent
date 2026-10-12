@@ -114,12 +114,11 @@ def ready_primary(monkeypatch):
     return fresh
 
 
-def test_idle_chat_but_busy_computer_is_not_stopped(ready_primary, monkeypatch):
+def test_idle_model_can_shut_down_while_computer_remains_busy(ready_primary, monkeypatch):
     monkeypatch.setattr(d1c, "_COMPUTER_ACTIVITY", {**ready_primary, "active_jobs": 2})
     decision = d1c.auto_off_decision()
-    assert decision["should_stop"] is False
+    assert decision["should_stop"] is True
     assert decision["computer_jobs"] == 2
-    assert "background job" in decision["reason"]
 
 
 def test_idle_everywhere_is_stopped(ready_primary):
@@ -128,15 +127,15 @@ def test_idle_everywhere_is_stopped(ready_primary):
     assert decision["computer_jobs"] == 0
 
 
-def test_unknown_computer_activity_blocks_stop_until_the_bound(ready_primary, monkeypatch):
+def test_unknown_computer_does_not_block_independent_model_stop(ready_primary, monkeypatch):
     now = time.time()
     monkeypatch.setattr(d1c, "_COMPUTER_ACTIVITY", {**ready_primary, "known": False, "fails": 2, "error": "502",
                                                    "unknown_since": now - 60})
     decision = d1c.auto_off_decision()
-    assert decision["should_stop"] is False and "unknown" in decision["reason"]
+    assert decision["should_stop"] is True and decision["computer_jobs"] == 0
     monkeypatch.setattr(d1c, "_COMPUTER_ACTIVITY", {**ready_primary, "known": False, "fails": 40, "error": "502",
                                                    "unknown_since": now - d1c.COMPUTER_ACTIVITY_MAX_UNKNOWN_S - 5})
-    assert d1c.auto_off_decision()["should_stop"] is True   # bounded: an unreachable computer cannot block forever
+    assert d1c.auto_off_decision()["should_stop"] is True   # computer role is not targeted
 
 
 def test_stop_requests_are_audited_with_their_source(monkeypatch):

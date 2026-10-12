@@ -340,13 +340,29 @@ class AgentRun:
             except Exception:  # bookkeeping must never affect a run
                 pass
 
+    async def _lease_heartbeat(self) -> None:
+        """Durable, expiring run lease: shutdown checks other Render workers too."""
+        import json
+        while True:
+            await asyncio.sleep(30)
+            try:
+                await self.deps.store.set_setting("bt_run:" + self.run.id, json.dumps({
+                    "session_id": self.run.session_id, "expires": time.time() + 120}))
+            except Exception as exc:
+                log.warning("run lease refresh failed: %s", type(exc).__name__)
+
     async def execute(self) -> None:
         status, error = "stop", None
         self._activity("run_started")
+        lease = asyncio.create_task(self._lease_heartbeat())
         # Immediate UI feedback: do not wait for GPU connect / prefill before the user sees activity.
         self.run.emit("thinking", state="start")
         self._early_thinking = True
         try:
+            import json
+            # Before any tool executes, D1 must hold a cross-worker shutdown lease.
+            await self.deps.store.set_setting("bt_run:" + self.run.id, json.dumps({
+                "session_id": self.run.session_id, "expires": time.time() + 120}))
             await self._loop()
             status = "length" if self.finish_reason == "length" else "stop"
         except asyncio.CancelledError:
@@ -361,6 +377,18 @@ class AgentRun:
             log.exception("agent run crashed")
             status, error = "error", {"code": "internal", "message": f"{type(exc).__name__}: {str(exc)[:240]}", "retryable": True}
         finally:
+            lease.cancel()
+            try:
+                await lease
+            except asyncio.CancelledError:
+                pass
+            try:
+                if hasattr(self.deps.store, "delete_setting"):
+                    await self.deps.store.delete_setting("bt_run:" + self.run.id)
+                else:
+                    await self.deps.store.set_setting("bt_run:" + self.run.id, "")
+            except Exception:
+                pass   # an expiring lease is safer than a premature shutdown
             for part in self.parts:
                 if part["type"] == "tool" and part.get("status") == "running":
                     part["status"] = "cancelled" if status in ("cancelled", "interrupted") else "error"

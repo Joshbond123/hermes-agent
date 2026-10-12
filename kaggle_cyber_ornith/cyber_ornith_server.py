@@ -254,6 +254,8 @@ def notify_workspace(status: str, tunnel_url: str = "", extra: dict = None) -> N
         pass
     if tunnel_url:
         _LAST_TUNNEL_URL = tunnel_url
+    elif status in ("SERVICE_DOWN", "TUNNEL_ERROR", "BOOT_FAILED", "GPU_STOPPED_SAVING_QUOTA"):
+        _LAST_TUNNEL_URL = ""
     else:
         tunnel_url = _LAST_TUNNEL_URL
     payload = {
@@ -1696,20 +1698,40 @@ def write_gateway() -> str:
     return path
 
 
-def start_gateway() -> None:
+def _computer_gateway_ok(base: str) -> bool:
+    """Check authenticated computer API, not just a TCP port or generic model /health."""
+    if not base:
+        return False
+    req = urllib.request.Request(base.rstrip("/") + "/computer/activity",
+                                 headers={"Authorization": "Bearer " + API_KEY,
+                                          "skip_zrok_interstitial": "true"})
+    try:
+        with urllib.request.urlopen(req, timeout=9) as resp:
+            data = json.loads(resp.read(65536))
+            return resp.status == 200 and isinstance(data.get("active_jobs"), int)
+    except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def start_gateway():
+    """Reuse an authenticated gateway if still alive; otherwise own one process."""
+    if _computer_gateway_ok(f"http://127.0.0.1:{GATEWAY_PORT}"):
+        return None   # existing process; do not start a competing uvicorn
     write_gateway()
-    subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "gateway_server:app", "--host", "0.0.0.0",
-         "--port", str(GATEWAY_PORT), "--log-level", "warning"],
-        cwd="/tmp", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
+    with open("/tmp/blackthorn_computer_gateway.log", "a") as output:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "uvicorn", "gateway_server:app", "--host", "0.0.0.0",
+             "--port", str(GATEWAY_PORT), "--log-level", "warning"],
+            cwd="/tmp", stdout=output, stderr=subprocess.STDOUT,
+        )
     for _ in range(30):
-        try:
-            urllib.request.urlopen(f"http://127.0.0.1:{GATEWAY_PORT}/health", timeout=2)
-            return
-        except Exception:
-            time.sleep(1)
-    raise RuntimeError("Gateway did not come up on port 8000")
+        if _computer_gateway_ok(f"http://127.0.0.1:{GATEWAY_PORT}"):
+            return proc
+        if proc.poll() is not None:
+            break
+        time.sleep(1)
+    proc.terminate()
+    raise RuntimeError("Authenticated computer gateway did not come up on port 8000")
 
 
 TUNNEL_HOSTNAME = (os.environ.get("BLACKTHORN_TUNNEL_HOSTNAME") or "blacktornagent.ing.ng").strip()
@@ -1779,7 +1801,9 @@ def launch_cloudflared(cloudflared_bin: str):
 def _kaggle_cli_env() -> dict:
     env = dict(os.environ)
     env["KAGGLE_USERNAME"] = os.environ.get("KAGGLE_USERNAME") or KAGGLE_USERNAME
-    env["KAGGLE_KEY"] = os.environ.get("KAGGLE_API_TOKEN") or KAGGLE_API_TOKEN
+    # KGAT_ tokens use Bearer auth; KAGGLE_KEY is legacy Basic and causes 401.
+    env["KAGGLE_API_TOKEN"] = os.environ.get("KAGGLE_API_TOKEN") or KAGGLE_API_TOKEN
+    env.pop("KAGGLE_KEY", None)
     return env
 
 
@@ -1818,10 +1842,31 @@ def restore_workspace() -> bool:
     try:
         extracted = os.path.join(archive_dir, "unzipped")
         os.makedirs(extracted, exist_ok=True)
+        def safe_extract(archive, dest):
+            base = os.path.realpath(dest)
+            with zipfile.ZipFile(archive) as zf:
+                for item in zf.infolist():
+                    name = item.filename
+                    path = os.path.realpath(os.path.join(base, name))
+                    if not path.startswith(base + os.sep) or (item.external_attr >> 16) & 0o170000 == 0o120000:
+                        raise ValueError("snapshot contains an unsafe path")
+                    if item.is_dir():
+                        os.makedirs(path, exist_ok=True)
+                    else:
+                        os.makedirs(os.path.dirname(path), exist_ok=True)
+                        with zf.open(item) as inp, open(path, "wb") as out:
+                            shutil.copyfileobj(inp, out)
+
         for name in os.listdir(archive_dir):
             if name.endswith(".zip"):
-                with zipfile.ZipFile(os.path.join(archive_dir, name)) as zf:
-                    zf.extractall(extracted)
+                safe_extract(os.path.join(archive_dir, name), extracted)
+        # Kaggle's --dir-mode zip puts the workspace directory in workspace.zip.
+        # Unpack ONLY this known staging zip, not arbitrary user-created zip files.
+        for name in ("workspace.zip", "blackthorn_workspace.zip"):
+            packed = os.path.join(extracted, name)
+            if os.path.isfile(packed):
+                safe_extract(packed, extracted)
+                os.unlink(packed)
         os.makedirs(COMPUTER_WORKSPACE, exist_ok=True)
         copied = 0
         for root, _dirs, files in os.walk(extracted):
@@ -1852,8 +1897,10 @@ def restore_workspace() -> bool:
 
 # Rebuildable trees stay out of the state dataset: caches, venvs and clones are re-created by the installer
 # from the registry on the next boot. Anything else larger than CHECKPOINT_MAX_FILE_BYTES is also skipped.
-CHECKPOINT_EXCLUDE_DIRS = {"__pycache__", ".git", "node_modules", ".cache", "venv", "security_catalog"}
+CHECKPOINT_EXCLUDE_DIRS = {"__pycache__", ".git", "node_modules", ".cache", "venv", "security_catalog",
+                           ".ssh", ".kaggle", ".aws", "secrets", ".gnupg"}
 CHECKPOINT_EXCLUDE_RELPATHS = {"tools/venv", "tools/home/.cache", "tools/home/go/pkg", "tmp"}
+CHECKPOINT_SECRET_NAMES = {".env", ".env.local", "credentials", "id_rsa", "id_ed25519", "kaggle.json", "access_token"}
 CHECKPOINT_MAX_FILE_BYTES = int(os.environ.get("CHECKPOINT_MAX_FILE_BYTES") or str(512 * 1024 * 1024))
 
 
@@ -1866,11 +1913,67 @@ def _checkpoint_ignore(directory: str, names: list) -> set:
         full = os.path.join(directory, name)
         if name in CHECKPOINT_EXCLUDE_DIRS or child_rel in CHECKPOINT_EXCLUDE_RELPATHS:
             skipped.add(name)
+        elif (os.path.islink(full) or name in CHECKPOINT_SECRET_NAMES or name.endswith((".pem", ".key", ".p12"))):
+            skipped.add(name)
         elif name.endswith((".part", ".partial", ".tmp")) or name == "state.zip":
             skipped.add(name)
         elif os.path.isfile(full) and os.path.getsize(full) > CHECKPOINT_MAX_FILE_BYTES:
             skipped.add(name)
     return skipped
+
+
+def _environment_inventory() -> dict:
+    """Record rebuildable package names, not the container filesystem or credentials."""
+    import importlib.metadata
+    pip = {}
+    for dist in importlib.metadata.distributions():
+        name = dist.metadata.get("Name", "")
+        version = dist.version
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,100}", name) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.+!-]{0,100}", version):
+            pip[name.lower().replace("_", "-")] = version
+    try:
+        result = subprocess.run(["dpkg-query", "-W", "-f", "${binary:Package}\n"],
+                                capture_output=True, text=True, timeout=30)
+        apt = [n for n in result.stdout.splitlines() if re.fullmatch(r"[a-z0-9][a-z0-9.+:-]{0,100}", n)] if result.returncode == 0 else []
+    except (OSError, subprocess.TimeoutExpired):
+        apt = []
+    return {"schema": 1, "pip": pip, "apt": apt}
+
+
+def restore_environment() -> dict:
+    """Install only absent packages after a Kaggle session restart; never replace installed ones."""
+    lock = os.path.join(COMPUTER_WORKSPACE, ".blackthorn", "environment.json")
+    if not os.path.isfile(lock):
+        return {"ok": True, "skipped": "no inventory"}
+    try:
+        with open(lock) as fh:
+            old = json.load(fh)
+        current = _environment_inventory()
+        pip = [f"{name}=={version}" for name, version in old.get("pip", {}).items()
+               if re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,100}", name)
+               and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.+!-]{0,100}", version)
+               and name not in current["pip"]]
+        apt = [name for name in old.get("apt", []) if re.fullmatch(r"[a-z0-9][a-z0-9.+:-]{0,100}", name)
+               and name not in current["apt"]]
+        if len(pip) > 50 or len(apt) > 50:
+            return {"ok": False, "error": "more than 50 missing packages; manual review required",
+                    "pip_missing": len(pip), "apt_missing": len(apt)}
+        failures = []
+        if apt:
+            p = subprocess.run(["apt-get", "update", "-qq"], capture_output=True, timeout=300)
+            if p.returncode == 0:
+                p = subprocess.run(["apt-get", "install", "-y", "-qq", *apt], capture_output=True, timeout=600)
+            if p.returncode:
+                failures.append("apt installation failed")
+        if pip:
+            p = subprocess.run([sys.executable, "-m", "pip", "install", "--no-input", "--disable-pip-version-check", *pip],
+                               capture_output=True, timeout=600)
+            if p.returncode:
+                failures.append("pip installation failed")
+        return {"ok": not failures, "pip_installed": len(pip), "apt_installed": len(apt),
+                "error": "; ".join(failures)}
+    except (OSError, ValueError, TypeError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "error": type(exc).__name__}
 
 
 def checkpoint_workspace(label: str = "") -> dict:
@@ -1881,15 +1984,17 @@ def checkpoint_workspace(label: str = "") -> dict:
     snap = os.path.join(STATE_DIR, "workspace")
     if os.path.isdir(snap):
         shutil.rmtree(snap, ignore_errors=True)
-    shutil.rmtree(snap, ignore_errors=True)
     shutil.copytree(COMPUTER_WORKSPACE, snap, ignore=_checkpoint_ignore, dirs_exist_ok=True)
+    os.makedirs(os.path.join(snap, ".blackthorn"), exist_ok=True)
+    with open(os.path.join(snap, ".blackthorn", "environment.json"), "w") as fh:
+        json.dump(_environment_inventory(), fh)
     generation = int(time.time())
     files = sum(len(f) for _r, _d, f in os.walk(snap))
     json.dump({"generation": generation, "label": label[:80], "files": files, "ts": time.time()},
               open(STATE_MANIFEST, "w"))
     with open(os.path.join(snap, "dataset-metadata.json"), "w") as fh:
         json.dump({"title": "Blackthorn Computer State", "id": STATE_DATASET,
-                   "licenses": [{"name": "other"}]}, fh)
+                   "isPrivate": True, "licenses": [{"name": "other"}]}, fh)
     env = _kaggle_cli_env()
     def _kaggle(args):
         for cmd in (["kaggle", *args], [sys.executable, "-m", "kaggle", *args]):
@@ -1949,15 +2054,7 @@ def _tunnel_answers(public_url: str) -> bool:
     """True when the public tunnel reaches this computer's gateway (any HTTP answer from the gateway is a yes)."""
     if not public_url:
         return False
-    req = urllib.request.Request(public_url.rstrip("/") + "/health",
-                                 headers={"skip_zrok_interstitial": "true"})
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.status == 200
-    except urllib.error.URLError:
-        return False  # includes HTTPError (inrok answers 502 when the tunnel is down)
-    except OSError:
-        return False
+    return _computer_gateway_ok(public_url)
 
 
 
@@ -2009,12 +2106,20 @@ def main_computer(started: float) -> None:
         return
 
     try:
-        restore_workspace()
+        restored = restore_workspace()
+        if restored:
+            env_result = restore_environment()
+            if not env_result.get("ok"):
+                log(f"Environment recovery incomplete: {env_result.get('error')}")
     except Exception as exc:
-        log(f"Persistence restore note: {exc}")
+        log(f"Persistence restore note: {type(exc).__name__}")
 
     notify_workspace("STARTING_GATEWAY", extra={"role": "computer"})
-    start_gateway()
+    try:
+        gateway_proc = start_gateway()
+    except (RuntimeError, OSError) as exc:
+        fail("SERVICE_DOWN", f"computer gateway startup failed: {type(exc).__name__}")
+        return
     try:
         cloudflared_bin = ensure_cloudflared()
     except Exception:
@@ -2026,53 +2131,89 @@ def main_computer(started: float) -> None:
         cf_proc, tunnel_url = launch_cloudflared(cloudflared_bin)
     except Exception:
         tunnel_url = ""
-    if not tunnel_url:
-        fail("TUNNEL_ERROR", "Could not bring up the computer tunnel (no URL and no configured hostname)")
-        return
-    notify_workspace("TUNNEL_ONLINE", tunnel_url=tunnel_url, extra={"role": "computer"})
-    notify_workspace("MODEL_READY_AND_WARMED", tunnel_url=tunnel_url,
-                     extra={"role": "computer", "boot_seconds": round(time.time() - started, 1)})
-    log(f"🖥️  Computer ready in {time.time() - started:.0f}s — workspace {COMPUTER_WORKSPACE}")
+    ready = bool(tunnel_url and _tunnel_answers(tunnel_url))
+    if not ready:
+        fail("TUNNEL_ERROR", "The computer API is not reachable through the public tunnel; recovering")
+        tunnel_url = ""
+    else:
+        notify_workspace("TUNNEL_ONLINE", tunnel_url=tunnel_url, extra={"role": "computer"})
+        notify_workspace("MODEL_READY_AND_WARMED", tunnel_url=tunnel_url,
+                         extra={"role": "computer", "boot_seconds": round(time.time() - started, 1)})
+        log(f"🖥️  Computer ready in {time.time() - started:.0f}s — workspace {COMPUTER_WORKSPACE}")
 
     loop_start = time.time()
     _last_heartbeat = 0.0
     _last_checkpoint = time.time()
     _last_tunnel_probe = 0.0
-    _tunnel_fails = 0
+    _tunnel_fails = 0 if ready else TUNNEL_FAILS_BEFORE_RELAUNCH - 1
+    _next_recover = 0.0
+    _recover_attempts = 0
     while time.time() - loop_start < MAX_RUNTIME_SECONDS:
         time.sleep(15)
         now = time.time()
-        if cf_proc is not None and cf_proc.poll() is not None:
-            log("⚠️ relay exited; restarting")
-            try:
-                cf_proc, tunnel_url = launch_cloudflared(cloudflared_bin)
-            except Exception as exc:
-                log(f"relay restart note: {exc}")
+        # A 502 can mean the *origin* crashed. Fix the service first, and do not
+        # touch the tunnel, environment, or workspace unless the public probe fails.
+        local_ok = _computer_gateway_ok(f"http://127.0.0.1:{GATEWAY_PORT}")
+        if not local_ok:
+            notify_workspace("SERVICE_DOWN", extra={"role": "computer"})
+            if now >= _next_recover:
+                if gateway_proc is not None and gateway_proc.poll() is None:
+                    gateway_proc.terminate()
+                    try:
+                        gateway_proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        gateway_proc.kill()
+                try:
+                    gateway_proc = start_gateway()
+                except (RuntimeError, OSError) as exc:
+                    _recover_attempts += 1
+                    _next_recover = now + min(300, 5 * (2 ** min(_recover_attempts, 6)))
+                    log(f"gateway recovery failed: {type(exc).__name__}; retry at {_next_recover:.0f}")
+                    continue
+                _recover_attempts = 0
+                _next_recover = 0.0
+            else:
+                continue
+
         _answer_checkpoint_request()
-        if now - _last_tunnel_probe >= TUNNEL_PROBE_EVERY_S:
+        if now - _last_tunnel_probe >= 30:
             _last_tunnel_probe = now
-            if _tunnel_answers(tunnel_url):
+            public_ok = bool(cf_proc is None or cf_proc.poll() is None) and _tunnel_answers(tunnel_url)
+            if public_ok:
                 _tunnel_fails = 0
+                _recover_attempts = 0
             else:
                 _tunnel_fails += 1
-                log(f"⚠️ public tunnel did not answer ({_tunnel_fails}/{TUNNEL_FAILS_BEFORE_RELAUNCH}): {tunnel_url}")
+                log(f"public computer API probe failed ({_tunnel_fails}/{TUNNEL_FAILS_BEFORE_RELAUNCH})")
                 if _tunnel_fails >= TUNNEL_FAILS_BEFORE_RELAUNCH:
-                    _tunnel_fails = 0
-                    if cf_proc is not None and cf_proc.poll() is None:
-                        cf_proc.terminate()
+                    notify_workspace("TUNNEL_ERROR", extra={"role": "computer"})
+                    tunnel_url = ""            # never heartbeat or route through a stale URL
+                    if now >= _next_recover:
+                        # One owner (this notebook loop) serializes restarts. Stop the
+                        # old process before launching a replacement, and verify upstream.
+                        if cf_proc is not None and cf_proc.poll() is None:
+                            cf_proc.terminate()
+                            try:
+                                cf_proc.wait(timeout=10)
+                            except subprocess.TimeoutExpired:
+                                cf_proc.kill()
+                        cf_proc = None
                         try:
-                            cf_proc.wait(timeout=10)
-                        except subprocess.TimeoutExpired:
-                            cf_proc.kill()
-                    try:
-                        cf_proc, fresh_url = launch_cloudflared(cloudflared_bin)
-                    except (OSError, RuntimeError, ValueError) as exc:
-                        cf_proc, fresh_url = None, ""
-                        log(f"tunnel relaunch failed: {type(exc).__name__}: {str(exc)[:160]}")
-                    if fresh_url:
-                        tunnel_url = fresh_url
-                        notify_workspace("TUNNEL_ONLINE", tunnel_url=tunnel_url, extra={"role": ROLE, "relaunched": True})
-                        log(f"tunnel relaunched: {tunnel_url}")
+                            candidate, fresh_url = launch_cloudflared(cloudflared_bin)
+                            if not fresh_url or not _tunnel_answers(fresh_url):
+                                if candidate is not None and candidate.poll() is None:
+                                    candidate.terminate()
+                                raise RuntimeError("fresh public endpoint failed computer API probe")
+                            cf_proc, tunnel_url = candidate, fresh_url
+                            _tunnel_fails = 0
+                            _recover_attempts = 0
+                            _next_recover = 0.0
+                            notify_workspace("HEARTBEAT_ONLINE", tunnel_url=tunnel_url,
+                                             extra={"role": "computer", "recovered": True})
+                        except (OSError, RuntimeError, ValueError) as exc:
+                            _recover_attempts += 1
+                            _next_recover = now + min(300, 5 * (2 ** min(_recover_attempts, 6)))
+                            log(f"relay recovery failed: {type(exc).__name__}; retry at {_next_recover:.0f}")
         if now - _last_checkpoint >= CHECKPOINT_INTERVAL_S:
             _last_checkpoint = now
             try:
@@ -2080,11 +2221,18 @@ def main_computer(started: float) -> None:
                 if not result.get("ok"):
                     log(f"Persistence checkpoint FAILED: {result.get('error')}")
             except Exception as exc:
-                log(f"Persistence checkpoint note: {exc}")
-        if now - _last_heartbeat >= 90:
+                log(f"Persistence checkpoint note: {type(exc).__name__}")
+        if tunnel_url and _tunnel_fails == 0 and now - _last_heartbeat >= 90:
             _last_heartbeat = now
             notify_workspace("HEARTBEAT_ONLINE", tunnel_url=tunnel_url,
                              extra={"role": "computer", "uptime": round(now - loop_start, 1)})
+    try:
+        last = checkpoint_workspace("session-limit")
+        if not last.get("ok"):
+            log(f"session limit checkpoint FAILED: {last.get('error')}")
+    except Exception as exc:
+        log(f"session limit checkpoint FAILED: {type(exc).__name__}")
+    notify_workspace("GPU_STOPPED_SAVING_QUOTA", extra={"role": "computer"})
 
 
 def main() -> None:

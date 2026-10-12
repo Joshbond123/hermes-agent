@@ -98,7 +98,9 @@ def test_checkpoint_writes_a_generation_manifest(tmp_path, monkeypatch):
 
     monkeypatch.setattr(srv.subprocess, "run", fake_run)
     out = srv.checkpoint_workspace("test")
-    assert out["ok"] and out["files"] == 1 and out["generation"] > 0
+    assert out["ok"] and out["files"] == 2 and out["generation"] > 0
+    inventory = json.loads((tmp_path / "state" / "workspace" / ".blackthorn" / "environment.json").read_text())
+    assert "pip" in inventory and "apt" in inventory
     assert calls["cmd"][1] in ("datasets",)                          # went through the kaggle CLI
     manifest = json.loads((tmp_path / "state" / "manifest.json").read_text())
     assert manifest["generation"] == out["generation"]

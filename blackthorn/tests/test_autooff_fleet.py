@@ -1,4 +1,4 @@
-"""Auto-off must stop every GPU the controller runs (primary and backup accounts), not only the primary row."""
+"""Model auto-off stops model accounts, but NEVER shuts down the computer role."""
 
 import ast
 from pathlib import Path
@@ -30,17 +30,19 @@ def test_daemon_auto_off_branch_uses_the_fleet_aware_stop():
 
 def test_auto_off_stops_backup_accounts_when_fleet_configured(monkeypatch):
     m = _module()
+    monkeypatch.setattr(m, "_durable_active_runs", lambda: 0)
     calls = []
-    monkeypatch.setattr(m, "turn_off_fleet", lambda blocking=True, source="": calls.append(("fleet", blocking)) or {"ok": True})
+    monkeypatch.setattr(m, "turn_off_fleet", lambda blocking=True, source="", roles=(): calls.append(("fleet", blocking, roles)) or {"ok": True})
     monkeypatch.setattr(m, "turn_off_kaggle_gpu", lambda: calls.append(("single",)) or {"ok": True})
     import blackthorn.fleet as fleet
     monkeypatch.setattr(fleet, "accounts_from_env", lambda env: ["primary-account", "backup-account"])
     m._auto_off_stop()
-    assert calls == [("fleet", True)]
+    assert calls == [("fleet", True, ("model",))]
 
 
 def test_auto_off_uses_the_single_session_when_no_fleet(monkeypatch):
     m = _module()
+    monkeypatch.setattr(m, "_durable_active_runs", lambda: 0)
     calls = []
     monkeypatch.setattr(m, "turn_off_fleet", lambda blocking=True: calls.append(("fleet", blocking)) or {})
     monkeypatch.setattr(m, "turn_off_kaggle_gpu", lambda: calls.append(("single",)) or {"ok": True})

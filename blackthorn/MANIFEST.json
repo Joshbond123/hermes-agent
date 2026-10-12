@@ -1,8 +1,8 @@
 {
  "files": {
   "blackthorn/README.md": "1e131377eab78a706b9185ceddcbaf2c3d61fca5d3dddb470176fa5ff709f21e",
-  "blackthorn/__init__.py": "7348383fb248e4cc3eaf30d0bcf560a9bd9c18c6ad66af96102ad7e69d4d4ed8",
-  "blackthorn/agent.py": "2210f56b9cf5395497bad86f1e5de14fe72e73254854986cd788ca6525e1c484",
+  "blackthorn/__init__.py": "8dfc000af5337644bfb8dc6e7d95dda3f8a867146c9c17b7cc8e3bb28f1e6c03",
+  "blackthorn/agent.py": "a08131c049ea52236ac97fd41cc9ab3af4fcebf28681489c094449239197d359",
   "blackthorn/api.py": "38218c528b20a3bab9e8de9b62a5ec58da42a728bceaad0e249f3364d8f8612e",
   "blackthorn/app.py": "4122e3ba8d6420ae62641257a50788cb47d35aa0ea507a6b966a48ce3f8aa98b",
   "blackthorn/computer_assets/browse.py": "6935fadc3c70d47bc9a4f878baafb1ba1a5640e0a7900128b03357beccafe075",
@@ -10,12 +10,12 @@
   "blackthorn/computer_assets/skillctl.py": "773df12a1f4fc65256b5b590ead5f929598c633c0bc2c90c4187a81f73c725fb",
   "blackthorn/config.py": "77f18840d1234857ed75bcaa700d75682328f2d06e8f88b8e1e9832912be75e8",
   "blackthorn/fleet.py": "bf181165b7dbdcd13e81bf245519b068c548fce6b4f47674a2513adfe157e95b",
-  "blackthorn/gpu.py": "ef84a470a34903dd5f6694e168c39199aae2adb2ca9bd82a849694e9d98f1914",
+  "blackthorn/gpu.py": "d10af66229dfea22ca54ae8dd6bb5a4add383e9145ccfac36aa61e6dc7fbdd1a",
   "blackthorn/kaggle_bundle.py": "f05991c9ef0a3ec9c41231e71021378938a34dba504156d3a202f2b809f8bf92",
   "blackthorn/llm.py": "4aa857ec656e4360a1617723377b611cc69a32fd874549503a1c59d1648d75b8",
   "blackthorn/prompts.py": "41ca33695c2d33d014ad49744ee3dac2400932ee29b6f3bfc160b09c3575819a",
   "blackthorn/relay.py": "4b7a4dc2b7d497f1ebfec38ed34b6bab349a0f06ca6d54f59303732b6ae4ad48",
-  "blackthorn/route.py": "0a97f03898d77c193b2709861e7d9aa148c57cd0cc85f11474c78cfa5974c1c1",
+  "blackthorn/route.py": "d0ead4b982168dafe6a7229f6ec8020003f1bf5dc7440d5148ae88823a6b3d25",
   "blackthorn/runs.py": "ef2d5deb094f9b9c879f80776b104218bb8a1cd4cc0a1ae695bd564c66e650db",
   "blackthorn/skills/authorized-recon-basics/SKILL.md": "093784f63b0e0b3c5716c973a004c2bfe3f0b74588dd479a80d2d8481e15f56a",
   "blackthorn/skills/authorized-recon-basics/references/workflows.md": "ae84babb3722603ef8e46f52f8a76e3cf1ff852d0cfa6003ea38dbe16ba88afc",
@@ -38,18 +38,18 @@
   "blackthorn/static/assets/index-DFRhMYIh.js": "28aaaa71392cc231551120bf8ddf09f1c7f41818088f1ce2b903419a727d21ba",
   "blackthorn/static/build.json": "0ab7899bf42a9c36bfb365625aaf4723a19f1e3e694cdb3b9e79bb23bc104c9b",
   "blackthorn/static/index.html": "71fd5677f5be77d9af48cd351d74d87e455d05065beaccd0a793064c89fb19c1",
-  "blackthorn/store.py": "95eb2948bc09e0081405e0a6f56b18242b033bb9d3f750cc2e2cc23e11ce603a",
+  "blackthorn/store.py": "03aa840bd57966eb94a573bb3a440ca0b026449f708c8a9509123b57ac518180",
   "blackthorn/tools/__init__.py": "c82d32346bd0f44106d7067d47b03006e81abf51bf539fb699fe7256e334ed8a",
   "blackthorn/tools/base.py": "ac6194b6d5f8f28e065e7237d630ddb91deb16b7284cc143d3be57c0ca5f218a",
-  "blackthorn/tools/computer.py": "aeaa6a7ce635894d50f2e9e1ec75f7bca67d9e663b55e5818f351df38455b930",
+  "blackthorn/tools/computer.py": "cea4d064278cca7f95d228ec1fb2568361ecf696693e3b0543414d9aa4481d1f",
   "blackthorn/tools/memory.py": "956b22148dc181ccedfffa80276e94f538c49c273f0780a679d24ad8c4f1766a",
   "blackthorn/tools/security.py": "e0d5d7c37e9012c0660bea104811e4c9ce1b9cd0a26e5070f5426cedc4a52348",
   "blackthorn/tools/task.py": "17bbe9d3b38135d9eb05f3903d02c2ccf8f20fcfcfea06be0b799a1471596dce",
   "blackthorn/tools/web.py": "e98acbf8521a9cd1492aff0eb2a35e89bc97800d0bde5e2215b40df244f084fd",
   "blackthorn/version.py": "5d43f6378622c4ddeeec627755c2e98152f6077be9334b2770c3a8199018bf37",
   "blackthorn_start.py": "d8189febd25f393cc6b41cd17f7cc88d73ecaa44942fa52f51dd310602b108df",
-  "cloudflare_d1_client.py": "48d35158951923cfe615ceda5335fdef1d4d7a9b50a19b9888e831d03b03460a",
-  "kaggle_cyber_ornith/cyber_ornith_server.py": "1176f1fccedeb3fd78ff1b759c2edf91d3172886aafd2487eebee607608e9ff4"
+  "cloudflare_d1_client.py": "207e0130a1ec0817cf65774c5ce24f4a07a634ff12e49ab715a5a3e068c7ef35",
+  "kaggle_cyber_ornith/cyber_ornith_server.py": "bec1c020a2cd308b2ba73df751b2303e4f75b287f6f97b4f5d7cf0090ff36abb"
  },
- "version": "5.1.0"
+ "version": "5.2.0"
 }

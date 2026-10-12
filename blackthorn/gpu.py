@@ -123,7 +123,20 @@ class GpuService:
             if crow:
                 c_status = str(crow.get("status") or "").upper()
                 c_url = str(crow.get("tunnel_url") or "").strip()
-                c_online = c_status in READY and bool(c_url)
+                heartbeat_age = time.time() - float(crow.get("updated_at") or 0)
+                c_online = c_status in READY and bool(c_url) and heartbeat_age < 210
+                if refresh and c_online:
+                    # A process existing at the tunnel provider is not proof of an
+                    # authenticated, working computer API. Probe the actual upstream.
+                    try:
+                        import httpx
+                        async with httpx.AsyncClient(timeout=8.0) as probe:
+                            reply = await probe.get(c_url.rstrip("/") + "/computer/activity",
+                                                    headers={**tunnel_headers(c_url),
+                                                             "Authorization": "Bearer " + str(crow.get("api_key") or "")})
+                            c_online = reply.status_code == 200 and isinstance(reply.json().get("active_jobs"), int)
+                    except (httpx.HTTPError, ValueError, KeyError, TypeError):
+                        c_online = False
                 c_booting = c_status in BOOTING or bool(crow.get("booting"))
                 computer_pub = {
                     "status": c_status,
@@ -133,7 +146,7 @@ class GpuService:
                     "transport": "inrok" if ".share.inrok.in" in c_url else ("relay" if c_url else ""),
                     "display_status": (
                         "Computer Ready" if c_online else
-                        ("Computer Starting" if c_booting else "Computer Offline")
+                        ("Computer Starting" if c_booting else ("Computer Recovering" if c_status in READY else "Computer Offline"))
                     ),
                     "gpu_info": crow.get("gpu_info") or "",
                     "model": crow.get("model") or "",
@@ -206,18 +219,15 @@ class GpuService:
         if hasattr(d1, "turn_off_fleet") and accounts_from_env(os.environ):
             # Blocking stop so the UI does not report offline while the kernel is still up.
             out = await asyncio.to_thread(d1.turn_off_fleet, True, "user turn-off")
-            # Safety net: also run the single-session off path for the primary row.
-            try:
-                await asyncio.to_thread(d1.turn_off_kaggle_gpu)
-            except Exception as exc:  # noqa: BLE001
-                log = __import__("logging").getLogger("blackthorn.gpu")
-                log.warning("legacy turn_off_kaggle_gpu after fleet: %s", exc)
+            # Never call the legacy single-kernel stop after the fleet has refused a
+            # shutdown: that bypasses task and checkpoint protection.
             st = await self.status(refresh=True)
             failed = {role: v for role, v in out.items() if isinstance(v, dict) and v.get("status") == "stop_failed"}
             st["fleet"] = out
-            st["turn_off_ok"] = not failed
-            if failed:
-                reasons = "; ".join(f"{role}: {v.get('error') or 'stop refused'}" for role, v in failed.items())
+            refused = {role: v for role, v in out.items() if isinstance(v, dict) and v.get("status") in ("stop_refused", "stop_unverified")}
+            st["turn_off_ok"] = not failed and not refused
+            if failed or refused:
+                reasons = "; ".join(f"{role}: {v.get('error') or 'stop refused'}" for role, v in {**failed, **refused}.items())
                 st["error"] = (f"Turn-off did not complete: Kaggle did not confirm that the session stopped ({reasons}). "
                                "Check the session on kaggle.com; if it is still running, stop it there, or give the token kernels.delete.")
             return st
