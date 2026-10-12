@@ -316,7 +316,12 @@ class FleetManager:
                     slot.last_error = ""
                 except FleetError as exc:
                     slot.last_error = str(exc)
-                    if slot.remaining_s is None:
+                    # A permanently rejected token cannot host this role. Prefer a
+                    # healthy backup; do not misread transient network errors as
+                    # proof of a dead account and flap between paid sessions.
+                    if "HTTP 401" in slot.last_error or "HTTP 403" in slot.last_error:
+                        slot.healthy = False
+                    elif slot.remaining_s is None:
                         slot.healthy = None
             if backup is None:                        # single-slot role: the primary just runs
                 for account in (primary,):

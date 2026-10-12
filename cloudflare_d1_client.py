@@ -1641,6 +1641,24 @@ def _write_fleet_row(row_id: str, status: str, tunnel_url: str = "", api_key: st
         logger.warning("fleet row write note (%s): %s", row_id, exc)
 
 
+def _fleet_role_online(role: str) -> bool:
+    """Real API probe before a turn-on; a healthy role must not be re-pushed."""
+    try:
+        row_id = "computer" if role == "computer" else "primary"
+        rows = d1_query("SELECT status, tunnel_url, api_key FROM kaggle_gpu_state WHERE id=? LIMIT 1;", [row_id])
+        row = rows[0] if rows else {}
+        if str(row.get("status") or "").upper() not in READY_STATUSES or not row.get("tunnel_url") or not row.get("api_key"):
+            return False
+        if role == "computer":
+            return isinstance(_computer_request("/computer/activity", None, 8).get("active_jobs"), int)
+        url = str(row["tunnel_url"]).rstrip("/")
+        req = urllib.request.Request(url + "/health", headers={"skip_zrok_interstitial": "true"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return resp.status == 200 and resp.headers.get("Content-Type", "").startswith("application/json")
+    except (urllib.error.URLError, OSError, RuntimeError, ValueError, TypeError, KeyError):
+        return False
+
+
 def turn_on_fleet(blocking: bool = False) -> Dict[str, Any]:
     """Start the model GPU and the computer GPU TOGETHER on their fleet-active accounts.
 
@@ -1662,17 +1680,20 @@ def turn_on_fleet(blocking: bool = False) -> Dict[str, Any]:
     fleet = FleetManager(accounts)
     plan: Dict[str, Any] = {}
     for role in ("model", "computer"):
-        st = fleet.decide(role, force=True)
+        reusable = _fleet_role_online(role)
+        st = fleet.decide(role, force=True) if not reusable else fleet.state[role]
         account = fleet.by_slot.get((role, st.active))
-        plan[role] = {"state": st, "account": account}
-    # flip BOTH rows to BOOTING immediately so the controller shows real progress at once
+        plan[role] = {"state": st, "account": account, "reusable": reusable}
+    # Never re-push a live computer when merely turning the model back on.
     for role in ("model", "computer"):
-        if plan[role]["account"] is not None:
+        if plan[role]["account"] is not None and not plan[role]["reusable"]:
             _write_fleet_row("computer" if role == "computer" else "primary", "BOOTING_KAGGLE_GPU",
                              gpu_info=f"Allocating on {plan[role]['account'].user}...")
 
     def boot(role: str) -> Dict[str, Any]:
         st, account = plan[role]["state"], plan[role]["account"]
+        if plan[role]["reusable"]:
+            return {"role": role, "status": "already_online", "account": account.user if account else None}
         if account is None:
             _write_fleet_row("computer" if role == "computer" else "primary", "BOOT_FAILED")
             return {"role": role, "status": "unconfigured"}
@@ -1826,6 +1847,7 @@ def turn_off_fleet(blocking: bool = True, source: str = "", roles: tuple = ("mod
 
     def _stops() -> None:
         seen = set()
+        role_results = {role: [] for role in roles}
         for fleet_, account, role, row_id in targets:
             key = (account.user, role)
             if key in seen:
@@ -1837,20 +1859,27 @@ def turn_off_fleet(blocking: bool = True, source: str = "", roles: tuple = ("mod
                 result = fleet_.stop_kernel_result(account, slug)
             except Exception as exc:  # noqa: BLE001 - reported per role, never hidden
                 result = {"state": "failed", "error": f"{type(exc).__name__}: {str(exc)[:160]}"}
-            if result["state"] in ("stopped", "not_running"):
-                _write_fleet_row(row_id, "GPU_STOPPED_SAVING_QUOTA", tunnel_url="", gpu_info="")
-                # Prefer reporting stopped if any account for the role stopped.
-                if out.get(role, {}).get("status") not in ("stopped",):
-                    out[role]["status"] = "stopped" if result["state"] == "stopped" else "not_running"
-            elif result["state"] == "unverified":
-                out[role]["status"] = "stop_unverified"
-                out[role]["error"] = result.get("error", "")
-                logger.warning("turn-off unverified for %s on %s: %s", role, account.user, result.get("error"))
+            role_results[role].append((account.user, result))
+            if result["state"] in ("failed", "unverified"):
+                logger.warning("turn-off not verified for %s on %s: %s", role, account.user, result.get("error"))
+
+        # A successful stop on one account cannot conceal failure on the other.
+        for role in roles:
+            if role not in out or out[role].get("status") == "unconfigured":
+                continue
+            results = role_results[role]
+            errors = [f"{account}: {result.get('error') or result['state']}" for account, result in results
+                      if result['state'] in ('failed', 'unverified')]
+            if errors:
+                out[role]["status"] = "stop_unverified" if any(result['state'] == 'unverified' for _, result in results) else "stop_failed"
+                out[role]["error"] = "; ".join(errors)[:320]
+            elif any(result['state'] == 'stopped' for _, result in results):
+                out[role]["status"] = "stopped"
+            elif results and all(result['state'] == 'not_running' for _, result in results):
+                out[role]["status"] = "not_running"
             else:
-                if out.get(role, {}).get("status") not in ("stopped", "not_running"):
-                    out[role]["status"] = "stop_failed"
-                    out[role]["error"] = result.get("error", "")
-                logger.error("turn-off refused for %s on %s: %s", role, account.user, result.get("error"))
+                out[role]["status"] = "stop_unverified"
+                out[role]["error"] = "no verified stop result"
 
         # Always finalize control-plane rows so the UI cannot stay stuck on STOPPING.
         # Best-effort Kaggle stops already ran; a denied kernels.get must not leave the

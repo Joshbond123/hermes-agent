@@ -68,16 +68,22 @@ class ComputerClient:
         check the outcome through a background job.
         """
         import asyncio
+        import time
         # Never let a model-chosen short timeout kill a healthy but busy notebook.
         timeout = max(45.0, float(timeout))
         last_err: Optional[Exception] = None
-        attempts = 12
+        # Kaggle's independent tunnel watchdog needs up to ~90 s to detect an
+        # outage and relaunch Inrok, plus time for re-registration. The old 12
+        # retries expired before the computer recovered. Bound by both count
+        # and elapsed time so an unavailable platform cannot trap a task forever.
+        attempts = 40
+        deadline = time.monotonic() + 195.0
         for attempt in range(1, attempts + 1):
             try:
                 base_url, api_key = await self._endpoint()
             except RouteError as exc:
                 last_err = ToolError("offline", "The remote computer is offline or recovering.", hint=exc.message)
-                if attempt >= attempts:
+                if attempt >= attempts or time.monotonic() >= deadline:
                     raise last_err from exc
                 await asyncio.sleep(min(8.0, 0.5 * 2 ** min(attempt, 5)))
                 continue
@@ -89,9 +95,9 @@ class ComputerClient:
                 self._resolver.invalidate()
                 last_err = ToolError("offline", "Could not reach the remote computer (the tunnel may have stopped).",
                                      hint="Open the GPU panel and check that the GPU is Ready.")
-                if attempt >= attempts:
+                if attempt >= attempts or time.monotonic() >= deadline:
                     raise last_err from exc
-                await asyncio.sleep(min(4.0, 0.5 * attempt))
+                await asyncio.sleep(min(8.0, 0.5 * (2 ** min(attempt - 1, 4))))
                 continue
             except httpx.TimeoutException as exc:
                 last_err = ToolError("timeout", f"The remote computer did not answer within {int(timeout)}s.",
@@ -101,10 +107,10 @@ class ComputerClient:
                 if not idempotent:
                     self._resolver.invalidate()
                     raise last_err from exc
-                if attempt >= attempts:
+                if attempt >= attempts or time.monotonic() >= deadline:
                     raise last_err from exc
                 self._resolver.invalidate()
-                await asyncio.sleep(min(4.0, 0.6 * attempt))
+                await asyncio.sleep(min(8.0, 0.5 * (2 ** min(attempt - 1, 4))))
                 continue
             except httpx.HTTPError as exc:
                 raise ToolError("network", f"Network error talking to the remote computer: {type(exc).__name__}") from exc
@@ -114,16 +120,16 @@ class ComputerClient:
                 self._resolver.invalidate()
                 last_err = ToolError("offline", f"The remote computer tunnel is down (HTTP {resp.status_code}).",
                                      hint="Open the GPU panel and turn the GPU on again if it is not Ready.")
-                if attempt >= attempts:
+                if attempt >= attempts or time.monotonic() >= deadline:
                     raise last_err
-                await asyncio.sleep(min(4.0, 0.5 * attempt))
+                await asyncio.sleep(min(8.0, 0.5 * (2 ** min(attempt - 1, 4))))
                 continue
             if resp.status_code in (401, 403):
                 # Key rotation / multi-worker race: refresh D1 key and retry.
                 self._resolver.invalidate()
                 last_err = ToolError("auth", "The remote computer rejected the access key.",
                                      hint="Turn the GPU off and on to refresh it.")
-                if attempt >= attempts:
+                if attempt >= attempts or time.monotonic() >= deadline:
                     raise last_err
                 await asyncio.sleep(min(0.5 * (2 ** (attempt - 1)), 15.0))
                 continue
@@ -137,9 +143,9 @@ class ComputerClient:
                     self._resolver.invalidate()
                     raise ToolError("timeout", f"The remote computer did not complete the request (HTTP {resp.status_code}).",
                                     hint="The command may still be running. Check with job_status if it was a background job.")
-                if resp.status_code in (502, 503, 504) and attempt < attempts:
+                if resp.status_code in (502, 503, 504) and attempt < attempts and time.monotonic() < deadline:
                     self._resolver.invalidate()
-                    await asyncio.sleep(min(4.0, 0.6 * attempt))
+                    await asyncio.sleep(min(8.0, 0.5 * (2 ** min(attempt - 1, 4))))
                     continue
                 raise ToolError("rejected", str(data.get("detail") or data.get("error") or f"HTTP {resp.status_code}")[:300])
             if not isinstance(data, dict):

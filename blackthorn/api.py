@@ -8,7 +8,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Literal, Optional
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -338,6 +338,7 @@ async def put_prompt(body: PromptBody, request: Request):
 # --------------------------------------------------------------------------- GPU
 class OffBody(BaseModel):
     confirm: bool = False
+    role: Literal["all", "model", "computer"] = "all"
 
 
 class AutoOffBody(BaseModel):
@@ -401,11 +402,11 @@ async def gpu_off(body: OffBody, request: Request):
         raise _err(422, "confirm_required", "Turning the GPU off stops the model session. Send {\"confirm\": true} to proceed.")
     live = s.runs.active_count()
     try:
-        out = await s.gpu.turn_off()
+        out = await s.gpu.turn_off() if body.role == "all" else await s.gpu.turn_off(role=body.role)
     except Exception as exc:
         raise _gpu_error(exc)
     s.resolver.invalidate()
-    out["interrupted_runs"] = live
+    out["interrupted_runs"] = live if out.get("turn_off_ok") else 0
     return out
 
 

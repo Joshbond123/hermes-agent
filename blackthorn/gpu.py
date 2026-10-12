@@ -211,14 +211,15 @@ class GpuService:
             return st
         return await self._augment(await asyncio.to_thread(d1.turn_on_kaggle_gpu))
 
-    async def turn_off(self) -> Dict[str, Any]:
-        """Power off both GPUs. ``turn_off_ok`` is true only when every role was verified stopped."""
+    async def turn_off(self, role: str = "all") -> Dict[str, Any]:
+        """Stop one role or the whole fleet, with task and checkpoint protection."""
         d1 = self._module()
         import os
         from .fleet import accounts_from_env
         if hasattr(d1, "turn_off_fleet") and accounts_from_env(os.environ):
             # Blocking stop so the UI does not report offline while the kernel is still up.
-            out = await asyncio.to_thread(d1.turn_off_fleet, True, "user turn-off")
+            roles = ("model", "computer") if role == "all" else (role,)
+            out = await asyncio.to_thread(d1.turn_off_fleet, True, "user turn-off", roles)
             # Never call the legacy single-kernel stop after the fleet has refused a
             # shutdown: that bypasses task and checkpoint protection.
             st = await self.status(refresh=True)
@@ -231,6 +232,8 @@ class GpuService:
                 st["error"] = (f"Turn-off did not complete: Kaggle did not confirm that the session stopped ({reasons}). "
                                "Check the session on kaggle.com; if it is still running, stop it there, or give the token kernels.delete.")
             return st
+        if role == "computer":
+            raise ValueError("no dedicated computer is configured")
         st = await self._augment(await asyncio.to_thread(d1.turn_off_kaggle_gpu))
         st["turn_off_ok"] = True
         return st

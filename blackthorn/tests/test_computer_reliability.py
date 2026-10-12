@@ -152,3 +152,75 @@ async def test_enrolled_offline_computer_never_routes_to_model(stack):
     client = ComputerClient(stack.services.resolver, stack.services.http, store=stack.services.store)
     with pytest.raises(RouteError, match="workspace has not been replaced"):
         await client._endpoint()
+
+
+def test_model_turn_on_reuses_live_computer_instead_of_restarting_it(monkeypatch):
+    from blackthorn import fleet as fm
+    accounts = [fm.Account("m", "tm", "model", "primary"),
+                fm.Account("c", "tc", "computer", "primary")]
+    pushes = []
+    rows = []
+
+    class FakeFleet:
+        def __init__(self, _accounts):
+            self.by_slot = {(a.role, a.slot): a for a in accounts}
+            self.state = {role: type("State", (), {"active": "primary", "reason": "initial"})()
+                          for role in ("model", "computer")}
+        def decide(self, role, force=False):
+            return self.state[role]
+        def start_kernel(self, account, **kwargs):
+            pushes.append(account.role)
+            return {"versionNumber": 1}
+        def status(self):
+            return {}
+
+    monkeypatch.setattr(fm, "accounts_from_env", lambda env: accounts)
+    monkeypatch.setattr(fm, "FleetManager", FakeFleet)
+    monkeypatch.setattr(d1, "_fleet_role_online", lambda role: role == "computer")
+    monkeypatch.setattr(d1, "ensure_d1_schema", lambda: None)
+    monkeypatch.setattr(d1, "_record_stop_event", lambda *args: None)
+    monkeypatch.setattr(d1, "_write_fleet_row", lambda role, *args, **kw: rows.append(role))
+    monkeypatch.setattr(fm, "notebook_env_for", lambda account, env: {})
+    import blackthorn.kaggle_bundle as kb
+    monkeypatch.setattr(kb, "build_notebook_text", lambda env: "model notebook")
+    monkeypatch.setattr(kb, "build_computer_notebook_text", lambda env: "computer notebook")
+    result = d1.turn_on_fleet(blocking=True)
+    assert result["computer"]["status"] == "already_online"
+    assert result["model"]["status"] == "starting"
+    assert pushes == ["model"] and rows == ["primary", "primary"]
+
+
+def test_invalid_primary_kaggle_token_fails_over_to_valid_computer_backup():
+    from blackthorn.fleet import Account, FleetManager
+    primary = Account("p", "bad", "computer", "primary")
+    backup = Account("b", "good", "computer", "backup")
+    def fetcher(method, body, token):
+        if token == "bad":
+            raise __import__("urllib").error.HTTPError("kaggle", 401, "Unauthenticated", {},
+                io.BytesIO(b'{"code":401,"message":"Unauthenticated"}'))
+        return {"gpuQuota": {"timeUsed": "0s", "timeReserved": "0s", "totalTimeAllowed": "108000s"}}
+    fleet = FleetManager([primary, backup], fetcher=fetcher)
+    state = fleet.decide("computer", force=True)
+    assert state.active == "backup" and state.reason == "primary_unhealthy"
+
+
+async def test_explicit_model_only_control_never_targets_computer(monkeypatch):
+    from blackthorn.api import OffBody
+    from blackthorn.gpu import GpuService
+    from blackthorn import fleet
+    assert OffBody(confirm=True, role="model").role == "model"
+    with pytest.raises(Exception):
+        OffBody(confirm=True, role="invalid")
+    calls = []
+    class FakeD1:
+        def turn_off_fleet(self, blocking, source, roles):
+            calls.append((blocking, source, roles))
+            return {"model": {"status": "stopped"}}
+    monkeypatch.setattr(fleet, "accounts_from_env", lambda env: ["fleet configured"])
+    gpu = GpuService(d1_module=FakeD1())
+    async def status(refresh=False):
+        return {"online": False}
+    gpu.status = status
+    result = await gpu.turn_off(role="model")
+    assert result["turn_off_ok"] is True
+    assert calls == [(True, "user turn-off", ("model",))]
