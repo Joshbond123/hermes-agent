@@ -1,5 +1,4 @@
 """Real ASGI authentication: no public chat or controller access after opt-in."""
-import os
 
 from fastapi.testclient import TestClient
 
@@ -28,3 +27,36 @@ def test_login_reset_revokes_and_csrf(monkeypatch, tmp_path):
         assert client.post('/api/auth/login', json={'password':'a-different-password-123456789'}, headers={'Origin':'http://testserver'}).status_code == 200
         assert client.post('/api/auth/logout', headers={'Origin':'http://testserver'}).status_code == 200
         assert client.get('/api/chat/sessions').status_code == 401
+
+
+import pytest
+from blackthorn.app import build_services
+from blackthorn.tests.fakes import ServerThread
+
+
+@pytest.mark.asyncio
+async def test_browser_login_remembers_and_settings_reset(monkeypatch, tmp_path, browser):
+    monkeypatch.setenv('BLACKTHORN_AUTH_REQUIRED', '1')
+    monkeypatch.setenv('BLACKTHORN_AUTH_SIGNING_KEY', 'z' * 48)
+    monkeypatch.setenv('BLACKTHORN_AUTH_PASSWORD_HASH', hash_password('owner-first-passphrase-123'))
+    settings = Settings(store='sqlite', sqlite_path=str(tmp_path / 'browser-auth.sqlite'))
+    services = build_services(settings)
+    server = ServerThread(create_app(settings, services=services, gpu_daemon=False)).start()
+    ctx = await browser.new_context()
+    try:
+        page = await ctx.new_page()
+        await page.goto(server.url)
+        await page.get_by_test_id('login-page').wait_for()
+        await page.get_by_label('Password', exact=True).fill('owner-first-passphrase-123')
+        await page.get_by_role('button', name='Sign in').click()
+        await page.get_by_test_id('composer-input').wait_for(timeout=10000)
+        await page.reload()
+        await page.get_by_test_id('composer-input').wait_for(timeout=10000)
+        await page.get_by_test_id('settings-open').click()
+        await page.get_by_label('Current password').fill('owner-first-passphrase-123')
+        await page.get_by_label('New password (16+ characters)').fill('new-owner-passphrase-123')
+        await page.get_by_role('button', name='Change password').click()
+        await page.get_by_text('Password changed. Other sessions have been signed out.').wait_for(timeout=10000)
+    finally:
+        await ctx.close()
+        server.stop()
