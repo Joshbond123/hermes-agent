@@ -49,6 +49,12 @@ export async function request<T>(path: string, init: RequestInit & { timeoutMs?:
 const json = (body: unknown): RequestInit => ({ body: JSON.stringify(body) })
 
 export const api = {
+  auth: {
+    status: () => request<{ authenticated: boolean; configured: boolean }>('/api/auth/status'),
+    login: (password: string) => request<{ ok: boolean }>('/api/auth/login', { method: 'POST', ...json({ password }) }),
+    reset: (current_password: string, new_password: string) => request<{ ok: boolean }>('/api/auth/reset', { method: 'POST', ...json({ current_password, new_password }) }),
+    logout: () => request<{ ok: boolean }>('/api/auth/logout', { method: 'POST' }),
+  },
   sessions: {
     list: (archived = false, q = '') =>
       request<{ sessions: Session[] }>(`/api/chat/sessions?archived=${archived ? 1 : 0}${q ? `&q=${encodeURIComponent(q)}` : ''}`).then((r) => r.sessions),

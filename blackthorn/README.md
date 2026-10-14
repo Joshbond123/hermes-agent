@@ -79,8 +79,12 @@ grows a download/extract step, the UI build is not content-hashed or loads anyth
 without rebuilding `blackthorn/static`.
 
 ## Security notes
-* The app has **no login** (as before). Anyone who can reach the URL can chat, run the agent's tools on the Kaggle computer and
-  turn the GPU on/off. Put it behind Cloudflare Access / a Render private service or add an access gate before sharing the URL.
+* The app requires an owner password on production D1. Configure `BLACKTHORN_AUTH_PASSWORD_HASH` (PBKDF2 format
+  from `blackthorn.auth.hash_password`) and a random `BLACKTHORN_AUTH_SIGNING_KEY` (32+ characters) as Render
+  environment variables **before** deploying this version; without them, the API fails closed with 503.
+  The login sets an HttpOnly, Secure, SameSite=Strict cookie and refreshes it for active users. Settings can
+  change the password; that invalidates older sessions across workers. Keep the site behind Cloudflare Access
+  as additional protection. Neither the password nor the signing key belongs in Git or D1 in plaintext.
 * The public GPU status never contains the tunnel URL, gateway key or account identifiers.
 * The gateway key is generated per Kaggle boot (`bt-…`) and published to D1 by the notebook. A previous constant key remains in
   old Git history: treat it as compromised (it stops working at the next GPU boot).

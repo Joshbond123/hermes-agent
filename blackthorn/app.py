@@ -14,6 +14,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.datastructures import MutableHeaders
 
 from . import __version__
+from .auth import AuthMiddleware, router as auth_router
 from .api import Services, router
 from .config import Settings, get_settings
 from .gpu import GpuService
@@ -153,11 +154,13 @@ def create_app(settings: Optional[Settings] = None, *, services: Optional[Servic
     app.state.bt = bt
     app.state.settings = settings
     app.include_router(router)
+    app.include_router(auth_router)
 
     # Pure ASGI, not @app.middleware("http"): BaseHTTPMiddleware wraps every response in its own
     # stream and does not propagate a client disconnect into a streaming body, which left GPU relay
     # generators running with nobody reading them. Headers are added on the start message only.
     app.add_middleware(SecurityHeadersMiddleware)
+    app.add_middleware(AuthMiddleware)
 
     def _file(path: Path, *, immutable: bool) -> Response:
         cache = "public, max-age=31536000, immutable" if immutable else "no-cache"
