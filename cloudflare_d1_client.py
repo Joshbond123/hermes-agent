@@ -576,6 +576,7 @@ def _record_auto_off(reason: str) -> None:
 READY_STATUSES = {
     "ONLINE", "MODEL_READY", "MODEL_READY_AND_WARMED", "MODEL_READY_COLD",
     "HEARTBEAT_ONLINE", "GPU_ONLINE", "CACHE_DATASET_READY", "CACHE_DATASET_PUBLISHED",
+    "COM11_READY",
 }
 
 
@@ -1631,8 +1632,19 @@ def _turn_on_kaggle_gpu_sync() -> Dict[str, Any]:
 
 
 def _write_fleet_row(row_id: str, status: str, tunnel_url: str = "", api_key: str = "",
-                     model: str = "Qwen3.8-27B-Uncensored", gpu_info: str = "") -> None:
+                     model: str = "Qwen3.8-27B-Uncensored", gpu_info: str = "",
+                     preserve_link: bool = False) -> None:
     try:
+        if preserve_link:
+            # Com11: tunnel_url/api_key are static relay configuration, not per-boot
+            # notebook output — a status write must never wipe them.
+            try:
+                cur = d1_query("SELECT tunnel_url, api_key FROM kaggle_gpu_state WHERE id=? LIMIT 1;", [row_id])
+                cur = cur[0] if cur else {}
+                tunnel_url = str(cur.get("tunnel_url") or "")
+                api_key = str(cur.get("api_key") or "")
+            except Exception:
+                pass
         d1_query(
             "INSERT OR REPLACE INTO kaggle_gpu_state (id, status, tunnel_url, api_key, model, gpu_info, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?);",
@@ -1657,6 +1669,77 @@ def _fleet_role_online(role: str) -> bool:
             return resp.status == 200 and resp.headers.get("Content-Type", "").startswith("application/json")
     except (urllib.error.URLError, OSError, RuntimeError, ValueError, TypeError, KeyError):
         return False
+
+
+# --------------------------------------------------------------------------- Com11 (GitHub Actions computer)
+# The computer role runs on GitHub Actions (public repo onchain007/Com11, Kali Linux
+# container). Start = workflow_dispatch, stop = run cancel; status/progress detail is
+# reported straight into this row by the runner. The PAT never lives in the repo.
+COM11_WORKFLOW = "com11-computer.yml"
+COM11_REPO = os.environ.get("COM11_GITHUB_REPO", "onchain007/Com11")
+
+
+def _com11_api(method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> Tuple[int, str]:
+    token = (os.environ.get("COM11_GITHUB_TOKEN") or "").strip()
+    if not token:
+        return 0, "COM11_GITHUB_TOKEN is not configured on the controller"
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    req = urllib.request.Request(
+        "https://api.github.com" + path, data=data, method=method,
+        headers={"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
+                 "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json",
+                 "User-Agent": "blackthorn-controller"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return resp.status, resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read().decode("utf-8", "replace")[:400]
+    except (urllib.error.URLError, OSError) as exc:
+        return 0, f"{type(exc).__name__}"
+
+
+def com11_session() -> Dict[str, Any]:
+    """State of the single com11-computer session (concurrency group = one at a time)."""
+    st, body = _com11_api("GET", f"/repos/{COM11_REPO}/actions/runs?per_page=15")
+    if st != 200:
+        return {"ok": False, "running": False, "error": f"HTTP {st} {body[:160]}"}
+    try:
+        runs = json.loads(body or "{}").get("workflow_runs") or []
+    except ValueError:
+        return {"ok": False, "running": False, "error": "bad runs payload"}
+    active = [r for r in runs
+              if str(r.get("name") or "") == "com11-computer"
+              and str(r.get("status") or "") in ("queued", "in_progress", "waiting", "pending")]
+    if not active:
+        return {"ok": True, "running": False}
+    active.sort(key=lambda r: str(r.get("created_at") or ""), reverse=True)
+    r = active[0]
+    return {"ok": True, "running": True, "run_id": r.get("id"), "status": r.get("status")}
+
+
+def com11_start() -> Dict[str, Any]:
+    state = com11_session()
+    if not state.get("ok"):
+        return {"ok": False, "error": state.get("error") or "session state unavailable"}
+    if state.get("running"):
+        return {"ok": True, "status": "already_running", "run_id": state.get("run_id")}
+    st, body = _com11_api("POST", f"/repos/{COM11_REPO}/actions/workflows/{COM11_WORKFLOW}/dispatches",
+                          {"ref": "main"})
+    if st != 204:
+        return {"ok": False, "error": f"dispatch HTTP {st} {body[:160]}"}
+    return {"ok": True, "status": "dispatched"}
+
+
+def com11_stop() -> Dict[str, Any]:
+    state = com11_session()
+    if not state.get("ok"):
+        return {"ok": False, "error": state.get("error") or "session state unavailable"}
+    if not state.get("running"):
+        return {"ok": True, "status": "not_running"}
+    st, body = _com11_api("DELETE", f"/repos/{COM11_REPO}/actions/runs/{state['run_id']}")
+    if st not in (200, 202, 204):
+        return {"ok": False, "error": f"cancel HTTP {st} {body[:160]}"}
+    return {"ok": True, "status": "cancelled", "run_id": state.get("run_id")}
 
 
 def turn_on_fleet(blocking: bool = False) -> Dict[str, Any]:
@@ -1686,14 +1769,27 @@ def turn_on_fleet(blocking: bool = False) -> Dict[str, Any]:
         plan[role] = {"state": st, "account": account, "reusable": reusable}
     # Never re-push a live computer when merely turning the model back on.
     for role in ("model", "computer"):
-        if plan[role]["account"] is not None and not plan[role]["reusable"]:
-            _write_fleet_row("computer" if role == "computer" else "primary", "BOOTING_KAGGLE_GPU",
+        if role != "computer" and plan[role]["account"] is not None and not plan[role]["reusable"]:
+            _write_fleet_row("primary", "BOOTING_KAGGLE_GPU",
                              gpu_info=f"Allocating on {plan[role]['account'].user}...")
 
     def boot(role: str) -> Dict[str, Any]:
         st, account = plan[role]["state"], plan[role]["account"]
         if plan[role]["reusable"]:
             return {"role": role, "status": "already_online", "account": account.user if account else None}
+        if role == "computer":
+            # Com11: no Kaggle push — dispatch the GitHub Actions Kali session.
+            out = com11_start()
+            if out.get("ok"):
+                _write_fleet_row("computer", "COM11_BOOTING",
+                                 gpu_info="Dispatching GitHub Actions runner (com11)...",
+                                 preserve_link=True)
+                return {"role": role, "account": "github-actions", "status": "starting",
+                        "dispatch": out.get("status"), "run_id": out.get("run_id")}
+            _write_fleet_row("computer", "BOOT_FAILED", gpu_info=f"FAILED: com11 {out.get('error')}",
+                             preserve_link=True)
+            return {"role": role, "account": "github-actions", "status": "start_failed",
+                    "error": str(out.get("error"))[:200]}
         if account is None:
             _write_fleet_row("computer" if role == "computer" else "primary", "BOOT_FAILED")
             return {"role": role, "status": "unconfigured"}
@@ -1755,7 +1851,8 @@ def _role_boot_in_progress(role: str) -> bool:
         row = rows[0] if rows else {}
         return (str(row.get("status") or "").upper() in {
             "BOOTING_KAGGLE_GPU", "CHECKING_ENVIRONMENT", "INSTALLING_DEPS",
-            "STARTING_GATEWAY", "TUNNEL_ONLINE", "DOWNLOADING_MODEL", "WARMING_GPU"}
+            "STARTING_GATEWAY", "TUNNEL_ONLINE", "DOWNLOADING_MODEL", "WARMING_GPU",
+            "COM11_BOOTING", "COM11_RECONNECTING"}
                 and time.time() - float(row.get("updated_at") or 0) < 900)
     except (OSError, ValueError, RuntimeError, urllib.error.URLError):
         return True   # fail closed when D1 cannot prove that boot is stale
@@ -1763,6 +1860,7 @@ def _role_boot_in_progress(role: str) -> bool:
 
 def failover_fleet_role(role: str, from_slot: str, to_slot: str) -> Dict[str, Any]:
     """Execute a failover the fleet engine decided: sync state, boot the new active, retire the old.
+    (The computer role no longer has a Kaggle account pair — see the guard below.)
 
     The backup has been completely cold until this moment (zero quota burned); this is
     the first and only time its kernel starts.
@@ -1771,6 +1869,9 @@ def failover_fleet_role(role: str, from_slot: str, to_slot: str) -> Dict[str, An
                                   mirror_state_dataset, notebook_env_for)
     from blackthorn.kaggle_bundle import build_computer_notebook_text, build_notebook_text
 
+    if role == "computer":
+        return {"ok": False, "status": "not_applicable", "role": role,
+                "reason": "the computer runs on GitHub Actions (Com11); no Kaggle account failover applies"}
     if not _role_intended_online(role):
         return {"ok": False, "status": "skipped_off", "role": role,
                 "reason": "role intentionally stopped or control-plane state unavailable"}
@@ -1867,6 +1968,22 @@ def turn_off_fleet(blocking: bool = True, source: str = "", roles: tuple = ("mod
     targets = []
     previous = {}
     for role in roles:
+        if role == "computer":
+            # Com11: checkpoint (above) is done — now cancel the GitHub Actions session.
+            try:
+                _write_fleet_row("computer", "STOPPING_KAGGLE_GPU", gpu_info="", preserve_link=True)
+            except Exception:
+                pass
+            cres = com11_stop()
+            out["computer"] = {"status": "stopped" if cres.get("ok") else "stop_failed",
+                               "account": "github-actions"}
+            if not cres.get("ok"):
+                out["computer"]["error"] = str(cres.get("error") or "")[:200]
+            try:
+                _write_fleet_row("computer", "GPU_STOPPED_SAVING_QUOTA", gpu_info="", preserve_link=True)
+            except Exception:
+                pass
+            continue
         st = fleet.state[role]
         account = fleet.by_slot.get((role, st.active)) or fleet.by_slot.get((role, "primary"))
         row_id = "computer" if role == "computer" else "primary"
@@ -1936,7 +2053,10 @@ def turn_off_fleet(blocking: bool = True, source: str = "", roles: tuple = ("mod
             st = out[role].get("status")
             if st in ("stopped", "not_running", "unconfigured"):
                 try:
-                    _write_fleet_row(row_id, "GPU_STOPPED_SAVING_QUOTA", tunnel_url="", api_key="", gpu_info="")
+                    if row_id == "computer":
+                        _write_fleet_row(row_id, "GPU_STOPPED_SAVING_QUOTA", gpu_info="", preserve_link=True)
+                    else:
+                        _write_fleet_row(row_id, "GPU_STOPPED_SAVING_QUOTA", tunnel_url="", api_key="", gpu_info="")
                 except Exception:
                     pass
             elif st in ("stop_failed", "stop_unverified"):
