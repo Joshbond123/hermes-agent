@@ -23,8 +23,8 @@ STAGE_OF = {
     "WARMING_GPU": 12,
 }
 TOTAL_STAGES = 12
-READY = {"ONLINE", "MODEL_READY_AND_WARMED", "HEARTBEAT_ONLINE", "MODEL_READY", "MODEL_READY_COLD"}
-BOOTING = {"BOOTING_KAGGLE_GPU", "CHECKING_ENVIRONMENT", "CHECKING_CACHE", "CACHE_HIT", "CACHE_MISS", "DOWNLOADING_MODEL",
+READY = {"ONLINE", "MODEL_READY_AND_WARMED", "HEARTBEAT_ONLINE", "MODEL_READY", "MODEL_READY_COLD", "COM11_READY"}
+BOOTING = {"BOOTING_KAGGLE_GPU", "COM11_BOOTING", "CHECKING_ENVIRONMENT", "CHECKING_CACHE", "CACHE_HIT", "CACHE_MISS", "DOWNLOADING_MODEL",
            "MODEL_DOWNLOADED", "VERIFYING_MODEL", "INSTALLING_DEPS", "STARTING_INSTALL", "INSTALLING_OLLAMA",
            "STARTING_OLLAMA", "LOADING_MODEL", "STARTING_GATEWAY", "TUNNEL_ONLINE", "WARMING_GPU"}
 BOOT_META_KEY = "blackthorn_gpu_boot_started"
@@ -145,24 +145,32 @@ class GpuService:
                     "has_endpoint": bool(c_url),
                     "transport": "inrok" if ".share.inrok.in" in c_url else ("relay" if c_url else ""),
                     "display_status": (
-                        "Computer Ready" if c_online else
-                        ("Computer Starting" if c_booting else ("Computer Recovering" if c_status in READY else "Computer Offline"))
+                        "Com11 ready" if c_online else
+                        ("Shutting down\u2026" if c_status == "STOPPING_KAGGLE_GPU" else
+                         ("Starting\u2026" if (c_booting or c_status == "COM11_BOOTING") else
+                          ("Reconnecting\u2026" if (c_status == "COM11_RECONNECTING" or c_status in READY) else
+                           "Unavailable")))
                     ),
                     "gpu_info": crow.get("gpu_info") or "",
                     "model": crow.get("model") or "",
+                    # Com11: real backend details behind the indicator (req. 7)
+                    "host": "GitHub Actions (Com11)",
+                    "environment": "com11-kali",
+                    "progress": str(crow.get("gpu_info") or ""),
+                    "last_health": _parse_detail(crow.get("detail")) or None,
                 }
                 if c_status and c_status not in ("", "OFF", "OFFLINE"):
                     model_online = bool(model_pub.get("online"))
                     if model_online and not c_online and not c_booting:
-                        model_pub["display_status"] = "Model ready — computer offline"
+                        model_pub["display_status"] = "Model ready — Com11 offline"
                         model_pub["computer_ready"] = False
                     elif model_online and c_booting:
-                        model_pub["display_status"] = "Waiting for computer GPU"
+                        model_pub["display_status"] = "Waiting for Com11"
                         model_pub["computer_ready"] = False
                         model_pub["online"] = False
                         model_pub["can_turn_on"] = False
                     elif model_online and c_online:
-                        model_pub["display_status"] = "Model + Computer Ready"
+                        model_pub["display_status"] = "Model + Com11 Ready"
                         model_pub["computer_ready"] = True
                     model_pub["computer"] = computer_pub
         except Exception:
@@ -175,6 +183,8 @@ class GpuService:
                 fleet = FleetManager(accounts)
                 quotas = {}
                 for role in ("model", "computer"):
+                    if role == "computer":
+                        continue  # Com11 runs on GitHub Actions — no Kaggle GPU quota
                     acc = next((a for a in accounts if a.role == role and getattr(a, "slot", "primary") in ("primary", None, "")), None)
                     if acc is None:
                         acc = next((a for a in accounts if a.role == role), None)
