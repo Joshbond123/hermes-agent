@@ -1679,10 +1679,33 @@ COM11_WORKFLOW = "com11-computer.yml"
 COM11_REPO = os.environ.get("COM11_GITHUB_REPO", "onchain007/Com11")
 
 
+_COM11_TOKEN_MEM: str = ""
+
+
+def _com11_token() -> str:
+    """Render cannot set service env vars through its current API, so the controller PAT
+    lives in the private D1 control-plane DB (state_meta), read with the same Cloudflare
+    credentials the service already has. Never logged, never returned to clients."""
+    global _COM11_TOKEN_MEM
+    tok = (os.environ.get("COM11_GITHUB_TOKEN") or "").strip()
+    if tok:
+        return tok
+    if _COM11_TOKEN_MEM:
+        return _COM11_TOKEN_MEM
+    try:
+        rows = d1_query("SELECT value FROM state_meta WHERE key = 'com11_github_token' LIMIT 1;")
+        val = str((rows[0] if rows else {}).get("value") or "").strip()
+        if val:
+            _COM11_TOKEN_MEM = val
+        return _COM11_TOKEN_MEM
+    except Exception:
+        return ""
+
+
 def _com11_api(method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> Tuple[int, str]:
-    token = (os.environ.get("COM11_GITHUB_TOKEN") or "").strip()
+    token = _com11_token()
     if not token:
-        return 0, "COM11_GITHUB_TOKEN is not configured on the controller"
+        return 0, "com11 GitHub token is not configured on the controller"
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     req = urllib.request.Request(
         "https://api.github.com" + path, data=data, method=method,
