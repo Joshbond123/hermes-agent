@@ -1,0 +1,103 @@
+name: com11-computer
+
+# Blackthorn Com11 — the Kali "computer" lifecycle.
+# start: workflow_dispatch (GPU controller / Render fleet controller, or self-handoff)
+# stop : the same run is cancelled by Render after /computer/checkpoint, or the
+#        5 h handoff dispatches a successor and this run ends cleanly.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: com11-computer-session
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+  packages: write
+
+jobs:
+  session:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Decrypt payload
+        env:
+          COM11_REPO_KEY: ${{ secrets.COM11_REPO_KEY }}
+        run: bash bootstrap.sh payload
+
+      - name: Restore workspace (decrypted from the workspace branch)
+        env:
+          COM11_REPO_KEY: ${{ secrets.COM11_REPO_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash payload/runner/host/restore_workspace.sh
+
+      - name: Restore tool cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/com11/opt-tools
+          key: com11-opt-tools-v1-${{ github.run_id }}
+          restore-keys: |
+            com11-opt-tools-v1-
+
+      - name: Start container
+        env:
+          COM11_RELAY_KEY: ${{ secrets.COM11_RELAY_KEY }}
+          COM11_REPO_KEY: ${{ secrets.COM11_REPO_KEY }}
+          PROTON_OVPN_USER: ${{ secrets.PROTON_OVPN_USER }}
+          PROTON_OVPN_PASS: ${{ secrets.PROTON_OVPN_PASS }}
+          PROTON_WG_CONF: ${{ secrets.PROTON_WG_CONF }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CF_API_KEY: ${{ secrets.CF_API_KEY }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_DB_ID: ${{ secrets.CF_DB_ID }}
+        run: bash payload/runner/host/start_container.sh
+
+      - name: Wait until anonymous and ready
+        env:
+          READY_TIMEOUT: "1200"
+        run: bash payload/runner/host/wait_ready.sh
+
+      - name: Session loop (health, handoff at ~5 h)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HANDOFF_MINUTES: "300"
+          MAX_MINUTES: "345"
+        run: bash payload/runner/host/session_loop.sh
+
+      - name: Collect evidence
+        if: always()
+        run: |
+          WS="${RUNNER_TEMP}/com11/workspace"
+          mkdir -p /tmp/com11-evidence
+          docker logs com11 > /tmp/com11-evidence/container.log 2>&1 || true
+          cp -r "$WS/evidence/." /tmp/com11-evidence/ 2>/dev/null || true
+          cp "$WS/ANON_STATUS.json" /tmp/com11-evidence/ 2>/dev/null || true
+          cp "$WS/logs/"*.log /tmp/com11-evidence/ 2>/dev/null || true
+          cp "${RUNNER_TEMP}/com11/wsrepo/SYNC_INFO.json" /tmp/com11-evidence/ 2>/dev/null || true
+          echo "--- evidence index ---"; ls -la /tmp/com11-evidence || true
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: com11-evidence-${{ github.run_id }}
+          path: /tmp/com11-evidence
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Save tool cache
+        if: always()
+        run: |
+          OPT="${RUNNER_TEMP}/com11/opt-tools"
+          if docker ps -a --format '{{.Names}}' | grep -qx com11; then
+            docker cp com11:/opt/bt-tools/. "$OPT/" 2>/dev/null || true
+          fi
+          du -sh "$OPT" 2>/dev/null || true
+
+      - name: Stop container
+        if: always()
+        run: docker rm -f com11 2>/dev/null || true
