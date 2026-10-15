@@ -145,12 +145,11 @@ class GpuService:
                     "has_endpoint": bool(c_url),
                     "transport": "inrok" if ".share.inrok.in" in c_url else ("relay" if c_url else ""),
                     "display_status": (
-                        "Com11 ready" if c_online else
-                        ("Shutting down\u2026" if c_status == "STOPPING_KAGGLE_GPU" else
-                         ("Starting\u2026" if (c_booting or c_status == "COM11_BOOTING") else
-                          ("Reconnecting\u2026" if (c_status == "COM11_RECONNECTING" or c_status in READY) else
-                           "Unavailable")))
-                    ),
+                        "Ready" if c_online else
+                        ("Shutting down…" if c_status == "STOPPING_KAGGLE_GPU" else
+                         ("Starting…" if (c_booting or c_status == "COM11_BOOTING") else
+                          ("Reconnecting…" if (c_status == "COM11_RECONNECTING" or c_status in READY) else
+                           "Unavailable")))),
                     "gpu_info": crow.get("gpu_info") or "",
                     "model": crow.get("model") or "",
                     # Com11: real backend details behind the indicator (req. 7)
