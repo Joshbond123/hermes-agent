@@ -1672,17 +1672,17 @@ def _fleet_role_online(role: str) -> bool:
 
 
 # --------------------------------------------------------------------------- Com11 (GitHub Actions computer)
-# The computer role runs on GitHub Actions (public repo onchain007/Com11, Kali Linux
+# The computer role runs on GitHub Actions (public repo comtool007/Com11, Kali Linux
 # container). Start = workflow_dispatch, stop = run cancel; status/progress detail is
 # reported straight into this row by the runner. The PAT never lives in the repo.
 COM11_WORKFLOW = "com11-computer.yml"
-COM11_DEFAULT_REPO = "Joshbond123/hermes-agent"
+COM11_DEFAULT_REPO = "comtool007/Com11"
 _COM11_REPO_MEM: str = ""
 
 
 def _com11_repo() -> str:
-    """env override -> private D1 state_meta -> default. The controller PAT is scoped to the
-    host repo; onchain007/Com11 resumes automatically once that account is restored."""
+    """env override -> private D1 state_meta -> default. The PAT is the comtool007
+    credential scoped to the Com11 computer repo."""
     global _COM11_REPO_MEM
     env = (os.environ.get("COM11_GITHUB_REPO") or "").strip()
     if env:
