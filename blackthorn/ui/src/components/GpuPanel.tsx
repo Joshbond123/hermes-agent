@@ -104,8 +104,11 @@ export function GpuPanel({ gpu, onClose }: { gpu: GpuView; onClose: () => void }
 
         {s?.computer && (
           <div className="muted small" data-testid="computer-status">
-            Computer: {s.computer.display_status || s.computer.status || 'unknown'}
+            Com11 computer: {s.computer.display_status || s.computer.status || 'unknown'}
             {s.computer.gpu_info ? ` · ${s.computer.gpu_info}` : ''}
+            {s.computer.host ? ` · ${s.computer.host}` : ''}
+            {s.computer.environment ? ` · env ${s.computer.environment}` : ''}
+            {s.computer.last_health?.verified_at ? ` · health checked ${new Date(s.computer.last_health.verified_at * 1000).toLocaleTimeString()}` : ''}
           </div>
         )}
 
