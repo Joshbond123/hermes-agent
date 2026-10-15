@@ -181,7 +181,12 @@ class AuthMiddleware:
             return
         request = Request(scope, receive=receive)
         path = scope.get("path", "")
-        if not path.startswith("/api/") or path in ("/api/health", "/api/auth/status", "/api/auth/login"):
+        # /api/kaggle-relay/* carries its own per-request relay key (see relay._authed);
+        # machine clients (the computer's relay client) hold no login cookie and must
+        # not be blocked by the owner-login wall. Everything else under /api stays walled.
+        if (not path.startswith("/api/")
+                or path in ("/api/health", "/api/auth/status", "/api/auth/login")
+                or path.startswith("/api/kaggle-relay/")):
             await self.app(scope, receive, send)
             return
         if not required(request):
