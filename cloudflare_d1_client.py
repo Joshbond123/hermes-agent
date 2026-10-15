@@ -1676,7 +1676,26 @@ def _fleet_role_online(role: str) -> bool:
 # container). Start = workflow_dispatch, stop = run cancel; status/progress detail is
 # reported straight into this row by the runner. The PAT never lives in the repo.
 COM11_WORKFLOW = "com11-computer.yml"
-COM11_REPO = os.environ.get("COM11_GITHUB_REPO", "onchain007/Com11")
+COM11_DEFAULT_REPO = "Joshbond123/hermes-agent"
+_COM11_REPO_MEM: str = ""
+
+
+def _com11_repo() -> str:
+    """env override -> private D1 state_meta -> default. The controller PAT is scoped to the
+    host repo; onchain007/Com11 resumes automatically once that account is restored."""
+    global _COM11_REPO_MEM
+    env = (os.environ.get("COM11_GITHUB_REPO") or "").strip()
+    if env:
+        return env
+    if _COM11_REPO_MEM:
+        return _COM11_REPO_MEM
+    try:
+        rows = d1_query("SELECT value FROM state_meta WHERE key = 'com11_github_repo' LIMIT 1;")
+        val = str((rows[0] if rows else {}).get("value") or "").strip()
+        _COM11_REPO_MEM = val or COM11_DEFAULT_REPO
+    except Exception:
+        _COM11_REPO_MEM = COM11_DEFAULT_REPO
+    return _COM11_REPO_MEM
 
 
 _COM11_TOKEN_MEM: str = ""
@@ -1723,7 +1742,7 @@ def _com11_api(method: str, path: str, payload: Optional[Dict[str, Any]] = None)
 
 def com11_session() -> Dict[str, Any]:
     """State of the single com11-computer session (concurrency group = one at a time)."""
-    st, body = _com11_api("GET", f"/repos/{COM11_REPO}/actions/runs?per_page=15")
+    st, body = _com11_api("GET", f"/repos/{_com11_repo()}/actions/runs?per_page=15")
     if st != 200:
         return {"ok": False, "running": False, "error": f"HTTP {st} {body[:160]}"}
     try:
@@ -1746,7 +1765,7 @@ def com11_start() -> Dict[str, Any]:
         return {"ok": False, "error": state.get("error") or "session state unavailable"}
     if state.get("running"):
         return {"ok": True, "status": "already_running", "run_id": state.get("run_id")}
-    st, body = _com11_api("POST", f"/repos/{COM11_REPO}/actions/workflows/{COM11_WORKFLOW}/dispatches",
+    st, body = _com11_api("POST", f"/repos/{_com11_repo()}/actions/workflows/{COM11_WORKFLOW}/dispatches",
                           {"ref": "main"})
     if st != 204:
         return {"ok": False, "error": f"dispatch HTTP {st} {body[:160]}"}
@@ -1759,7 +1778,7 @@ def com11_stop() -> Dict[str, Any]:
         return {"ok": False, "error": state.get("error") or "session state unavailable"}
     if not state.get("running"):
         return {"ok": True, "status": "not_running"}
-    st, body = _com11_api("DELETE", f"/repos/{COM11_REPO}/actions/runs/{state['run_id']}")
+    st, body = _com11_api("DELETE", f"/repos/{_com11_repo()}/actions/runs/{state['run_id']}")
     if st not in (200, 202, 204):
         return {"ok": False, "error": f"cancel HTTP {st} {body[:160]}"}
     return {"ok": True, "status": "cancelled", "run_id": state.get("run_id")}
