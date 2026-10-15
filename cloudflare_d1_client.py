@@ -1823,6 +1823,10 @@ def turn_on_fleet(blocking: bool = False) -> Dict[str, Any]:
             # Com11: no Kaggle push — dispatch the GitHub Actions Kali session.
             out = com11_start()
             if out.get("ok"):
+                if out.get("status") == "already_running":
+                    # a live session owns its row status (COM11_READY/heartbeats) — do not clobber it
+                    return {"role": role, "account": "github-actions", "status": "already_running",
+                            "run_id": out.get("run_id")}
                 _write_fleet_row("computer", "COM11_BOOTING",
                                  gpu_info="Dispatching GitHub Actions runner (com11)...",
                                  preserve_link=True)
