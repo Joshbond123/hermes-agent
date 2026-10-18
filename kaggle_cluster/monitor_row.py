@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Watch vllm_sm75 row until terminal state. Baselines updated_at at start.
 
-Usage: python3 monitor_row.py <baseline_updated_at> [timeout_s]
+Usage: python3 monitor_row.py <baseline_updated_at> [timeout_s] [base_row]
 Exit: 0 DONE, 1 FAIL_*, 2 timeout, 3 heartbeat/session death.
 """
 import json
@@ -53,20 +53,27 @@ def get(row):
 def main():
     baseline = float(sys.argv[1])
     budget = float(sys.argv[2]) if len(sys.argv) > 2 else 1500.0
+    BASE = sys.argv[3] if len(sys.argv) > 3 else "vllm_sm75"
     t_end = time.time() + budget
     last = None
     print("monitor start baseline=%.1f budget=%.0fs" % (baseline, budget), flush=True)
     while time.time() < t_end:
         try:
-            row = get("vllm_sm75")
-            hb = get("vllm_sm75_hb")
+            row = get(BASE)
+            hb = get(BASE + "_hb")
         except Exception as e:  # noqa: BLE001
             print("poll err:", repr(e), flush=True)
             time.sleep(20)
             continue
         if row is None:
-            print("ROW GONE", flush=True)
-            sys.exit(3)
+            # row does not exist yet: the run has not started; keep waiting
+            # within the overall budget (old terminal rows are also handled
+            # by requiring updated_at > baseline before accepting status).
+            if last != "(no row yet)":
+                print("[%s] row absent (run not started)" % time.strftime("%H:%M:%S"), flush=True)
+                last = "(no row yet)"
+            time.sleep(20)
+            continue
         st = row.get("status", "?")
         upd = float(row.get("updated_at") or 0)
         if st != last:

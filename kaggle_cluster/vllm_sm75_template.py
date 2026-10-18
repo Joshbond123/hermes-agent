@@ -1,4 +1,4 @@
-"""vLLM sm75 test v16 — enforce_eager; alagbo clean-batch run.
+"""vLLM sm75 test v18 — per-account rows (@@TAG@@) + eternal result row on DONE.
 
 Injected at push time: @@CF_ACCOUNT@@ @@CF_DB@@ @@CF_KEY@@ @@HF_TOKEN@@
 Rows: vllm_sm75 (status+notes+result), vllm_sm75_hb (30s heartbeat).
@@ -18,8 +18,8 @@ CF_DB = "@@CF_DB@@"
 CF_KEY = "@@CF_KEY@@"
 HF_TOKEN = "@@HF_TOKEN@@"
 T0 = time.time()
-ROW = "vllm_sm75"
-HB = "vllm_sm75_hb"
+ROW = "vllm_sm75_@@TAG@@"
+HB = "vllm_sm75_@@TAG@@_hb"
 MODEL = "Qwen/Qwen3.5-4B"
 NOTES = []
 PHASE = ["INIT"]
@@ -237,6 +237,8 @@ NOTES.append({"serve_rc": out.strip()[-40:]})
 mm = re.search(r"VLLM_RESULT (\{.*\})", log_head + log_tail)
 if mm and out.strip().endswith("RC=0"):
     save("DONE", log_tail[-4000:], extra={"result": json.loads(mm.group(1)), "vllm": VER})
+    put("vllm_sm75_result", "DONE", {"result": json.loads(mm.group(1)), "vllm": VER,
+        "tag": "@@TAG@@", "elapsed": round(time.time() - T0, 1), "notes": NOTES[-12:]})
     print("SUCCESS", mm.group(1), flush=True)
     sys.exit(0)
 
@@ -248,7 +250,7 @@ try:
     n = len(txt)
     for i in range(3):
         part = txt[i*n//3:(i+1)*n//3]
-        put("vllm_sm75_l%d"%(i+1), "LOG%d"% (i+1), {"off": i*n//3, "len": len(part), "part": part[:15000]})
+        put(ROW+"_l%d"%(i+1), "LOG%d"% (i+1), {"off": i*n//3, "len": len(part), "part": part[:15000]})
 except Exception as e:
     save("LOGCAP_FAIL", str(e))
 

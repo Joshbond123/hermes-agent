@@ -204,6 +204,7 @@ One notebook, iterated v1→v10; every fix evidence-backed via D1 rows
 | v7 | in-process monkeypatch invisible to spawned workers (fresh module import) | patch must be file-level in dist-packages |
 | v8 | triple-quoted patch text → SyntaxError (unterminated string) | quote-free patch: keep `def` line, body = 8-space `return  # …`; `py_compile` verified inside the phase |
 | v9 | **PATCH VERIFIED ON LIVE GPUs**: workers loaded model in bf16 (`dtype=torch.bfloat16` accepted, weights resident). New failure = **OOM "Tried to allocate 128.00 GiB"** in `vit_attn_wrappers.py → F.scaled_dot_product_attention`, mis-tagged FAIL_DTYPE_BF16 (FA2 "not supported" line + 'bfloat16' in config dump) | see v10 |
+| v13 | (20:21-20:31) happink's ancient pre-`enforce_eager` trigger finally got capacity & failed with the Inductor SkipFrame again — content-era forensics via `non-default args` (no `enforce_eager` in config) | confirms `enforce_eager=True` is required AND sufficient (alagbo runs with it = COMPLETE) |
 | v10 | root cause: engine `profile_run → encoder_runner.profile_encoder_cache(dummy_mm_inputs)` runs the **vision tower** on a 4096×4096 dummy (patch 16 → 65 536 tokens; 65536² × 16 heads × 2 B = **exactly 128 GiB**); bf16-on-Turing → SDPA math fallback materializes the matrix → OOM. FA2 unavailable on CC<8 (logged, benign) | `LLM(..., skip_mm_profiling=True)` (gates `model_runner.py:994` block; text-only serving never touches the ViT) + `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` + OOM-first failure tagger |
 
 - Verdict so far: **bf16-on-sm75 bypass = fixed & verified**; v10 (skip
@@ -217,7 +218,7 @@ One notebook, iterated v1→v10; every fix evidence-backed via D1 rows
 
 | ID | What | Result |
 |----|------|--------|
-| E8 | vLLM bf16-on-T4 series v1→v10 (see §10) | v9: patch verified on live GPUs; v10 in flight |
+| E8 | vLLM bf16-on-T4 series v1→v18 (see §10) | **PASS**: full fix-stack session on alagbo exited 0 (`GetKernelSessionStatus=COMPLETE` = only exits 0 on `VLLM_RESULT`+`RC=0`); v18 rerun in flight for latency capture |
 | E9 | netprobe-v3 peer sweep (teslaarymo v5, alagbo v1) | PASS: 256 addrs **0 hits** = sessions fully isolated; egress SC 34.148.241.40 / OR 136.69.162.65, peer TW 34.81.112.98 → random regions |
 
 ### Session/status API semantics (measured 18:0x)

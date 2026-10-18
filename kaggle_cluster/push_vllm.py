@@ -23,6 +23,7 @@ tk = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else 
 slug = sys.argv[3] if len(sys.argv) > 3 and not sys.argv[3].startswith("--") else "vllm-sm75-bf16-test"
 tpl_path = sys.argv[4] if len(sys.argv) > 4 and not sys.argv[4].startswith("--") else "/home/user/work/cluster/vllm_sm75_template.py"
 RAW = "--raw" in sys.argv
+TAG = {"KAGGLE_BU3": "hap", "KAGGLE_BU2": "tem", "KAGGLE_U3": "ala"}.get(uk, "x")
 
 tpl = open(tpl_path).read()
 code = (
@@ -30,8 +31,9 @@ code = (
     .replace("@@CF_DB@@", g("CF_DB"))
     .replace("@@CF_KEY@@", g("CF_KEY"))
     .replace("@@HF_TOKEN@@", g("HF_TOKEN"))
+    .replace("@@TAG@@", TAG)
 )
-for marker in ("@@CF_ACCOUNT@@", "@@CF_DB@@", "@@CF_KEY@@", "@@HF_TOKEN@@"):
+for marker in ("@@CF_ACCOUNT@@", "@@CF_DB@@", "@@CF_KEY@@", "@@HF_TOKEN@@", "@@TAG@@"):
     if marker in code:
         raise SystemExit(f"unreplaced marker {marker}")
 
