@@ -219,3 +219,44 @@ One notebook, iterated v1→v10; every fix evidence-backed via D1 rows
 |----|------|--------|
 | E8 | vLLM bf16-on-T4 series v1→v10 (see §10) | v9: patch verified on live GPUs; v10 in flight |
 | E9 | netprobe-v3 peer sweep (teslaarymo v5, alagbo v1) | PASS: 256 addrs **0 hits** = sessions fully isolated; egress SC 34.148.241.40 / OR 136.69.162.65, peer TW 34.81.112.98 → random regions |
+
+### Session/status API semantics (measured 18:0x)
+
+- `GetKernelSessionStatus`: `{}` = no session (queued/pre-start);
+  `ERROR` = last session exited **non-zero**; `COMPLETE` = exited 0
+  (probed against `gpu-debug-marker*`). It reports the *last* session,
+  so a stale `ERROR` can linger after a failed run.
+- `lastRunTime` (via `ListKernels?user=`) = timestamp of last session
+  **start**; updated within ~1 s of a SaveKernel-triggered start when
+  capacity is free; unchanged while a new run waits for GPU capacity.
+- `kernelExecutionType:"SAVE_AND_RUN_ALL"` + SaveKernel = the only run
+  trigger (probed `RunKernel`/`StartKernel`/… → 404).
+- **Raw `.py` text + `kernelType:"notebook"` + `kernelExecutionType:"SAVE_AND_RUN_ALL"` = the working combination** (v13 run live-verified 18:25; matches v4–v9 and E9 netprobe pushes). E3 vs E4 was a confounded test: the real variable was SAVE_AND_RUN_ALL (it persists per-kernel after the first set), not ipynb wrapping. My ipynb-JSON pushes (v11/v12) saved fine (versionNumber bumped) but **never scheduled**; the raw re-push (v13) scheduled in 38 s and executed phases. The earlier "v10 ERROR" was v9's exit(1) status lagging ~10 min (v10 never actually started). push_vllm.py: use `--raw` (default is now raw).
+
+### Scheduling/capacity findings (18:4x–19:0x, evening UTC peak)
+
+- Saves can **queue silently for many minutes** when T4 capacity is
+  tight (evening UTC ≈ US peak): `session={}`, no billing, no D1
+  writes. Earlier same-day runs started in 30–40 s (17:33, 18:25);
+  18:47–19:05 = multi-minute darkness on two accounts (happink +
+  temilolo both queued) → cluster-wide capacity, not payload.
+- A save while the previous session still shows `ERROR`/teardown
+  appears to **drop the trigger** (status clears but no run): push only
+  when `GetKernelSessionStatus` already reads `{}`, and bump content
+  (docstring) to defeat save-dedup; `lastRunTime` stamps at schedule
+  for some pushes, at actual start for others — treat both as hints,
+  only D1 writes are truth.
+- Two accounts queued simultaneously is fine (different sessions); the
+  E-series stagger advice is about capacity contention during launches.
+
+### Push/session mechanics — final recipe (verified 19:50, PROBE2_OK)
+
+| Rule | Evidence |
+|------|----------|
+| **Creation must send ipynb-wrapped `text`** (nbformat 4, cell id ok) | raw-text CREATION poisons the kernel: sessions flip RUNNING→ERROR with **zero execution** (probe `vllm-sched-probe`, temilolo `vllm-sm75-bf16-test` v1/v2) |
+| Saves to a properly-created kernel may be raw .py (auto-wrapped) **or** ipynb | happink kernel (E4-era creation) ran raw saves v4–v13 fine; probe2 creation+ipynb ran to D1 write |
+| **`newTitle` determines the slug at creation** (`slugify(title)`); the `slug` payload field is ignored on create | "VLLM SM75 vllm-sm75-bf16-a1" → `vllm-sm75-vllm-sm75-bf16-a1`; "Sched Probe Two" → `sched-probe-two`. Titles are account-unique (409 otherwise) |
+| **Always print the FULL SaveKernel response** — `{"error":"Maximum batch GPU session count of 2 reached."}` hides in there | batch = concurrent GPU *commit* sessions, limit 2/account (kaggle-cli#185, product-feedback/223728); known stale-counter bug; no stop RPC exists (StopKernel et al. all 404; official CLI only has kernels_delete) |
+| GPU trigger → start latency: **~40 s when capacity is free** (17:33, 18:25, 19:25 waves), otherwise silent queueing for tens of minutes with `session={}` and no billing | CPU sessions start in ~9 s regardless → dark GPU = capacity, not payload |
+| `GetKernelSessionStatus` 403s for kernels that **don't exist** (not 404) | probe slug polling confusion |
+| Fix stack in notebook (in order): HF xet-off → PRE_SERVE torchaudio → file main guard → PATCH_SM75 → `skip_mm_profiling=True` → `enforce_eager=True` → OOM-first tagger | E8 §10 |

@@ -1,4 +1,4 @@
-"""vLLM sm75 test v10 — v9 + skip_mm_profiling (128GiB ViT SDPA OOM fix) + OOM-first tagger.
+"""vLLM sm75 test v16 — enforce_eager; alagbo clean-batch run.
 
 Injected at push time: @@CF_ACCOUNT@@ @@CF_DB@@ @@CF_KEY@@ @@HF_TOKEN@@
 Rows: vllm_sm75 (status+notes+result), vllm_sm75_hb (30s heartbeat).
@@ -209,7 +209,7 @@ def main():
     llm = LLM(model='Qwen/Qwen3.5-4B', dtype='bfloat16', tensor_parallel_size=2,
               gpu_memory_utilization=0.92, max_model_len=4096,
               trust_remote_code=True, download_dir='/kaggle/working/hf_cache',
-              skip_mm_profiling=True)
+              skip_mm_profiling=True, enforce_eager=True)
     t_load = time.time()-t0
     sp = SamplingParams(max_tokens=64, temperature=0.7)
     t1 = time.time()
@@ -262,6 +262,8 @@ tag = "FAIL_SERVE"
 # "not supported" line used to mis-tag OOM as FAIL_DTYPE_BF16 (v9).
 if "out of memory" in low:
     tag = "FAIL_OOM"
+elif "skipframe" in low or "bf16 is not supported" in low or "inductor" in low and "error" in low:
+    tag = "FAIL_COMPILE"   # torch._inductor bf16 gate (v13); fixed via enforce_eager
 elif "bfloat16" in low and ("not supported" in low or "unsupported" in low) \
         and "out of memory" not in low and "profile" not in low:
     tag = "FAIL_DTYPE_BF16"

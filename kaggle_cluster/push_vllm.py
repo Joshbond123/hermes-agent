@@ -17,28 +17,52 @@ def g(n):
     return m.group(1).strip() if m else ""
 
 
-# usage: push_vllm.py [user_key=P] [token_key=P] [slug] [template]
-uk = sys.argv[1] if len(sys.argv) > 1 else "KAGGLE_BU3"
-tk = sys.argv[2] if len(sys.argv) > 2 else "KAGGLE_B3"
-slug = sys.argv[3] if len(sys.argv) > 3 else "vllm-sm75-bf16-test"
-tpl_path = sys.argv[4] if len(sys.argv) > 4 else "/home/user/work/cluster/vllm_sm75_template.py"
+# usage: push_vllm.py [user_key] [token_key] [slug] [template] [--raw]
+uk = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("--") else "KAGGLE_BU3"
+tk = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else "KAGGLE_B3"
+slug = sys.argv[3] if len(sys.argv) > 3 and not sys.argv[3].startswith("--") else "vllm-sm75-bf16-test"
+tpl_path = sys.argv[4] if len(sys.argv) > 4 and not sys.argv[4].startswith("--") else "/home/user/work/cluster/vllm_sm75_template.py"
+RAW = "--raw" in sys.argv
 
 tpl = open(tpl_path).read()
-text = (
+code = (
     tpl.replace("@@CF_ACCOUNT@@", g("CF_ACCOUNT"))
     .replace("@@CF_DB@@", g("CF_DB"))
     .replace("@@CF_KEY@@", g("CF_KEY"))
     .replace("@@HF_TOKEN@@", g("HF_TOKEN"))
 )
 for marker in ("@@CF_ACCOUNT@@", "@@CF_DB@@", "@@CF_KEY@@", "@@HF_TOKEN@@"):
-    if marker in text:
+    if marker in code:
         raise SystemExit(f"unreplaced marker {marker}")
+
+if RAW:
+    text = code  # control: raw .py (scheduled fine as v10; fails at session parse)
+else:
+    # DEPRECATED path kept for A/B: ipynb JSON saved fine but never scheduled
+    # (v11/v12); raw+SAVE_AND_RUN_ALL is the empirically working combo (v13).
+    lines = code.splitlines(keepends=True)
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+    notebook = {
+        "cells": [{"cell_type": "code", "execution_count": None, "id": "c1",
+                   "metadata": {}, "outputs": [], "source": lines}],
+        "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python",
+                                    "name": "python3"},
+                     "language_info": {"name": "python"}},
+        "nbformat": 4, "nbformat_minor": 5,
+    }
+    text = json.dumps(notebook)
+# Default to raw: flip when --wrap given.
+if not RAW:
+    text = code
+if "--wrap" in sys.argv:
+    text = json.dumps(notebook)
 
 acct = Account(g(uk), g(tk), role="model", slot="backup")
 fleet = FleetManager([acct])
 payload = {
     "slug": f"{acct.user}/{slug}",
-    "newTitle": "VLLM SM75 BF16 Test",
+    "newTitle": f"VLLM SM75 {slug}",  # account-unique: title derives from slug (409 guard)
     "text": text,
     "language": "python",
     "kernelType": "notebook",
@@ -51,8 +75,7 @@ payload = {
 }
 try:
     out = fleet.rpc(acct, "SaveKernel", payload)
-    print("pushed:", json.dumps({k: out.get(k) for k in
-          ("slug", "ref", "versionNumber") if k in out}), flush=True)
+    print("pushed FULL:", json.dumps(out)[:900], flush=True)
 except FleetError as e:
     raise SystemExit(f"PUSH FAILED: {e}")
 
