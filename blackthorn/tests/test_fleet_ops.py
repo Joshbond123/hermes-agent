@@ -21,7 +21,7 @@ def _quota(remaining):
 @pytest.fixture()
 def ops(monkeypatch):
     """Patch the fleet transport + row writes + notebook builders; record every action."""
-    calls = {"starts": [], "rows": [], "rpcs": [], "mirrors": [], "texts": {}}
+    calls = {"starts": [], "rows": [], "rpcs": [], "mirrors": [], "texts": {}, "meta": [], "dispatches": []}
     quota = {"tp": 108000.0, "tb": 108000.0, "cp": 108000.0, "cb": 108000.0}
 
     def fake_rpc(method, body, token):
@@ -32,8 +32,11 @@ def ops(monkeypatch):
 
     monkeypatch.setattr(FleetManager, "_rpc", staticmethod(fake_rpc))
     monkeypatch.setattr(d1, "_write_fleet_row",
-                        lambda row_id, status, tunnel_url="", api_key="", model="", gpu_info="":
-                        calls["rows"].append((row_id, status)))
+                        lambda row_id, status, **kwargs: calls["rows"].append((row_id, status)))
+    monkeypatch.setattr(d1, "_set_meta", lambda key, value: calls["meta"].append((key, value)))
+    monkeypatch.setattr(d1, "_record_stop_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(d1, "_fleet_role_online", lambda role: False)
+    monkeypatch.setattr(d1, "com11_start", lambda: calls["dispatches"].append(True) or {"ok": True, "status": "dispatched"})
     monkeypatch.setattr(d1, "ensure_d1_schema", lambda: None)
     monkeypatch.setattr("blackthorn.fleet.accounts_from_env", lambda env: list(ACCOUNTS))
     monkeypatch.setattr("blackthorn.kaggle_bundle.build_notebook_text",
@@ -62,11 +65,12 @@ def ops(monkeypatch):
 def test_turn_on_boots_both_systems_together_and_never_the_backups(ops):
     out = d1.turn_on_fleet(blocking=True)
     started = {user for user, _slug, _nb in ops["starts"]}
-    assert started == {"joshbond123", "josh787"}                     # both primaries, in one call
+    assert started == {"joshbond123"}  # Kaggle runs only the selected model; Com11 is separate.
     assert out["model"]["account"] == "joshbond123"
-    assert out["computer"]["account"] == "josh787"
+    assert out["computer"]["account"] == "github-actions"
+    assert ops["dispatches"] == [True]
     assert any(r == ("primary", "BOOTING_KAGGLE_GPU") for r in ops["rows"])
-    assert any(r == ("computer", "BOOTING_KAGGLE_GPU") for r in ops["rows"])
+    assert any(r == ("computer", "COM11_BOOTING") for r in ops["rows"])
     assert not any(u in ("teslaarymo", "alagbo") for u in started)   # backups stay COLD
 
 
@@ -79,52 +83,23 @@ def test_backup_boots_only_when_the_primary_hits_thirty_minutes(ops):
     assert out["model"]["reason"] == "primary_quota_low"
 
 
-def test_failover_syncs_state_before_booting_the_backup(ops):
-    order = []
-    ops["mirrors"].append  # keep fixture alive
-    import blackthorn.fleet as fleet_mod
-
-    def fake_mirror(*a, **k):
-        order.append("sync")
-        return {"ok": True}
-
-    def fake_start(self, account, *, slug, title, notebook_text, datasets=None):
-        order.append(f"boot:{account.user}")
-        return {"ok": True}
-
-    ops["starts"].clear()
-    import cloudflare_d1_client as _d
-    # patch where failover_fleet_role imports them from
-    import blackthorn.fleet as fm
-    orig_mirror = fm.mirror_state_dataset
-    fm.mirror_state_dataset = fake_mirror
-    try:
-        import unittest.mock as mock
-        with mock.patch.object(_d, "_role_intended_online", lambda role: True), \
-             mock.patch.object(_d, "_role_boot_in_progress", lambda role: False), \
-             mock.patch.object(FleetManager, "start_kernel", fake_start), \
-             mock.patch.object(FleetManager, "rpc",
-                               lambda self, account, method, body=None: order.append(f"{method}:{account.user}") or {"ok": True}):
-            out = _d.failover_fleet_role("computer", "primary", "backup")
-    finally:
-        fm.mirror_state_dataset = orig_mirror
-    assert out["account"] == "alagbo"
-    assert order.index("sync") < order.index("boot:alagbo")           # state first, then switch
-    assert "GetKernelSessionStatus:josh787" in order                  # old primary retire attempted after
-    assert order.index("boot:alagbo") < order.index("GetKernelSessionStatus:josh787")
+def test_model_failover_starts_backup_and_restarts_boot_timer(ops, monkeypatch):
+    monkeypatch.setattr(d1, "_role_intended_online", lambda role: True)
+    monkeypatch.setattr(d1, "_role_boot_in_progress", lambda role: False)
+    monkeypatch.setattr(FleetManager, "find_role_kernel", lambda *a: None)
+    monkeypatch.setattr(FleetManager, "stop_kernel_session", lambda *a: True)
+    out = d1.failover_fleet_role("model", "primary", "backup")
+    assert out["account"] == "teslaarymo"
+    assert out["status"] == "starting"
+    assert any(u == "teslaarymo" for u, _slug, _nb in ops["starts"])
+    assert any(key == "blackthorn_gpu_boot_started" for key, _ in ops["meta"])
+    assert not ops["mirrors"]  # Computer checkpoint does not apply to model failover.
 
 
-def test_resource_exhaustion_is_reported_not_hidden(ops):
-    """A start failure on one system must not fake success or block the other."""
-    def boom(self, account, *, slug, title, notebook_text, datasets=None):
-        if account.role == "computer":
-            raise RuntimeError("Kaggle quota exhausted")
-        return {"ok": True}
-
-    import unittest.mock as mock
-    with mock.patch.object(FleetManager, "start_kernel", boom):
-        out = d1.turn_on_fleet(blocking=True)
+def test_com11_dispatch_failure_is_reported_without_blocking_the_model(ops, monkeypatch):
+    monkeypatch.setattr(d1, "com11_start", lambda: {"ok": False, "error": "GitHub dispatch unavailable"})
+    out = d1.turn_on_fleet(blocking=True)
     assert out["model"]["status"] == "starting"
     assert out["computer"]["status"] == "start_failed"
-    assert "quota exhausted" in out["computer"]["error"]
-    assert ("computer", "BOOT_FAILED") in ops["rows"]                 # the UI sees the real failure
+    assert "dispatch unavailable" in out["computer"]["error"]
+    assert ("computer", "BOOT_FAILED") in ops["rows"]

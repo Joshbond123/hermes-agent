@@ -1812,6 +1812,9 @@ def turn_on_fleet(blocking: bool = False) -> Dict[str, Any]:
     # Never re-push a live computer when merely turning the model back on.
     for role in ("model", "computer"):
         if role != "computer" and plan[role]["account"] is not None and not plan[role]["reusable"]:
+            # The fleet path used to leave blackthorn_gpu_boot_started unchanged.
+            # The GPU UI then displayed the elapsed time since an earlier boot.
+            _set_meta("blackthorn_gpu_boot_started", str(time.time()))
             _write_fleet_row("primary", "BOOTING_KAGGLE_GPU",
                              gpu_info=f"Allocating on {plan[role]['account'].user}...")
 
@@ -1960,6 +1963,8 @@ def failover_fleet_role(role: str, from_slot: str, to_slot: str) -> Dict[str, An
         env = notebook_env_for(new, dict(os.environ))
         text = (build_computer_notebook_text if role == "computer" else build_notebook_text)(env=env)
         slug = kernel_slug_for(new)
+        if role == "model":
+            _set_meta("blackthorn_gpu_boot_started", str(time.time()))
         _write_fleet_row(row_id, "BOOTING_KAGGLE_GPU", gpu_info=f"Failover to {new.user}...")
         fleet.start_kernel(new, slug=slug, title=f"Blackthorn {role} ({new.user})", notebook_text=text)
         out.update(status="starting", slug=slug)
