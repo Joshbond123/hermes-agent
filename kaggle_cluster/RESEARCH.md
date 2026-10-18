@@ -1,0 +1,221 @@
+# Kaggle 3-Account Cluster — Research Log (live)
+
+Owner task: aggregate 3 Kaggle accounts into one logical cluster serving
+`orcarouter/Qwen3.8-27B-Uncensored` **BF16** (55.56 GB, 18 shards,
+27.78 B params), with automatic backup-cluster failover at T-30 min of
+session time, zero re-download persistence, and UI status fixes.
+
+All findings below are either **measured** (marked E) or **sourced** (marked
+with the URL). Nothing is claimed as working until its test ID passes.
+
+---
+
+## 1. Accounts, quota, API (E)
+
+- Doc (`Blackthorn` Drive doc, modified 2026-10-18 11:31) defines **two
+  clusters of three accounts each**:
+  - PRIMARY: `black797`, `teslaarymo`, `alagbo`
+  - BACKUP: `Joshbond123`, `temilolo`, `happink`
+  - All six KGAT tokens staged locally as `KAGGLE_U*/P*` and
+    `KAGGLE_BU*/B*` in `~/.secrets/com11.env` (values never printed).
+- `GetAcceleratorQuotaStatistics` works with all six tokens:
+  **30.0 h GPU/week each, 0 h used, refresh 2026-10-24T00:00:00Z**
+  (`timeUsed/timeReserved/totalTimeAllowed/minimumTimeAllowed=108000s`).
+  TPU quota 72000 s (unused). (E: 2026-10-18 ~11:47)
+- `GetKernelSessionStatus` **works from outside** once the kernel exists
+  (earlier 403 `kernels.get` happened only before creation):
+  `{"status":"RUNNING"}`. Usable for session-liveness. (E)
+- `SaveKernel` RPC semantics (E):
+  - `slug` **must be** `{username}/{slug}` — bare slug silently no-ops
+    (returns `{}` and creates nothing).
+  - `kernelType:"notebook"` requires **nbformat-4 JSON** text; raw .py
+    under notebook type runs nothing (run time stamped, zero output).
+  - `kernelExecutionType:"SAVE_AND_RUN_ALL"` (enum name; kagglesdk
+    `EnumSerializer` uses `.name`) is what actually **starts** the run.
+    Without it a newly created kernel does not execute.
+  - Fields used: `isPrivate`, `enableInternet:true`, `enableGpu:false`
+    (CPU probes), `machineShape:"NvidiaTeslaT4"` + `enableGpu:true`
+    (GPU sessions, per existing fleet).
+  - `lastRunTime` in REST `GET /api/v1/kernels/list?user=` reflects the
+    running session start (works with Bearer token).
+- Push→RUN latency for CPU kernels: **~60–90 s** from SaveKernel to
+  first D1 write; session ends when the script exits. (E)
+- GPU shape (2026-10): only `NvidiaTeslaT4` (UI "T4 ×2", 2×16 GB) for
+  general accounts; P100 sunset 2026-09-15; L4 = select competitions.
+  Source: kaggle-cli PR #1198 / issue #1196; kaggle.com/discussions/
+  product-announcements/735239; kaggle.com/docs/notebooks.
+
+## 2. Cross-session networking (E — decisive)
+
+Experiment `netprobe` v1/v2, two accounts, CPU sessions, results in D1
+rows `np_p1`/`np_p2` (table `kaggle_gpu_state`):
+
+- Each session is an **isolated container netns**:
+  `eth0 172.19.2.2/24` (SAME address on every session), default via
+  `172.19.2.1`, **gateway unreachable (timeout)**, `.3+` = "no route to
+  host", ARP table empty.
+- v1 "internal connect succeeded" was **self-connection**; v2 nonce test
+  proves every answered socket belongs to the local host
+  (`peer_host == HOSTID`, `self:true`).
+- **Public IPs differ and inbound TCP to them times out** (GCP firewall,
+  no hole punching possible): p1 `34.9.218.210`/egress `34.81.112.98`,
+  p2 `35.201.197.221`/egress `34.75.225.94`.
+- **Sessions land in random GCP regions/continents**:
+  - black797 probe egress = **Taipei, TW (asia-east1)**
+  - teslaarymo probe egress = **North Charleston, SC, US (us-east1)**
+  - (ipinfo.io from inside the session)
+- Conclusion: **no direct L3 between sessions**; cross-node traffic must
+  ride outbound-initiated tunnels/relays, and **region placement must be
+  measured at boot** (retry strategy needed to keep PP latency sane).
+
+## 3. Model & precision facts
+
+- `orcarouter/Qwen3.8-27B-Uncensored`: arch
+  `Qwen3_5ForConditionalGeneration`, hybrid Gated-DeltaNet (48 linear +
+  16 full-attn of 64 layers) + VL tower + MTP; safetensors 55 563 118 992
+  B / 18 shards, BF16, 27 781 427 952 params; **gated=auto**, region us.
+  (HF API, E)
+- **HF token from doc (`HF_TOKEN`) authenticates but is NOT authorized**:
+  `resolve/.../config.json` → 403 "not in the authorized list";
+  `GET /api/models/...` → 200 (metadata only). Web accept-form endpoint
+  not yet found (guessed `/request-access`, `/access-request`, `/accept`,
+  `/request` → 404). Gate acceptance = one click by a logged-in user.
+- **Ungated 16-bit sources (verified via HF API, E):**
+  - `chimingw/Qwen3.8-27B-Uncensored-OrcaRouter-GGUF` (**gated=false**):
+    `BF16/…-FP8-derived-BF16-00001-of-00002.gguf` 44 977 268 896 B +
+    `…-00002…` 8 831 013 728 B = 53.8 GB (**bf16-typed GGUF**), plus
+    Q8_0 29.0 GB, mmproj F16/BF16. Lineage pinned to orcarouter FP8 rev.
+  - `orcarouter/Qwen3.8-27B-Uncensored-GGUF` (**gated=auto**): F16 split
+    2× files 54.7 GB "full precision".
+  - `ressl/Qwen3.8-27B-uncensored-GGUF` (gated=false) — current code's
+    `HF_REPO` (Q4_K_M).
+- Fallback if gate stays closed: download chimingw **BF16 GGUF** (ungated)
+  → convert to **bf16 safetensors** (dtype-preserving) → same artifacts
+  as gated repo, byte-level provenance documented (FP8-derived lineage).
+- FP8 sibling 30.9 GB unusable on 32 GB T4×2 (needs ~40 GB).
+
+## 4. Serving stack constraints (sourced)
+
+- T4 = sm75 Turing: **no BF16 tensor cores**; PyTorch ≥2.8
+  `is_bf16_supported()` returns True only in *emulation* mode; vLLM min
+  CC 7.5 (docs.vllm.ai/en/stable/getting_started/installation/gpu);
+  FP8 KV cache unsupported on sm75 (vLLM issue #47549); FlashInfer SM75
+  restored in vLLM PR #55380 (requires `uv pip uninstall --system
+  flashinfer-jit-cache`, HEAD_DIM ≤ 256); TRITON_ATTN prefill up to 15×
+  slower on Turing (issue #60821); T4 fixed in vLLM 0.11.1 (issue #27729).
+  → **Open test: does `--dtype bfloat16` run on sm75 at all?**
+- Multi-node vLLM (docs.vllm.ai parallelism_scaling + kubernetes.recipes
+  + spark-vllm-docker 2026-07):
+  - Ray backend is the default for multi-node; **no-Ray** path:
+    `vllm serve … --nnodes N --node-rank R --master-addr A --master-port
+    P --tensor-parallel-size TP --pipeline-parallel-size PP
+    --distributed-executor-backend mp` (multi-host mp requires PP ≥ 1
+    with PP>1; V1-engine multi-node PP via mp was issue #41864, now
+    documented as supported in current CVS docs 2026-09).
+  - For TP×PP across hosts: `TP = GPUs per node (2)`, `PP = nodes (3)`.
+  - Required env: `NCCL_IB_DISABLE=1`, `NCCL_P2P_DISABLE` (cross-node),
+    `NCCL_SOCKET_IFNAME`/`GLOO_SOCKET_IFNAME` pinned, `NCCL_SHM_DISABLE=1`
+    across nodes, `NCCL_PROTO=Simple` for heterogeneous paths,
+    `NCCL_TIMEOUT`/`NCCL_SOCKET_TIMEOUT` raised for high RTT.
+- PP math for this model (design): hidden 5120 × bf16 = 10 KB/token per
+  stage boundary; 64 layers → ~21–22 layers/stage; per-GPU weights
+  ≈ 9.3 GB (55.6/3/2) + KV share of 96 GB aggregate.
+
+## 5. Transport decision (design, next tests)
+
+No inbound, random regions → raw-socket users (NCCL, Ray, vLLM mp,
+llama.cpp `--rpc`) all need a **public TCP rendezvous per node**.
+Candidates to test (in order):
+
+1. **bore.pub** (open-source TCP tunnel, no account): client exposes
+   `public_host:port → local port`. Test liveness + throughput 2026-10.
+2. **inrok** (`app.inrok.in`, API key in doc; already used by production
+   stack env `INROK_API_KEY`/`INROK_TUNNEL_NAME`): determine whether it
+   offers raw TCP endpoints.
+3. playit.gg / tailscale-derp (accounts) as fallback.
+4. Cloudflare quick tunnels are **HTTP/WS only** — usable for control
+   plane (gateway) but not for NCCL.
+
+Placement strategy: probe region at session start (ipinfo egress); if the
+three primary nodes are not co-region(ed within acceptable RTT), stop the
+outlier and re-push (CPU probes are ~90 s; GPU attempts cost only their
+startup minutes). Then form the tunnel mesh, then vLLM.
+
+## 6. Failover / session-time detection (partial E)
+
+- Weekly quota API (§1) = **weekly** budget, not session remaining.
+- Session remaining = 12 h limit minus (now − session start).
+  Session start available via REST `lastRunTime` (list) or
+  `GetKernelSessionStatus` (works). T-30 min trigger = orchestrator
+  computes `session_start + 12h − now ≤ 30 min` → start backup cluster
+  (its 3 different accounts), warm it, flip D1 `tunnel_url`, stop
+  primary at T0.
+- Quota math (honest): steady-state with rolling T-30 handoff burns
+  ≈12 h per account per ~11.5 h of cluster uptime → with 30 h/week the
+  cluster can stay hot ≈ **24–29 h/week**, not 168 h. Must document.
+
+## 7. Persistence design (from existing stack, E)
+
+- Existing cache flow (cyber_ornith_server.py): private per-account
+  dataset `{user}/qwen38-27b-uncensored-model-cache` pulled **inside the
+  run** (attach-at-push measured to stall boots 30+ min — do not
+  re-enable `datasetDataSources` mount for large sets), verified, else HF
+  fallback; boot-step vocab CHECKING_CACHE→…→WARMING_GPU.
+- BF16 scale-up: 55.6 GB in-run pull from Kaggle storage is fast
+  (datacenter-local); mirror = same bytes to **each** of the 6 accounts'
+  private datasets; checksum manifest in `state_meta` for the
+  "synced/cloned backup" requirement; HF download only when dataset miss.
+
+## 8. UI bugs still in scope (from previous message)
+
+- `GpuPanel.tsx` "turning on" timer: client shows
+  `elapsed_seconds + (Date.now()-fetchedAt)/1000` while `booting`;
+  server `elapsed_seconds` derives from D1 `state_meta
+  ['blackthorn_gpu_boot_started']` (`BOOT_META_KEY`) — suspect stale /
+  never-cleared boot-start timestamp inflating the countdown.
+- Header status indicators live in `gpu.ts summarize()` / `Header.tsx`
+  (not yet inspected).
+
+## 9. Test ledger
+
+| ID | What | Result |
+|----|------|--------|
+| E1 | 6 tokens + quota API | PASS (30 h each) |
+| E2 | HF token auth vs gate | metadata 200, files 403 (unauthorized) |
+| E3 | netprobe v1 push (raw py, no exec type) | FAIL (silent no-run) |
+| E4 | netprobe v1' (ipynb, SAVE_AND_RUN_ALL) | PASS run; internal reach = SELF false-positive |
+| E5 | netprobe v2 nonce + region + sweep | PASS: isolation + regions proven |
+| E6 | GetKernelSessionStatus outside | PASS 200 RUNNING |
+| E7 | CPU push→run latency | PASS ~60–90 s |
+
+## 10. E8: vLLM BF16-on-T4 bring-up (happink/vllm-sm75-bf16-test)
+
+One notebook, iterated v1→v10; every fix evidence-backed via D1 rows
+`vllm_sm75` (status/gpu_info) + `vllm_sm75_hb` (30 s heartbeat) +
+`vllm_sm75_l1..l3` (full serve-log thirds on failure).
+
+| Ver | Blocker found | Fix |
+|-----|---------------|-----|
+| v1 | HF **xet** backend crashed the session seconds after `snapshot_download` (status ERROR, 585 s billed) | `HF_HUB_DISABLE_XET=1` + per-file `hf_hub_download`; heartbeat row mandatory |
+| v2 | pip `vllm` pulls torch 2.13.0+cu130 vs preinstalled torchaudio cu128 → RuntimeError in transformers import chain | PRE_SERVE phase: import test → uninstall torchaudio → retest → reinstall fallback |
+| v3 | EngineCore spawn bootstrap crash (heredoc stdin main can't be re-imported) | file-based `serve.py` + `if __name__ == '__main__':` guard |
+| v4/v5 | (spawn fixed) arch resolved `Qwen3_5ForConditionalGeneration`, driver 580.178.04 `cuda-ok`, failure moved to WorkerProc init | — |
+| v6 | **`vllm/platforms/cuda.py:648 check_if_supports_dtype` → ValueError "Bfloat16 is only supported on GPUs with compute capability of at least 8.0 … (T4, 7.5)"** | vLLM hard-blocks bf16 below CC 8.0 although torch reports `is_bf16_supported()==True` → file-level PATCH_SM75 |
+| v7 | in-process monkeypatch invisible to spawned workers (fresh module import) | patch must be file-level in dist-packages |
+| v8 | triple-quoted patch text → SyntaxError (unterminated string) | quote-free patch: keep `def` line, body = 8-space `return  # …`; `py_compile` verified inside the phase |
+| v9 | **PATCH VERIFIED ON LIVE GPUs**: workers loaded model in bf16 (`dtype=torch.bfloat16` accepted, weights resident). New failure = **OOM "Tried to allocate 128.00 GiB"** in `vit_attn_wrappers.py → F.scaled_dot_product_attention`, mis-tagged FAIL_DTYPE_BF16 (FA2 "not supported" line + 'bfloat16' in config dump) | see v10 |
+| v10 | root cause: engine `profile_run → encoder_runner.profile_encoder_cache(dummy_mm_inputs)` runs the **vision tower** on a 4096×4096 dummy (patch 16 → 65 536 tokens; 65536² × 16 heads × 2 B = **exactly 128 GiB**); bf16-on-Turing → SDPA math fallback materializes the matrix → OOM. FA2 unavailable on CC<8 (logged, benign) | `LLM(..., skip_mm_profiling=True)` (gates `model_runner.py:994` block; text-only serving never touches the ViT) + `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` + OOM-first failure tagger |
+
+- Verdict so far: **bf16-on-sm75 bypass = fixed & verified**; v10 (skip
+  encoder profiling) fixes the 128 GiB profiler OOM.
+- FAIL_DTYPE_BF16 classifier was a false positive: 'bfloat16' occurs in
+  every config dump; the "not supported" came from
+  `fa_utils.py:212 FA2 is only supported on devices with compute
+  capability >= 8` (benign fallback to TRITON_ATTN/TORCH_SDPA).
+
+## 11. Test ledger (continued)
+
+| ID | What | Result |
+|----|------|--------|
+| E8 | vLLM bf16-on-T4 series v1→v10 (see §10) | v9: patch verified on live GPUs; v10 in flight |
+| E9 | netprobe-v3 peer sweep (teslaarymo v5, alagbo v1) | PASS: 256 addrs **0 hits** = sessions fully isolated; egress SC 34.148.241.40 / OR 136.69.162.65, peer TW 34.81.112.98 → random regions |
