@@ -172,6 +172,7 @@ async def login(body: Login, request: Request) -> JSONResponse:
             s = get_settings()
         except Exception:
             s = Settings()
+        pass  # token issued below
         token = issue_token(s)
         response = JSONResponse({"ok": True})
         set_session_cookie(response, token)
