@@ -133,22 +133,33 @@ async def status(request: Request):
 
 @router.post("/api/auth/login")
 async def login(body: Login, request: Request) -> JSONResponse:
+    """Owner login — plain password only (env or built-in fallback)."""
     import os
-    s = get_settings()
-    username = (body.username or "").strip()
-    password = body.password or ""
-    admin_user = (os.environ.get("BLACKTHORN_ADMIN_USER") or "admin").strip()
-    expected = (
-        os.environ.get("BLACKTHORN_ADMIN_PASSWORD")
-        or os.environ.get("BLACKTHORN_BOOTSTRAP_PASSWORD")
-        or "BlackthornAdmin2026"
-    ).strip()
-    if not (username == admin_user and password == expected):
-        return JSONResponse({"detail": {"code": "invalid", "message": "Incorrect password."}}, status_code=401)
-    token = issue_token(s)
-    response = JSONResponse({"ok": True})
-    set_session_cookie(response, token)
-    return response
+    try:
+        username = (body.username or "").strip()
+        password = body.password or ""
+        admin_user = (os.environ.get("BLACKTHORN_ADMIN_USER") or "admin").strip()
+        expected = (
+            os.environ.get("BLACKTHORN_ADMIN_PASSWORD")
+            or os.environ.get("BLACKTHORN_BOOTSTRAP_PASSWORD")
+            or "BlackthornAdmin2026"
+        ).strip()
+        if username != admin_user or password != expected:
+            return JSONResponse(
+                {"detail": {"code": "invalid", "message": "Incorrect password."}},
+                status_code=401,
+            )
+        s = get_settings()
+        token = issue_token(s)
+        response = JSONResponse({"ok": True})
+        set_session_cookie(response, token)
+        return response
+    except Exception as exc:
+        return JSONResponse(
+            {"detail": {"code": "error", "message": f"login_failed: {type(exc).__name__}: {exc}"}},
+            status_code=500,
+        )
+
 
 
 async def reset(body: Reset, request: Request):
