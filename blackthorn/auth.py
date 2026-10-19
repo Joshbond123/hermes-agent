@@ -133,36 +133,21 @@ async def status(request: Request):
 
 @router.post("/api/auth/login")
 async def login(body: Login, request: Request) -> JSONResponse:
-    """Authenticate owner. Prefer plain env password; never 500 on bad hash."""
     import os
     s = get_settings()
-    username = (getattr(body, "username", None) or "").strip()
-    password = getattr(body, "password", None) or ""
-    admin_user = (os.environ.get("BLACKTHORN_ADMIN_USER") or getattr(s, "admin_user", None) or "admin").strip()
+    username = (body.username or "").strip()
+    password = body.password or ""
+    admin_user = (os.environ.get("BLACKTHORN_ADMIN_USER") or "admin").strip()
     expected = (
         os.environ.get("BLACKTHORN_ADMIN_PASSWORD")
         or os.environ.get("BLACKTHORN_BOOTSTRAP_PASSWORD")
-        or getattr(s, "admin_password", None)
-        or getattr(s, "bootstrap_password", None)
         or "BlackthornAdmin2026"
     ).strip()
-    ok = False
-    if expected and username == admin_user and password == expected:
-        ok = True
-    else:
-        password_hash = (os.environ.get("BLACKTHORN_AUTH_PASSWORD_HASH") or getattr(s, "password_hash", None) or "").strip()
-        if password_hash and username == admin_user:
-            try:
-                ok = verify(password, password_hash)
-            except Exception:
-                ok = False
-    if not ok:
+    if not (username == admin_user and password == expected):
         return JSONResponse({"detail": {"code": "invalid", "message": "Incorrect password."}}, status_code=401)
+    token = issue_token(s)
     response = JSONResponse({"ok": True})
-    try:
-        set_session_cookie(response, issue_token(s), request)
-    except TypeError:
-        set_session_cookie(response, issue_token(s))
+    set_session_cookie(response, token)
     return response
 
 
