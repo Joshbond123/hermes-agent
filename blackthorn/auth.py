@@ -152,7 +152,14 @@ async def login(body: Login, request: Request) -> JSONResponse:
     elif expected:
         ok = username == admin_user and password == expected
     else:
-        return JSONResponse({"detail": {"code": "setup", "message": "Site login is not configured."}}, status_code=503)
+        # Last-resort default so the owner can sign in if Render env injection fails.
+        expected = "BlackthornAdmin2026"
+        ok = username == admin_user and password == expected
+        if not ok:
+            return JSONResponse({"detail": {"code": "setup", "message": "Site login is not configured."}}, status_code=503)
+        response = JSONResponse({"ok": True})
+        set_session_cookie(response, issue_token(s), request)
+        return response
     if not ok:
         return JSONResponse({"detail": {"code": "invalid", "message": "Incorrect password."}}, status_code=401)
     response = JSONResponse({"ok": True})
