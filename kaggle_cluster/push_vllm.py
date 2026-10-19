@@ -23,7 +23,17 @@ tk = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else 
 slug = sys.argv[3] if len(sys.argv) > 3 and not sys.argv[3].startswith("--") else "vllm-sm75-bf16-test"
 tpl_path = sys.argv[4] if len(sys.argv) > 4 and not sys.argv[4].startswith("--") else "/home/user/work/cluster/vllm_sm75_template.py"
 RAW = "--raw" in sys.argv
-TAG = {"KAGGLE_BU3": "hap", "KAGGLE_BU2": "tem", "KAGGLE_U3": "ala"}.get(uk, "x")
+TAG = {"KAGGLE_BU3": "hap", "KAGGLE_BU2": "tem", "KAGGLE_U3": "ala",
+       "KAGGLE_U1": "bla", "KAGGLE_U2": "tes", "KAGGLE_BU1": "jos"}.get(uk, "x")
+PART = "1"
+for a in sys.argv:
+    if a.startswith("--part="):
+        PART = a.split("=", 1)[1]
+KUSER_KEY = {"KAGGLE_BU3": "KAGGLE_B3", "KAGGLE_BU2": "KAGGLE_B2",
+             "KAGGLE_U3": "KAGGLE_P3", "KAGGLE_U1": "KAGGLE_P1",
+             "KAGGLE_U2": "KAGGLE_P2", "KAGGLE_BU1": "KAGGLE_B1"}.get(uk, tk)
+KUSER = g(uk)   # kaggle username of the chosen account (value not printed)
+KKEY = g(KUSER_KEY)
 
 tpl = open(tpl_path).read()
 code = (
@@ -32,8 +42,12 @@ code = (
     .replace("@@CF_KEY@@", g("CF_KEY"))
     .replace("@@HF_TOKEN@@", g("HF_TOKEN"))
     .replace("@@TAG@@", TAG)
+    .replace("@@PART@@", PART)
+    .replace("@@KUSER@@", KUSER)
+    .replace("@@KKEY@@", KKEY)
 )
-for marker in ("@@CF_ACCOUNT@@", "@@CF_DB@@", "@@CF_KEY@@", "@@HF_TOKEN@@", "@@TAG@@"):
+for marker in ("@@CF_ACCOUNT@@", "@@CF_DB@@", "@@CF_KEY@@", "@@HF_TOKEN@@", "@@TAG@@", "@@PART@@",
+               "@@KUSER@@", "@@KKEY@@"):
     if marker in code:
         raise SystemExit(f"unreplaced marker {marker}")
 
@@ -64,17 +78,18 @@ acct = Account(g(uk), g(tk), role="model", slot="backup")
 fleet = FleetManager([acct])
 payload = {
     "slug": f"{acct.user}/{slug}",
-    "newTitle": f"VLLM SM75 {slug}",  # account-unique: title derives from slug (409 guard)
+    "newTitle": slug,  # creation derives slug from title: keep both identical
     "text": text,
     "language": "python",
     "kernelType": "notebook",
     "isPrivate": True,
-    "enableGpu": True,
+    "enableGpu": "--cpu" not in sys.argv,
     "enableTpu": False,
     "enableInternet": True,
-    "machineShape": "NvidiaTeslaT4",
     "kernelExecutionType": "SAVE_AND_RUN_ALL",
 }
+if "--cpu" not in sys.argv:
+    payload["machineShape"] = "NvidiaTeslaT4"
 try:
     out = fleet.rpc(acct, "SaveKernel", payload)
     print("pushed FULL:", json.dumps(out)[:900], flush=True)

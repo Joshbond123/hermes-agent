@@ -80,7 +80,9 @@ def main():
             print("[%s] status=%s updated_at=%.1f" % (
                 time.strftime("%H:%M:%S"), st, upd), flush=True)
             last = st
-        if upd > baseline and st.startswith("DONE"):
+        # "DONE" anywhere: covers vllm DONE and mirror MIRROR_DONE
+        # (startswith("DONE") missed MIRROR_DONE -> monitor ran to timeout)
+        if upd > baseline and "DONE" in st:
             print("TERMINAL DONE", flush=True)
             sys.exit(0)
         if upd > baseline and (st.startswith("FAIL") or st.startswith("LOGCAP")):
