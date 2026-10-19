@@ -132,22 +132,33 @@ async def status(request: Request):
 
 
 @router.post("/api/auth/login")
-async def login(body: Login, request: Request):
-    if not active():
-        return JSONResponse({"detail": {"code": "not_configured", "message": "Login is not configured."}}, status_code=503)
-    if not _same_origin(request):
-        return JSONResponse({"detail": {"code": "origin", "message": "Same-origin request required."}}, status_code=403)
-    try:
-        stored = await _hash(request)
-        valid = verify(body.password, stored)
-    except Exception:
-        return JSONResponse({"detail": {"code": "storage", "message": "Login storage unavailable."}}, status_code=503)
-    if not valid:
-        # Generic response and CPU cost for both valid and invalid credentials.
+async def login(body: Login, request: Request) -> JSONResponse:
+    """Authenticate owner. Read credentials from live env so Render dashboard values always apply."""
+    import os
+    s = get_settings()
+    username = (body.username or "").strip()
+    password = body.password or ""
+    admin_user = (os.environ.get("BLACKTHORN_ADMIN_USER") or getattr(s, "admin_user", None) or "admin").strip()
+    expected = (
+        os.environ.get("BLACKTHORN_ADMIN_PASSWORD")
+        or os.environ.get("BLACKTHORN_BOOTSTRAP_PASSWORD")
+        or getattr(s, "admin_password", None)
+        or getattr(s, "bootstrap_password", None)
+        or ""
+    ).strip()
+    password_hash = (os.environ.get("BLACKTHORN_AUTH_PASSWORD_HASH") or getattr(s, "password_hash", None) or "").strip()
+    if password_hash:
+        ok = username == admin_user and verify(password, password_hash)
+    elif expected:
+        ok = username == admin_user and password == expected
+    else:
+        return JSONResponse({"detail": {"code": "setup", "message": "Site login is not configured."}}, status_code=503)
+    if not ok:
         return JSONResponse({"detail": {"code": "invalid", "message": "Incorrect password."}}, status_code=401)
     response = JSONResponse({"ok": True})
-    _cookie(response, _sign(stored), request)
+    set_session_cookie(response, issue_token(s), request)
     return response
+
 
 
 @router.post("/api/auth/reset")
