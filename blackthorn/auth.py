@@ -5,6 +5,8 @@ across all workers. This gate protects the API, not the public source of the SPA
 """
 from __future__ import annotations
 
+from .config import Settings, get_settings
+
 import base64
 import hashlib
 import hmac
@@ -166,7 +168,10 @@ async def login(body: Login, request: Request) -> JSONResponse:
                 {"detail": {"code": "invalid", "message": "Incorrect password."}},
                 status_code=401,
             )
-        s = get_settings()
+        try:
+            s = get_settings()
+        except Exception:
+            s = Settings()
         token = issue_token(s)
         response = JSONResponse({"ok": True})
         set_session_cookie(response, token)
