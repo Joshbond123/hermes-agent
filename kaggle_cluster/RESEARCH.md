@@ -329,3 +329,54 @@ requires. Design decided 2026-10-19 after gate reopened:
 - Rules in force: never push to a kernel with a RUNNING session (push
   cancels it); push only on `{}`/terminal; `pkill -f` needs bracket
   patterns; `d1poll` lists `mn%`.
+
+### E10c field notes (12:00–13:50 UTC)
+
+- `NameError` class: the bore `fetch()` helper was lost in the VPN
+  rewrite → hub died `FAIL_BORE` at 339 s. **pyflakes the injected cell
+  + overlay module before every push** (both now clean; lesson: compile
+  checks don't catch NameError).
+- **Jupyter catches `sys.exit`**: after a FAIL_* save the CELL ends but
+  the kernel process keeps idling — daemon heartbeat keeps writing and
+  **the GPU keeps billing** (observed 7+ min on spk1). Push rule
+  refinement: if the ROW already says FAIL_* the cell is done ⇒ a push
+  is safe AND desirable (cancels the idle session, requeues).
+- Kaggle `/dev/net/tun` node missing though `SUDO_OK` → `mknod c 10 200`
+  (in `open_tun` + env probe row `mn_env`).
+- spk1 waits: 112-min `mn_ep` window exhausted 13:38 (`FAIL_EP_WAIT`) —
+  ceilings now 720×15 s (3 h) for ep/bundle/peer loops (refreshF).
+
+## 14. E11→E12 pivot: tun impossible, single-node offload path
+
+Probes `hw_probe`/`hw_probe2` (CPU kernels, wrapped creation) settled it:
+
+- **TUN cannot exist on Kaggle**: `/dev/net/tun` absent; `modprobe tun`
+  → `FATAL: Module tun not found` (host kernel 6.18.48+, no module);
+  manual `mknod c 10 200` succeeds (root, CapEff includes CAP_NET_ADMIN
+  0x1000 — decoded from `0xa80425fb`) but `TUNSETIFF` and
+  `ip tuntap add` both → **EPERM**; cgroup v2 has no devices
+  controller. Overlay transports (openvpn/tinc/python-ovl) are all
+  therefore dead on Kaggle; only plain outbound TCP (bore/cloudflared)
+  exists. gcc/g++/make/cmake ARE present (ncclNet-plugin remains the
+  theoretical multi-node fallback; untried).
+- **Disk**: `/kaggle/working` = 20 G loop2 (confirmed dd); `/` overlay
+  reports **1.1 TB avail and rw** → per-session big scratch on `/`
+  (e.g. `/root/hf27`) is the model-file home; nothing outside
+  `/kaggle/working` persists across sessions (persistence mirrors are a
+  later phase).
+- **RAM 31 G / VRAM 2×14.996 GiB** → single-node full-BF16 =
+  TP2 + `cpu_offload_gb≈28` + `gpu_memory_utilization=0.96` +
+  `max_model_len=512` + skip_mm + enforce_eager + PATCH_SM75: totals
+  ~55.6 G weights vs 28.8 G GPU budget + 31 G RAM (tight; empirical).
+
+### E12 launched
+
+- `joshbond123/vllm27-jb` v1 16:06 UTC → session RUNNING 16:07 but
+  **ERROR with ZERO D1 writes** (cell never reached phase ENV; init-
+  level or infra failure — content passes cell-compile, pyflakes, and
+  marker sim; creation was ipynb-wrapped). v2 queued 16:13; capacity
+  drought since ~16:10 (no start through 17:06).
+- E11 4-node launcher `launch_e11.py` (check|push) stands ready for a
+  future transport (single-node path chosen first).
+- E10 mini left: hub-jb `FAIL_HUB_START` (tun EPERM), spoke deleted,
+  alagbo/temilolo kernels deleted or idle; watcher retired.

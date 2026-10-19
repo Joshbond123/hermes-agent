@@ -38,6 +38,10 @@ repl = {
     "@@TAG@@": TAG, "@@NODE_RANK@@": RANK, "@@NNODES@@": NNODES,
     "@@MASTER@@": MASTER, "@@MODEL@@": MODEL, "@@ROWPEER@@": ROWPEER,
     "@@PP@@": PP, "@@DL_MODE@@": DL_MODE, "@@HOLDSECS@@": HOLD, "@@PEERS@@": peers,
+    # E12 single-node knobs (defaults; override via env)
+    "@@CACHE@@": os.environ.get("E12_CACHE", "/root/hf27"),
+    "@@MAXLEN@@": os.environ.get("E12_MAXLEN", "512"),
+    "@@OFFLOAD@@": os.environ.get("E12_OFFLOAD", "28"),
 }
 for k, v in repl.items():
     code = code.replace(k, v)

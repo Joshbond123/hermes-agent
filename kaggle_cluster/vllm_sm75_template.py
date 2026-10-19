@@ -1,4 +1,4 @@
-"""vLLM sm75 test v18 — per-account rows (@@TAG@@) + eternal result row on DONE.
+"""E12 single-node 27B BF16 (cpu_offload) — @@MODEL@@ on @@TAG@@; cache=@@CACHE@@.
 
 Injected at push time: @@CF_ACCOUNT@@ @@CF_DB@@ @@CF_KEY@@ @@HF_TOKEN@@
 Rows: vllm_sm75 (status+notes+result), vllm_sm75_hb (30s heartbeat).
@@ -18,9 +18,9 @@ CF_DB = "@@CF_DB@@"
 CF_KEY = "@@CF_KEY@@"
 HF_TOKEN = "@@HF_TOKEN@@"
 T0 = time.time()
-ROW = "vllm_sm75_@@TAG@@"
-HB = "vllm_sm75_@@TAG@@_hb"
-MODEL = "Qwen/Qwen3.5-4B"
+ROW = "vllm27_@@TAG@@"
+HB = "vllm27_@@TAG@@_hb"
+MODEL = "@@MODEL@@"
 NOTES = []
 PHASE = ["INIT"]
 HBN = [0]
@@ -92,8 +92,13 @@ def sh(cmd, timeout=3600):
 # ---------------------------------------------------------------- phases
 phase("ENV")
 rc, out, dt = sh("python3 -V; nvidia-smi --query-gpu=name,memory.total,compute_cap --format=csv,noheader; "
-                 "free -g|head -2; df -h /kaggle/working|tail -1")
+                 "free -g|head -2; df -h / /kaggle/working; "
+                 "mkdir -p @@CACHE@@; dd if=/dev/zero of=@@CACHE@@/.w bs=1M count=64 2>&1 | tail -1; "
+                 "rm -f @@CACHE@@/.w && echo ROOT_WRITE_OK")
 save("RUNNING_GPU_INFO", out)
+if "ROOT_WRITE_OK" not in out:
+    save("FAIL_DISK", out[-1200:])
+    sys.exit(1)
 
 rc, out, dt = sh("python3 - <<'PY'\n"
                  "import torch\n"
@@ -146,7 +151,7 @@ save("RUNNING_PATCH_OK", out[:400])
 # download: in-process, per-file, xet disabled (xet crashed session in v1)
 phase("DOWNLOAD")
 os.environ["HF_HUB_DISABLE_XET"] = "1"
-os.environ["HF_HOME"] = "/kaggle/working/hf_cache"
+os.environ["HF_HOME"] = "@@CACHE@@"
 try:
     from huggingface_hub import list_repo_files, hf_hub_download
 
@@ -156,7 +161,7 @@ try:
     got = []
     for f in sfiles:
         p0 = time.time()
-        hf_hub_download(MODEL, f, token=HF_TOKEN, cache_dir="/kaggle/working/hf_cache")
+        hf_hub_download(MODEL, f, token=HF_TOKEN, cache_dir="@@CACHE@@")
         got.append(f)
         put(ROW, "RUNNING_DL_FILE", {"file": f, "got": len(got), "total": len(sfiles),
                                      "t": round(time.time() - T0, 1), "notes": NOTES[-6:]})
@@ -206,9 +211,10 @@ def main():
     CudaPlatform.check_if_supports_dtype = _allow
     from vllm import LLM, SamplingParams
     t0 = time.time()
-    llm = LLM(model='Qwen/Qwen3.5-4B', dtype='bfloat16', tensor_parallel_size=2,
-              gpu_memory_utilization=0.92, max_model_len=4096,
-              trust_remote_code=True, download_dir='/kaggle/working/hf_cache',
+    llm = LLM(model=MODEL, dtype='bfloat16', tensor_parallel_size=2,
+              gpu_memory_utilization=0.96, max_model_len=@@MAXLEN@@,
+              cpu_offload_gb=@@OFFLOAD@@,
+              trust_remote_code=True, download_dir='@@CACHE@@',
               skip_mm_profiling=True, enforce_eager=True)
     t_load = time.time()-t0
     sp = SamplingParams(max_tokens=64, temperature=0.7)
@@ -223,21 +229,21 @@ def main():
 if __name__ == '__main__':
     main()
 """
-with open("/kaggle/working/serve.py", "w") as fh:
+with open("@@CACHE@@/serve.py", "w") as fh:
     fh.write(SERVE_SRC)
-rc, out, dt = sh("HF_TOKEN=%s HF_HUB_DISABLE_XET=1 HF_HOME=/kaggle/working/hf_cache "
+rc, out, dt = sh("HF_TOKEN=%s HF_HUB_DISABLE_XET=1 HF_HOME=@@CACHE@@ "
                  "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "
-                 "VLLM_LOGGING_LEVEL=INFO NCCL_SHM_DISABLE=1 NCCL_P2P_DISABLE=0 NCCL_DEBUG=WARN python3 /kaggle/working/serve.py "
-                 "> /kaggle/working/vllm_serve.log 2>&1; echo RC=$?" % HF_TOKEN, timeout=3000)
-log_tail = sh("tail -c 10000 /kaggle/working/vllm_serve.log")[1]
-log_head = sh("head -c 6000 /kaggle/working/vllm_serve.log")[1]
+                 "VLLM_LOGGING_LEVEL=INFO NCCL_SHM_DISABLE=1 NCCL_P2P_DISABLE=0 NCCL_DEBUG=WARN python3 @@CACHE@@/serve.py "
+                 "> @@CACHE@@/vllm_serve.log 2>&1; echo RC=$?" % HF_TOKEN, timeout=3000)
+log_tail = sh("tail -c 10000 @@CACHE@@/vllm_serve.log")[1]
+log_head = sh("head -c 6000 @@CACHE@@/vllm_serve.log")[1]
 errlines = sh("grep -n -m 30 -Ei 'error|not supported|notimplemented|driver|cuda err|bfloat|"
-              "qwen3_5|failed|bootstrap' /kaggle/working/vllm_serve.log")[1]
+              "qwen3_5|failed|bootstrap' @@CACHE@@/vllm_serve.log")[1]
 NOTES.append({"serve_rc": out.strip()[-40:]})
 mm = re.search(r"VLLM_RESULT (\{.*\})", log_head + log_tail)
 if mm and out.strip().endswith("RC=0"):
     save("DONE", log_tail[-4000:], extra={"result": json.loads(mm.group(1)), "vllm": VER})
-    put("vllm_sm75_result", "DONE", {"result": json.loads(mm.group(1)), "vllm": VER,
+    put("vllm27_result", "DONE", {"result": json.loads(mm.group(1)), "vllm": VER,
         "tag": "@@TAG@@", "elapsed": round(time.time() - T0, 1), "notes": NOTES[-12:]})
     print("SUCCESS", mm.group(1), flush=True)
     sys.exit(0)
@@ -245,7 +251,7 @@ if mm and out.strip().endswith("RC=0"):
 
 # full log in chunks (rows vllm_sm75_l1..l3)
 try:
-    blob = open("/kaggle/working/vllm_serve.log","rb").read()
+    blob = open("@@CACHE@@/vllm_serve.log","rb").read()
     txt = blob.decode("utf-8","replace")
     n = len(txt)
     for i in range(3):

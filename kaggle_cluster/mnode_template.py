@@ -176,7 +176,9 @@ save("RUNNING_PATCH_OK", out[:400])
 # ------------------------------------------------------------------ VPN overlay (python tun<->tcp over bore)
 phase("VPN")
 print("VPN_PHASE_START sudo/tun check:", flush=True)
-rc, out, _ = sh("ls -la /dev/net/tun 2>&1; sudo -n true 2>&1 && echo SUDO_OK || echo SUDO_FAIL; "
+rc, out, _ = sh("mkdir -p /dev/net 2>/dev/null; sudo -n mknod /dev/net/tun c 10 200 2>/dev/null; "
+                "sudo -n chmod 666 /dev/net/tun 2>/dev/null; "
+                "ls -la /dev/net/tun 2>&1; sudo -n true 2>&1 && echo SUDO_OK || echo SUDO_FAIL; "
                 "python3 -V; ip -V | head -1")
 print("VPN_ENV_RC", rc, out[:600], flush=True)
 put("mn_env", "ENV", {"rank": RANK, "out": out[:1500], "t": time.time()})
@@ -196,6 +198,11 @@ def log(m):
 def open_tun(name, ip, prefix="24"):
     import subprocess
     name = "ovl" + ip.split(".")[-1]   # unique per endpoint (hub=ovl1, spokeN=ovlN)
+    # Kaggle containers lack the /dev/net/tun node (module is present): create it
+    if not os.path.exists("/dev/net/tun"):
+        subprocess.run(["mkdir", "-p", "/dev/net"], check=False)
+        subprocess.run(["mknod", "/dev/net/tun", "c", "10", "200"], check=False)
+        subprocess.run(["chmod", "666", "/dev/net/tun"], check=False)
     tun = os.open("/dev/net/tun", os.O_RDWR)
     ifr = struct.pack("16sH22s", name.encode(), 0x0001 | 0x1000, b"")  # IFF_TUN|IFF_NO_PI
     fcntl.ioctl(tun, 0x400454ca, ifr)  # TUNSETIFF
@@ -382,6 +389,12 @@ if __name__ == "__main__":
 with open("/kaggle/working/ovl.py", "w") as _f:
     _f.write(OVERLAY_SRC)
 
+
+def fetch(url, timeout=60):
+    req = urllib.request.Request(url, headers={"User-Agent": "mnode"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
 if RANK == 0:
     phase("BORE")
     try:
@@ -427,7 +440,7 @@ if RANK == 0:
     phase("VPN_WAIT_PEER")
     peers = [p for p in "@@PEERS@@".split(",") if p]
     for prow in peers:
-        peer = get_row(prow, tries=450, delay=15)   # ~112 min for capacity waves
+        peer = get_row(prow, tries=720, delay=15)   # ~112 min for capacity waves
         if not peer:
             save("FAIL_PEER_WAIT", "peer readiness row missing: " + prow)
             sys.exit(1)
@@ -438,7 +451,7 @@ if RANK == 0:
         sys.exit(1)
     save("RUNNING_VPN_OK", "hub up, %d peers reachable" % nready)
 else:
-    ep_s = get_row("mn_ep", tries=450, delay=15)
+    ep_s = get_row("mn_ep", tries=720, delay=15)
     if not ep_s:
         save("FAIL_EP_WAIT", "hub never posted mn_ep")
         sys.exit(1)
