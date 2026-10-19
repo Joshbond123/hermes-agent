@@ -99,6 +99,10 @@ def _cookie(response: JSONResponse, token: str, request: Request) -> None:
 
 
 class Login(BaseModel):
+    username: str = ""
+    password: str = ""
+    email: str = ""
+
     password: str = Field(min_length=1, max_length=512)
 
 
@@ -136,8 +140,21 @@ async def login(body: Login, request: Request) -> JSONResponse:
     """Owner login — plain password only (env or built-in fallback)."""
     import os
     try:
-        username = (body.username or "").strip()
-        password = body.password or ""
+        # Support username or email field names from different UI builds
+        username = (
+            getattr(body, "username", None)
+            or getattr(body, "email", None)
+            or getattr(body, "user", None)
+            or ""
+        )
+        if hasattr(body, "model_dump"):
+            data = body.model_dump()
+            username = username or data.get("username") or data.get("email") or data.get("user") or ""
+            password = data.get("password") or ""
+        else:
+            password = getattr(body, "password", None) or ""
+        username = str(username).strip()
+        password = str(password or "")
         admin_user = (os.environ.get("BLACKTHORN_ADMIN_USER") or "admin").strip()
         expected = (
             os.environ.get("BLACKTHORN_ADMIN_PASSWORD")
@@ -159,8 +176,6 @@ async def login(body: Login, request: Request) -> JSONResponse:
             {"detail": {"code": "error", "message": f"login_failed: {type(exc).__name__}: {exc}"}},
             status_code=500,
         )
-
-
 
 async def reset(body: Reset, request: Request):
     if not _same_origin(request):
