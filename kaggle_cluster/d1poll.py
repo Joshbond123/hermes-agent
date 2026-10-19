@@ -69,7 +69,7 @@ def main():
         return
     rows = q(
         "SELECT id,status,updated_at FROM kaggle_gpu_state "
-        "WHERE id LIKE 'vllm%' OR id LIKE 'np_%' OR id LIKE 'gpu_dbg%' "
+        "WHERE id LIKE 'vllm%' OR id LIKE 'np_%' OR id LIKE 'gpu_dbg%' OR id LIKE 'mn%' "
         "ORDER BY updated_at DESC LIMIT 30"
     )
     for r in rows:
