@@ -136,7 +136,7 @@ async def login(body: Login, request: Request) -> JSONResponse:
     """Owner login. Uses env password or BlackthornAdmin2026 fallback."""
     import os
     try:
-        s = get_settings()
+        s = Settings()
         username = (body.username or "").strip()
         password = body.password or ""
         admin_user = (os.environ.get("BLACKTHORN_ADMIN_USER") or getattr(s, "admin_user", None) or "admin").strip()
