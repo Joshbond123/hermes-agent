@@ -46,10 +46,19 @@ code = (
     .replace("@@KUSER@@", KUSER)
     .replace("@@KKEY@@", KKEY)
 )
-for marker in ("@@CF_ACCOUNT@@", "@@CF_DB@@", "@@CF_KEY@@", "@@HF_TOKEN@@", "@@TAG@@", "@@PART@@",
-               "@@KUSER@@", "@@KKEY@@"):
-    if marker in code:
-        raise SystemExit(f"unreplaced marker {marker}")
+# generic: any @@NAME@@ whose NAME exists in the secrets env
+import re as _re
+_ENVD = {}
+for _line in ENV.splitlines():
+    if "=" in _line and _line.split("=", 1)[0].isidentifier():
+        _ENVD[_line.split("=", 1)[0]] = _line.split("=", 1)[1].strip()
+for _m in _re.finditer(r"@@([A-Z0-9_]+)@@", code):
+    _name = _m.group(1)
+    if _name not in _ENVD or not _ENVD[_name]:
+        raise SystemExit(f"unreplaced marker @@{_name}@@ (missing/empty in env)")
+    code = code.replace(f"@@{_name}@@", _ENVD[_name])
+if _re.search(r"@@[A-Z0-9_]+@@", code):
+    raise SystemExit("unreplaced markers remain: " + str(_re.findall(r"@@[A-Z0-9_]+@@", code)))
 
 if RAW:
     text = code  # control: raw .py (scheduled fine as v10; fails at session parse)
