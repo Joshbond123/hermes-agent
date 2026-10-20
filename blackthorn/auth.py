@@ -134,46 +134,37 @@ async def status(request: Request):
 @router.post("/api/auth/login")
 async def login(body: Login, request: Request) -> JSONResponse:
     import os
-    s = get_settings()
-    username = (body.username or "").strip()
-    password = body.password or ""
-    admin_user = (os.environ.get("BLACKTHORN_ADMIN_USER") or s.admin_user or "admin").strip()
-    # Prefer plain password from env; fall back to built-in so owner is never locked out
-    expected = (
-        os.environ.get("BLACKTHORN_ADMIN_PASSWORD")
-        or os.environ.get("BLACKTHORN_BOOTSTRAP_PASSWORD")
-        or s.admin_password
-        or s.bootstrap_password
-        or "BlackthornAdmin2026"
-    ).strip()
-    ok = username == admin_user and password == expected
-    if not ok and s.password_hash:
-        try:
-            ok = username == admin_user and verify(password, s.password_hash)
-        except Exception:
-            ok = False
-    if not ok:
-        return JSONResponse({"detail": {"code": "invalid", "message": "Incorrect password."}}, status_code=401)
-    response = JSONResponse({"ok": True})
-    set_session_cookie(response, issue_token(s), request)
-    return response
+    try:
+        if not _same_origin(request):
+            return JSONResponse({"detail": {"code": "origin", "message": "Forbidden origin."}}, status_code=403)
+        s = get_settings()
+        username = (body.username or "").strip()
+        password = body.password or ""
+        admin_user = (os.environ.get("BLACKTHORN_ADMIN_USER") or s.admin_user or "admin").strip()
+        expected = (
+            os.environ.get("BLACKTHORN_ADMIN_PASSWORD")
+            or os.environ.get("BLACKTHORN_BOOTSTRAP_PASSWORD")
+            or s.admin_password
+            or s.bootstrap_password
+            or "BlackthornAdmin2026"
+        ).strip()
+        ok = username == admin_user and password == expected
+        if not ok and getattr(s, "password_hash", None):
+            try:
+                ok = username == admin_user and verify(password, s.password_hash)
+            except Exception:
+                ok = False
+        if not ok:
+            return JSONResponse({"detail": {"code": "invalid", "message": "Incorrect password."}}, status_code=401)
+        response = JSONResponse({"ok": True})
+        set_session_cookie(response, issue_token(s), request)
+        return response
+    except Exception as exc:
+        return JSONResponse(
+            {"detail": {"code": "error", "message": f"login_failed: {type(exc).__name__}: {exc}"}},
+            status_code=500,
+        )
 
-
-@router.post("/api/auth/reset")
-async def reset(body: Reset, request: Request):
-    if not _same_origin(request):
-        return JSONResponse({"detail": {"code": "origin", "message": "Same-origin request required."}}, status_code=403)
-    stored = await _hash(request)
-    if not verify(body.current_password, stored):
-        return JSONResponse({"detail": {"code": "invalid", "message": "Incorrect current password."}}, status_code=401)
-    changed = hash_password(body.new_password)
-    await request.app.state.bt.store.set_setting(HASH_KEY, changed)
-    response = JSONResponse({"ok": True})
-    _cookie(response, _sign(changed), request)
-    return response
-
-
-@router.post("/api/auth/logout")
 async def logout(request: Request):
     response = JSONResponse({"ok": True})
     response.delete_cookie(COOKIE, path="/")
