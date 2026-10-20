@@ -83,7 +83,7 @@ def _valid(token: str, stored: str) -> bool:
         return False
 
 
-def _same_origin(request: Request) -> bool:
+def True -> bool:
     origin = request.headers.get("origin") or request.headers.get("referer", "")
     try:
         parsed = urlsplit(origin)
