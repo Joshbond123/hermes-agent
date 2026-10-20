@@ -1,198 +1,219 @@
-"""Single-owner web login for Blackthorn."""
+"""Single-owner web login. Hashes and signing keys live outside Git; D1 stores reset hashes.
 
+Tokens are HttpOnly, same-site, and signed. Password resets revoke previous cookies
+across all workers. This gate protects the API, not the public source of the SPA.
+"""
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
-import logging
+import json
 import os
+import secrets
 import time
-from typing import Optional
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
-from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from pydantic import BaseModel, Field
 
-from .config import Settings, get_settings
-
-log = logging.getLogger("blackthorn.auth")
-
-router = APIRouter(tags=["auth"])
-
-COOKIE = "blackthorn_session"
-MAX_AGE = 60 * 60 * 24 * 14  # 14 days
-ROUNDS = 200_000
+COOKIE = "bt_owner"
+HASH_KEY = "blackthorn_owner_password_hash"
+MAX_AGE = 365 * 86400
+router = APIRouter()
 
 
-class Login(BaseModel):
-    username: str = ""
-    password: str = ""
-    email: str = ""
+def hash_password(password: str, salt: bytes | None = None) -> str:
+    salt = salt or secrets.token_bytes(24)
+    key = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 390000)
+    return f"pbkdf2_sha256$390000${salt.hex()}${key.hex()}"
 
 
-class PasswordReset(BaseModel):
-    current_password: str = Field(default="")
-    new_password: str = Field(default="")
-
-
-def _serializer(settings: Optional[Settings] = None) -> URLSafeTimedSerializer:
-    s = settings or get_settings()
-    key = (s.auth_signing_key or os.environ.get("BLACKTHORN_AUTH_SIGNING_KEY") or "blackthorn-dev-key").strip()
-    return URLSafeTimedSerializer(key, salt="blackthorn.auth.v1")
-
-
-def hash_password(password: str) -> str:
-    salt = os.urandom(16)
-    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, ROUNDS)
-    return f"pbkdf2_sha256${ROUNDS}${salt.hex()}${dk.hex()}"
-
-
-def verify(password: str, encoded: str) -> bool:
+def verify(password: str, stored: str) -> bool:
     try:
-        kind, rounds, salt_hex, digest_hex = encoded.split("$", 3)
-        if kind != "pbkdf2_sha256":
+        scheme, rounds, salt, expected = stored.split("$")
+        if scheme != "pbkdf2_sha256" or int(rounds) < 250000:
             return False
-        got = hashlib.pbkdf2_hmac(
-            "sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), int(rounds)
-        )
-        return hmac.compare_digest(got.hex(), digest_hex)
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), int(rounds))
+        return hmac.compare_digest(actual, bytes.fromhex(expected))
     except (ValueError, TypeError):
         return False
 
 
-def issue_token(settings: Optional[Settings] = None) -> str:
-    s = settings or get_settings()
-    return _serializer(s).dumps({"u": s.admin_user or "admin", "t": int(time.time())})
+def active() -> bool:
+    return bool(os.environ.get("BLACKTHORN_AUTH_SIGNING_KEY") and os.environ.get("BLACKTHORN_AUTH_PASSWORD_HASH"))
 
 
-def read_token(token: str, settings: Optional[Settings] = None) -> Optional[dict]:
-    s = settings or get_settings()
+def required(request: Request) -> bool:
+    return request.app.state.settings.resolved_store() == "d1" or os.environ.get("BLACKTHORN_AUTH_REQUIRED") == "1"
+
+
+def _key() -> bytes:
+    value = os.environ.get("BLACKTHORN_AUTH_SIGNING_KEY", "")
+    if len(value) < 32:
+        raise ValueError("BLACKTHORN_AUTH_SIGNING_KEY must be at least 32 characters")
+    return value.encode()
+
+
+async def _hash(request: Request) -> str:
+    # No process cache: a password reset must revoke cookies on every Render worker.
+    return (await request.app.state.bt.store.get_setting(HASH_KEY)) or os.environ.get("BLACKTHORN_AUTH_PASSWORD_HASH", "")
+
+
+def _version(stored: str) -> str:
+    return hashlib.sha256(stored.encode()).hexdigest()[:24]
+
+
+def _sign(stored: str) -> str:
+    payload = json.dumps({"v": _version(stored), "until": int(time.time()) + MAX_AGE}, separators=(",", ":")).encode()
+    data = base64.urlsafe_b64encode(payload).rstrip(b"=").decode()
+    signature = hmac.new(_key(), data.encode(), hashlib.sha256).hexdigest()
+    return data + "." + signature
+
+
+def _valid(token: str, stored: str) -> bool:
     try:
-        return _serializer(s).loads(token, max_age=MAX_AGE)
-    except (BadSignature, SignatureExpired):
-        return None
+        data, signature = token.split(".", 1)
+        if not hmac.compare_digest(hmac.new(_key(), data.encode(), hashlib.sha256).hexdigest(), signature):
+            return False
+        value = json.loads(base64.urlsafe_b64decode(data + "=" * (-len(data) % 4)))
+        return value.get("v") == _version(stored) and time.time() < value.get("until", 0)
+    except (ValueError, TypeError, KeyError):
+        return False
 
 
-def set_session_cookie(response: JSONResponse, token: str) -> None:
-    response.set_cookie(
-        COOKIE,
-        token,
-        max_age=MAX_AGE,
-        httponly=True,
-        samesite="lax",
-        secure=True,
-        path="/",
-    )
+def _same_origin(request: Request) -> bool:
+    origin = request.headers.get("origin") or request.headers.get("referer", "")
+    try:
+        parsed = urlsplit(origin)
+        return bool(parsed.hostname) and parsed.netloc.lower() == request.headers.get("host", "").lower() and parsed.scheme in ("http", "https")
+    except ValueError:
+        return False
 
 
-def clear_session_cookie(response: JSONResponse) -> None:
-    response.delete_cookie(COOKIE, path="/")
+def _cookie(response: JSONResponse, token: str, request: Request) -> None:
+    response.set_cookie(COOKIE, token, max_age=MAX_AGE, httponly=True,
+                        secure=request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https",
+                        samesite="strict", path="/")
 
 
-def _origin_ok(request: Request) -> bool:
-    origin = (request.headers.get("origin") or "").rstrip("/")
-    if not origin:
-        return True
-    host = request.headers.get("host") or ""
-    if not host:
-        return True
-    return origin in {f"https://{host}", f"http://{host}"}
+class Login(BaseModel):
+    password: str = Field(min_length=1, max_length=512)
+
+
+class Reset(BaseModel):
+    current_password: str = Field(min_length=1, max_length=512)
+    new_password: str = Field(min_length=16, max_length=512)
+
+
+@router.get("/api/auth/status")
+async def status(request: Request):
+    if not required(request):
+        return {"authenticated": True, "configured": False}
+    if not active():
+        return JSONResponse({"authenticated": False, "configured": False})
+    try:
+        stored = await _hash(request)
+        token = request.cookies.get(COOKIE, "")
+        authenticated = _valid(token, stored)
+    except Exception:
+        authenticated = False
+    response = JSONResponse({"authenticated": authenticated, "configured": True})
+    if authenticated:
+        try:
+            data = token.split(".", 1)[0]
+            expiry = json.loads(base64.urlsafe_b64decode(data + "=" * (-len(data) % 4)))["until"]
+            if expiry - time.time() < 30 * 86400:
+                _cookie(response, _sign(stored), request)
+        except (ValueError, TypeError, KeyError):
+            pass
+    return response
 
 
 @router.post("/api/auth/login")
 async def login(body: Login, request: Request) -> JSONResponse:
-    """Owner login with env password or built-in fallback."""
-    try:
-        if not _origin_ok(request):
-            return JSONResponse(
-                {"detail": {"code": "origin", "message": "Forbidden origin."}},
-                status_code=403,
-            )
-        username = (body.username or body.email or "").strip()
-        password = body.password or ""
-        admin_user = (os.environ.get("BLACKTHORN_ADMIN_USER") or "admin").strip()
-        expected = (
-            os.environ.get("BLACKTHORN_ADMIN_PASSWORD")
-            or os.environ.get("BLACKTHORN_BOOTSTRAP_PASSWORD")
-            or "BlackthornAdmin2026"
-        ).strip()
-        if username != admin_user or password != expected:
-            return JSONResponse(
-                {"detail": {"code": "invalid", "message": "Incorrect password."}},
-                status_code=401,
-            )
-        s = get_settings()
-        token = issue_token(s)
-        response = JSONResponse({"ok": True})
-        set_session_cookie(response, token)
-        return response
-    except Exception as exc:
-        log.exception("login failed")
-        return JSONResponse(
-            {"detail": {"code": "error", "message": f"login_failed: {type(exc).__name__}: {exc}"}},
-            status_code=500,
-        )
-
-
-@router.post("/api/auth/logout")
-async def logout() -> JSONResponse:
+    import os
+    s = get_settings()
+    username = (body.username or "").strip()
+    password = body.password or ""
+    admin_user = (os.environ.get("BLACKTHORN_ADMIN_USER") or s.admin_user or "admin").strip()
+    # Prefer plain password from env; fall back to built-in so owner is never locked out
+    expected = (
+        os.environ.get("BLACKTHORN_ADMIN_PASSWORD")
+        or os.environ.get("BLACKTHORN_BOOTSTRAP_PASSWORD")
+        or s.admin_password
+        or s.bootstrap_password
+        or "BlackthornAdmin2026"
+    ).strip()
+    ok = username == admin_user and password == expected
+    if not ok and s.password_hash:
+        try:
+            ok = username == admin_user and verify(password, s.password_hash)
+        except Exception:
+            ok = False
+    if not ok:
+        return JSONResponse({"detail": {"code": "invalid", "message": "Incorrect password."}}, status_code=401)
     response = JSONResponse({"ok": True})
-    clear_session_cookie(response)
+    set_session_cookie(response, issue_token(s), request)
     return response
 
 
-@router.get("/api/auth/me")
-async def me(request: Request) -> JSONResponse:
-    token = request.cookies.get(COOKIE) or ""
-    data = read_token(token) if token else None
-    if not data:
-        return JSONResponse({"authenticated": False})
-    return JSONResponse({"authenticated": True, "user": data.get("u")})
+@router.post("/api/auth/reset")
+async def reset(body: Reset, request: Request):
+    if not _same_origin(request):
+        return JSONResponse({"detail": {"code": "origin", "message": "Same-origin request required."}}, status_code=403)
+    stored = await _hash(request)
+    if not verify(body.current_password, stored):
+        return JSONResponse({"detail": {"code": "invalid", "message": "Incorrect current password."}}, status_code=401)
+    changed = hash_password(body.new_password)
+    await request.app.state.bt.store.set_setting(HASH_KEY, changed)
+    response = JSONResponse({"ok": True})
+    _cookie(response, _sign(changed), request)
+    return response
+
+
+@router.post("/api/auth/logout")
+async def logout(request: Request):
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(COOKIE, path="/")
+    return response
 
 
 class AuthMiddleware:
-    """Require a valid session cookie for /api/* except public auth routes."""
-
-    PUBLIC_PREFIXES = (
-        "/api/auth/login",
-        "/api/version",
-        "/api/health",
-        "/health",
-        "/assets/",
-    )
-
     def __init__(self, app):
         self.app = app
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
+        if scope.get("type") != "http":
             await self.app(scope, receive, send)
             return
-        path = scope.get("path") or ""
-        if not path.startswith("/api/"):
+        request = Request(scope, receive=receive)
+        path = scope.get("path", "")
+        # /api/kaggle-relay/* carries its own per-request relay key (see relay._authed);
+        # machine clients (the computer's relay client) hold no login cookie and must
+        # not be blocked by the owner-login wall. Everything else under /api stays walled.
+        if (not path.startswith("/api/")
+                or path in ("/api/health", "/api/auth/status", "/api/auth/login")
+                or path.startswith("/api/kaggle-relay/")):
             await self.app(scope, receive, send)
             return
-        if any(path.startswith(p) for p in self.PUBLIC_PREFIXES):
+        if not required(request):
             await self.app(scope, receive, send)
             return
-        # Let the app handle detailed auth; middleware is a soft gate only
-        await self.app(scope, receive, send)
-
-
-# App.py imports these handler names
-login_handler = login
-logout_handler = logout
-me_handler = me
-
-async def change_password_handler(body: PasswordReset, request: Request) -> JSONResponse:
-    """Optional password change — requires valid session."""
-    token = request.cookies.get(COOKIE) or ""
-    if not read_token(token):
-        return JSONResponse({"detail": {"code": "auth", "message": "Sign in required."}}, status_code=401)
-    new_pw = (body.new_password or "").strip()
-    if len(new_pw) < 8:
-        return JSONResponse({"detail": {"code": "invalid", "message": "Password too short."}}, status_code=400)
-    # Persist via env is not possible at runtime; report success for UI
-    return JSONResponse({"ok": True, "message": "Password change acknowledged. Set BLACKTHORN_ADMIN_PASSWORD in Render to persist."})
-
+        if not active():
+            response = JSONResponse({"detail": {"code": "auth_unconfigured", "message": "Site login is not configured."}}, status_code=503)
+        else:
+            try:
+                stored = await _hash(request)
+                allowed = _valid(request.cookies.get(COOKIE, ""), stored)
+            except Exception:
+                allowed = False
+            if not allowed:
+                response = JSONResponse({"detail": {"code": "unauthorized", "message": "Log in to continue."}}, status_code=401)
+            elif request.method not in ("GET", "HEAD", "OPTIONS") and not _same_origin(request):
+                response = JSONResponse({"detail": {"code": "origin", "message": "Same-origin request required."}}, status_code=403)
+            else:
+                await self.app(scope, receive, send)
+                return
+        await response(scope, receive, send)
