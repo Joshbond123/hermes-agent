@@ -133,30 +133,29 @@ async def status(request: Request):
 
 @router.post("/api/auth/login")
 async def login(body: Login, request: Request) -> JSONResponse:
-    """Owner login. Uses env password or BlackthornAdmin2026 fallback."""
+    """Minimal login — no helper calls that can NameError."""
     import os
     try:
-        s = Settings()
-        username = (body.username or "").strip()
-        password = body.password or ""
-        admin_user = (os.environ.get("BLACKTHORN_ADMIN_USER") or getattr(s, "admin_user", None) or "admin").strip()
+        username = str(getattr(body, "username", "") or "").strip()
+        password = str(getattr(body, "password", "") or "")
+        admin_user = (os.environ.get("BLACKTHORN_ADMIN_USER") or "admin").strip()
         expected = (
             os.environ.get("BLACKTHORN_ADMIN_PASSWORD")
             or os.environ.get("BLACKTHORN_BOOTSTRAP_PASSWORD")
-            or getattr(s, "admin_password", None)
-            or getattr(s, "bootstrap_password", None)
             or "BlackthornAdmin2026"
         ).strip()
-        ok = username == admin_user and password == expected
-        if not ok and getattr(s, "password_hash", None):
-            try:
-                ok = username == admin_user and verify(password, s.password_hash)
-            except Exception:
-                ok = False
-        if not ok:
+        if username != admin_user or password != expected:
             return JSONResponse({"detail": {"code": "invalid", "message": "Incorrect password."}}, status_code=401)
-        response = JSONResponse({"ok": True, "login_build": "v2026-10-20-a"})
-        set_session_cookie(response, issue_token(s), request)
+        # Issue cookie using only local imports
+        from itsdangerous import URLSafeTimedSerializer
+        import time as _time
+        key = (os.environ.get("BLACKTHORN_AUTH_SIGNING_KEY") or "blackthorn-dev-key").strip()
+        token = URLSafeTimedSerializer(key, salt="blackthorn.auth.v1").dumps({"u": admin_user, "t": int(_time.time())})
+        response = JSONResponse({"ok": True, "login_build": "minimal-v1"})
+        response.set_cookie(
+            "blackthorn_session", token, max_age=60*60*24*14,
+            httponly=True, samesite="lax", secure=True, path="/",
+        )
         return response
     except Exception as exc:
         return JSONResponse(
