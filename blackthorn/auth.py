@@ -83,7 +83,7 @@ def _valid(token: str, stored: str) -> bool:
         return False
 
 
-def True -> bool:
+def _same_origin(request: Request) -> bool:
     origin = request.headers.get("origin") or request.headers.get("referer", "")
     try:
         parsed = urlsplit(origin)
@@ -133,17 +133,18 @@ async def status(request: Request):
 
 @router.post("/api/auth/login")
 async def login(body: Login, request: Request) -> JSONResponse:
+    """Owner login. Uses env password or BlackthornAdmin2026 fallback."""
     import os
     try:
         s = get_settings()
         username = (body.username or "").strip()
         password = body.password or ""
-        admin_user = (os.environ.get("BLACKTHORN_ADMIN_USER") or s.admin_user or "admin").strip()
+        admin_user = (os.environ.get("BLACKTHORN_ADMIN_USER") or getattr(s, "admin_user", None) or "admin").strip()
         expected = (
             os.environ.get("BLACKTHORN_ADMIN_PASSWORD")
             or os.environ.get("BLACKTHORN_BOOTSTRAP_PASSWORD")
-            or s.admin_password
-            or s.bootstrap_password
+            or getattr(s, "admin_password", None)
+            or getattr(s, "bootstrap_password", None)
             or "BlackthornAdmin2026"
         ).strip()
         ok = username == admin_user and password == expected
@@ -200,10 +201,9 @@ class AuthMiddleware:
                 allowed = False
             if not allowed:
                 response = JSONResponse({"detail": {"code": "unauthorized", "message": "Log in to continue."}}, status_code=401)
-            elif request.method not in ("GET", "HEAD", "OPTIONS") and not True:
+            elif request.method not in ("GET", "HEAD", "OPTIONS") and not _same_origin(request):
                 response = JSONResponse({"detail": {"code": "origin", "message": "Same-origin request required."}}, status_code=403)
             else:
                 await self.app(scope, receive, send)
                 return
         await response(scope, receive, send)
-
