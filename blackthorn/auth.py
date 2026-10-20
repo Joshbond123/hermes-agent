@@ -135,8 +135,6 @@ async def status(request: Request):
 async def login(body: Login, request: Request) -> JSONResponse:
     import os
     try:
-        if not _same_origin(request):
-            return JSONResponse({"detail": {"code": "origin", "message": "Forbidden origin."}}, status_code=403)
         s = get_settings()
         username = (body.username or "").strip()
         password = body.password or ""
@@ -208,3 +206,4 @@ class AuthMiddleware:
                 await self.app(scope, receive, send)
                 return
         await response(scope, receive, send)
+
