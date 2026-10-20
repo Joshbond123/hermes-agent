@@ -155,7 +155,7 @@ async def login(body: Login, request: Request) -> JSONResponse:
                 ok = False
         if not ok:
             return JSONResponse({"detail": {"code": "invalid", "message": "Incorrect password."}}, status_code=401)
-        response = JSONResponse({"ok": True})
+        response = JSONResponse({"ok": True, "login_build": "v2026-10-20-a"})
         set_session_cookie(response, issue_token(s), request)
         return response
     except Exception as exc:
