@@ -1428,12 +1428,12 @@ def _set_cache_dataset(slug: str) -> None:
         pass
 
 
-def refresh_model_cache_dataset(expected_bytes: int = 5629110976) -> str:
+def refresh_model_cache_dataset(expected_bytes: int = 16810714496) -> str:
     """Confirm the private model-cache dataset exists and is ready, then remember it.
 
     Uses the dataset VIEW endpoint (owner search does not index private datasets).
     The dataset is published by the Kaggle notebook itself on its first real
-    download, and is attached to every later kernel so the 5.6 GB GGUF is never
+    download, and is used by later boots so the ~16 GB GGUF is never
     downloaded twice.
     """
     slug = f"{KAGGLE_USERNAME}/{CACHE_DATASET_NAME}"
@@ -1833,11 +1833,27 @@ def turn_on_fleet(blocking: bool = False) -> Dict[str, Any]:
             return {"role": role, "account": account.user, "status": "build_failed", "error": str(exc)[:200]}
         slug = kernel_slug_for(account)
         _write_fleet_row(row_id, "BOOTING_KAGGLE_GPU", gpu_info=f"Allocating on {account.user}...")
+        # Attach persistent datasets when available so boots restore instead of redownload.
+        datasets = []
+        if role == "model":
+            try:
+                cache = refresh_model_cache_dataset()
+                if cache:
+                    datasets.append(cache)
+            except Exception:
+                pass
+            # Prefer the account-owned cache slug so each fleet slot can mount its own copy.
+            own = f"{account.user}/qwen38-27b-uncensored-model-cache"
+            if own not in datasets:
+                datasets.append(own)
+        else:
+            datasets.append(f"{account.user}/blackthorn-computer-state")
         try:
             out = fleet.start_kernel(account, slug=slug, title=f"Blackthorn {role} ({account.user})",
-                                     notebook_text=text)
+                                     notebook_text=text, datasets=datasets or None)
             return {"role": role, "account": account.user, "slug": slug,
-                    "slot": st.active, "reason": st.reason, "status": "starting", "push": bool(out)}
+                    "slot": st.active, "reason": st.reason, "status": "starting", "push": bool(out),
+                    "datasets": datasets}
         except Exception as exc:  # noqa: BLE001
             _write_fleet_row(row_id, "BOOT_FAILED", gpu_info=f"FAILED: {exc}")
             return {"role": role, "account": account.user, "status": "start_failed", "error": str(exc)[:200]}
@@ -1943,7 +1959,20 @@ def failover_fleet_role(role: str, from_slot: str, to_slot: str) -> Dict[str, An
         text = (build_computer_notebook_text if role == "computer" else build_notebook_text)(env=env)
         slug = kernel_slug_for(new)
         _write_fleet_row(row_id, "BOOTING_KAGGLE_GPU", gpu_info=f"Failover to {new.user}...")
-        fleet.start_kernel(new, slug=slug, title=f"Blackthorn {role} ({new.user})", notebook_text=text)
+        datasets = []
+        if role == "model":
+            own = f"{new.user}/qwen38-27b-uncensored-model-cache"
+            datasets.append(own)
+            try:
+                cache = refresh_model_cache_dataset()
+                if cache and cache not in datasets:
+                    datasets.append(cache)
+            except Exception:
+                pass
+        else:
+            datasets.append(f"{new.user}/blackthorn-computer-state")
+        fleet.start_kernel(new, slug=slug, title=f"Blackthorn {role} ({new.user})",
+                           notebook_text=text, datasets=datasets or None)
         out.update(status="starting", slug=slug)
     except Exception as exc:  # noqa: BLE001
         _write_fleet_row(row_id, "BOOT_FAILED", gpu_info=f"FAILED: {exc}")
@@ -2309,6 +2338,42 @@ def start_permanent_gpu_daemon() -> None:
                     consecutive_dead = 0
             except Exception as exc:
                 logger.debug("Permanent GPU daemon tick note: %s", exc)
+
+            # Fleet quota failover: when primary has <= 30 min left, boot backup and retire primary.
+            try:
+                from blackthorn.fleet import FleetManager, accounts_from_env
+                accounts = accounts_from_env(os.environ)
+                if accounts:
+                    fleet = FleetManager(accounts)
+                    for role in ("model", "computer"):
+                        if not _role_intended_online(role):
+                            continue
+                        before = fleet.state[role].active
+                        st = fleet.decide(role, force=True)
+                        if st.active != before and st.reason not in ("initial", "backup_only"):
+                            logger.warning(
+                                "Fleet failover: %s %s -> %s (%s)",
+                                role, before, st.active, st.reason,
+                            )
+                            try:
+                                failover_fleet_role(role, before, st.active)
+                            except Exception as fexc:
+                                logger.warning("fleet failover failed for %s: %s", role, fexc)
+                        # Keep computer backups in sync while the primary is live.
+                        if role == "computer" and st.active == "primary":
+                            primary = fleet.by_slot.get(("computer", "primary"))
+                            backup = fleet.by_slot.get(("computer", "backup"))
+                            if primary and backup:
+                                try:
+                                    from blackthorn.fleet import mirror_state_dataset
+                                    # Best-effort periodic mirror (quota-gated inside decide)
+                                    if int(time.time()) % 900 < 25:  # roughly once per ~15 min window
+                                        mirror_state_dataset(primary, backup)
+                                except Exception as mexc:
+                                    logger.debug("computer mirror note: %s", mexc)
+            except Exception as fexc:
+                logger.debug("fleet failover tick note: %s", fexc)
+
             time.sleep(20.0)
 
     t = threading.Thread(target=_daemon_loop, daemon=True, name="blackthorn-permanent-gpu-daemon")
