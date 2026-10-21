@@ -217,6 +217,8 @@ class FleetManager:
         if not status_readable:
             try:
                 listing = self.rpc(account, "ListKernels", {"pageSize": 100, "user": account.user})
+                if not isinstance(listing, dict) or not any(k in listing for k in ("kernels", "results")):
+                    raise FleetError("kernel listing unavailable")
                 kernels = listing.get("kernels") or listing.get("results") or []
                 if not any(str(k.get("ref") or k.get("slug") or "").split("/")[-1] == name or
                            str(k.get("title") or "").startswith(f"Blackthorn {account.role}")
@@ -235,6 +237,8 @@ class FleetManager:
             """
             try:
                 listing = self.rpc(account, "ListKernels", {"pageSize": 100, "user": account.user})
+                if not isinstance(listing, dict) or not any(k in listing for k in ("kernels", "results")):
+                    return False
                 kernels = listing.get("kernels") or listing.get("results") or []
                 return not any(str(k.get("ref") or k.get("slug") or "").split("/")[-1] == name or
                                str(k.get("title") or "").startswith(f"Blackthorn {account.role}")
