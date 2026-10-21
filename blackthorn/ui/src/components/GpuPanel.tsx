@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { api, ApiError } from '../api'
 import { summarize, type GpuView } from '../gpu'
 import type { FleetSlot, VersionInfo } from '../types'
@@ -15,20 +15,46 @@ function useTick(active: boolean) {
   }, [active])
 }
 
+/** Elapsed since this boot: prefer server elapsed, but never go backwards; local 0 when boot just started. */
+function useBootElapsed(gpu: GpuView): number | null {
+  const booting = Boolean(gpu.status?.booting)
+  const serverElapsed = gpu.status?.elapsed_seconds
+  const localStart = useRef<number | null>(null)
+  useTick(booting)
+
+  useEffect(() => {
+    if (booting) {
+      if (localStart.current == null) localStart.current = Date.now()
+    } else {
+      localStart.current = null
+    }
+  }, [booting])
+
+  if (!booting) return null
+  const local = localStart.current != null ? (Date.now() - localStart.current) / 1000 : 0
+  if (serverElapsed == null || serverElapsed < 0) return Math.max(0, Math.floor(local))
+  // Prefer the larger of local and server so a late status refresh cannot jump the clock backward.
+  return Math.max(0, Math.floor(Math.max(local, serverElapsed)))
+}
+
 function SlotRow({ label, slot, active }: { label: string; slot?: FleetSlot | null; active?: boolean }) {
-  if (!slot) return (
-    <div className="fleet-slot muted">
-      <span className="fleet-slot-label">{label}</span>
-      <span>—</span>
-    </div>
-  )
-  if (slot.error) return (
-    <div className="fleet-slot bad">
-      <span className="fleet-slot-label">{label}</span>
-      <span className="fleet-slot-account">{slot.account || 'unknown'}</span>
-      <span className="muted small">{slot.error}</span>
-    </div>
-  )
+  if (!slot) {
+    return (
+      <div className="fleet-slot muted">
+        <span className="fleet-slot-label">{label}</span>
+        <span>—</span>
+      </div>
+    )
+  }
+  if (slot.error) {
+    return (
+      <div className="fleet-slot bad">
+        <span className="fleet-slot-label">{label}</span>
+        <span className="fleet-slot-account">{slot.account || 'unknown'}</span>
+        <span className="muted small">{slot.error}</span>
+      </div>
+    )
+  }
   const rem = slot.remaining_hours ?? 0
   const tone = rem <= 0.5 ? 'bad' : rem <= 2 ? 'warn' : 'ok'
   return (
@@ -39,21 +65,28 @@ function SlotRow({ label, slot, active }: { label: string; slot?: FleetSlot | nu
       <div className="fleet-quota-bar" aria-hidden>
         <i style={{ width: `${Math.min(100, Math.max(0, 100 - (slot.used_pct || 0)))}%` }} />
       </div>
-      <span className="muted small">{(slot.used_hours ?? 0).toFixed(1)} / {(slot.total_hours ?? 30).toFixed(0)}h used</span>
+      <span className="muted small">
+        {(slot.used_hours ?? 0).toFixed(1)} / {(slot.total_hours ?? 30).toFixed(0)}h used this week
+      </span>
     </div>
   )
 }
 
 export function GpuButton({ gpu, open, onToggle }: { gpu: GpuView; open: boolean; onToggle: () => void }) {
   const sum = summarize(gpu)
-  useTick(Boolean(gpu.status?.booting))
-  const elapsed = gpu.status?.booting && gpu.status.elapsed_seconds != null
-    ? gpu.status.elapsed_seconds + (Date.now() - gpu.fetchedAt) / 1000
-    : null
+  const elapsed = useBootElapsed(gpu)
   return (
-    <button type="button" className={`gpu-btn tone-${sum.tone}${open ? ' open' : ''}`} onClick={onToggle}
-      aria-haspopup="dialog" aria-expanded={open}
-      data-popover-trigger data-testid="gpu-button" data-state={sum.tone} title={sum.detail}>
+    <button
+      type="button"
+      className={`gpu-btn tone-${sum.tone}${open ? ' open' : ''}`}
+      onClick={onToggle}
+      aria-haspopup="dialog"
+      aria-expanded={open}
+      data-popover-trigger
+      data-testid="gpu-button"
+      data-state={sum.tone}
+      title={sum.detail}
+    >
       <span className="dot" aria-hidden />
       <span className="gpu-label">{sum.label}</span>
       {elapsed != null && <span className="gpu-elapsed">{formatElapsed(elapsed)}</span>}
@@ -64,120 +97,129 @@ export function GpuButton({ gpu, open, onToggle }: { gpu: GpuView; open: boolean
 export function GpuPanel({ gpu, onClose }: { gpu: GpuView; onClose: () => void }) {
   const s = gpu.status
   const sum = summarize(gpu)
+  const elapsed = useBootElapsed(gpu)
   const [confirmOff, setConfirmOff] = useState(false)
   const [showLogs, setShowLogs] = useState(false)
-  const [logs, setLogs] = useState<{ lines: string[]; error?: string } | null>(null)
+  const [logs, setLogs] = useState<{ lines?: string[]; error?: string } | null>(null)
   const [auto, setAuto] = useState<{ minutes: number; choices: number[] } | null>(null)
-  const [autoErr, setAutoErr] = useState<string | null>(null)
+  const [autoErr, setAutoErr] = useState('')
   const [version, setVersion] = useState<VersionInfo | null>(null)
-  useTick(Boolean(s?.booting))
 
   useEffect(() => {
-    void api.gpu.activity().then((a) => setAuto({ minutes: a.auto_off_minutes, choices: a.choices })).catch(() => undefined)
-    void api.version().then(setVersion).catch(() => undefined)
+    void api.version().then(setVersion).catch(() => null)
+    void api.gpu.activity().then((a: any) => {
+      setAuto({ minutes: a.auto_off_minutes ?? 15, choices: a.choices?.length ? a.choices : [0, 5, 10, 15, 30, 60] })
+    }).catch(() => null)
   }, [])
+
   useEffect(() => {
     if (!showLogs) return
-    let alive = true
-    const load = () => api.gpu.logs().then((l) => alive && setLogs(l)).catch((e) => alive && setLogs({ lines: [], error: e instanceof ApiError ? e.message : 'Could not load logs' }))
-    void load()
-    const id = setInterval(load, 8000)
-    return () => { alive = false; clearInterval(id) }
+    void api.gpu.logs().then(setLogs).catch((e) => setLogs({ error: e instanceof ApiError ? e.message : String(e) }))
   }, [showLogs])
 
-  const elapsed = s?.booting && s.elapsed_seconds != null
-    ? s.elapsed_seconds + (Date.now() - gpu.fetchedAt) / 1000
-    : null
-  const bytes = s?.progress_kind === 'bytes' && s.progress_bytes_total ? s : null
-  const stageFrac = s?.progress_stage && s.progress_total_stages ? s.progress_stage / s.progress_total_stages : 0
-  const changeAuto = async (minutes: number) => {
-    setAutoErr(null)
+  async function changeAuto(minutes: number) {
+    setAutoErr('')
     try {
-      const r = await api.gpu.setAutoOff(minutes)
-      setAuto((a) => (a ? { ...a, minutes: r.auto_off_minutes } : a))
+      const out: any = await api.gpu.setAutoOff(minutes)
+      setAuto({ minutes: out.auto_off_minutes ?? minutes, choices: out.choices?.length ? out.choices : [0, 5, 10, 15, 30, 60] })
     } catch (e) {
-      setAutoErr(e instanceof ApiError ? e.message : 'Could not save')
+      setAutoErr(e instanceof ApiError ? e.message : String(e))
     }
   }
 
-  const fleet = s?.fleet_slots
-  const modelName = s?.model_name || s?.model || 'Qwen3.8-27B-Uncensored'
-  const cacheDs = s?.model_cache_dataset
+  const modelSlots = s?.fleet_slots?.model
+  const compSlots = s?.fleet_slots?.computer
+  const modelQuota = s?.quotas?.model || s?.quota
+  const compQuota = s?.quotas?.computer
+
+  const pct =
+    s?.progress_bytes_done != null && s?.progress_bytes_total
+      ? Math.min(100, Math.round((100 * s.progress_bytes_done) / Math.max(1, s.progress_bytes_total)))
+      : s?.progress_stage != null && s?.progress_total_stages
+        ? Math.min(100, Math.round((100 * s.progress_stage) / Math.max(1, s.progress_total_stages)))
+        : null
 
   return (
     <>
-      <div className="gpu-panel-scrim" data-testid="gpu-panel-scrim" aria-hidden onClick={onClose} />
+      <div className="gpu-panel-scrim" onClick={onClose} aria-hidden />
       <Popover onClose={onClose} className="gpu-panel gpu-panel-v2" testId="gpu-panel">
-        <div className="panel-head">
-          <span className={`dot tone-${sum.tone}`} aria-hidden />
+        <header className="gpu-panel-head">
           <div>
             <strong data-testid="gpu-status-text">{s?.display_status || sum.label}</strong>
-            <div className="muted small">{sum.detail}</div>
-          </div>
-        </div>
-
-        {gpu.error && (
-          <div className="notice error" role="alert">
-            {gpu.error}{' '}
-            <button type="button" className="link" onClick={() => void gpu.refresh()}>Retry</button>
-          </div>
-        )}
-        {s?.error && !s.online && (
-          <div className="notice error" role="alert" data-testid="gpu-error">{s.error}</div>
-        )}
-
-        <div className="gpu-meta-grid">
-          <div>
-            <div className="muted small">Model</div>
-            <div className="gpu-meta-value" data-testid="gpu-model-name">{modelName}</div>
-          </div>
-          <div>
-            <div className="muted small">Cache dataset</div>
-            <div className="gpu-meta-value mono small" data-testid="gpu-cache-dataset">
-              {cacheDs || 'black797/qwen38-27b-uncensored-model-cache'}
+            <div className="muted small">
+              {s?.model_name || s?.model || 'Qwen3.8-27B-Uncensored'}
+              {s?.transport ? ` · ${s.transport}` : ''}
             </div>
           </div>
-        </div>
+          <span className={`gpu-pill tone-${sum.tone}`}>{sum.tone}</span>
+        </header>
 
-        {s?.booting && (
-          <div className="progress-block" data-testid="gpu-progress">
-            <div className="progress-line">
-              <span>
-                {bytes
-                  ? `${s.progress_label ?? 'Transferring'} · ${formatBytes(bytes.progress_bytes_done ?? 0)} of ${formatBytes(bytes.progress_bytes_total ?? 0)}`
-                  : s.progress_stage
-                    ? `Step ${s.progress_stage} of ${s.progress_total_stages}`
-                    : 'Starting'}
-              </span>
-              {elapsed != null && <span className="muted">{formatElapsed(elapsed)} elapsed</span>}
-            </div>
-            <div className="bar" role="progressbar" aria-valuemin={0} aria-valuemax={100}
-              aria-valuenow={Math.round((bytes ? (bytes.progress_bytes_done ?? 0) / (bytes.progress_bytes_total ?? 1) : stageFrac) * 100)}>
-              <i style={{ width: `${Math.round((bytes ? (bytes.progress_bytes_done ?? 0) / (bytes.progress_bytes_total ?? 1) : stageFrac) * 100)}%` }} />
-            </div>
-            <div className="muted small">{s.progress_step}</div>
+        {gpu.error && <div className="notice error small">{gpu.error}</div>}
+        {s?.error && <div className="notice error small">{s.error}</div>}
+
+        <section className="gpu-section">
+          <div className="gpu-section-title">Model GPU</div>
+          <div className="gpu-kv">
+            <span>Status</span>
+            <span>{s?.status || '—'}</span>
           </div>
-        )}
-
-        <section className="fleet-section" data-testid="gpu-fleet-model">
-          <h3>Model GPU fleet</h3>
-          <p className="muted small">Primary hosts Qwen permanently (Kaggle dataset cache). Backup starts when primary has ≤30 min left.</p>
-          <SlotRow label="Primary" slot={fleet?.model?.primary || s?.quotas?.model} active={(fleet?.model?.active || 'primary') === 'primary'} />
-          <SlotRow label="Backup" slot={fleet?.model?.backup} active={fleet?.model?.active === 'backup'} />
-        </section>
-
-        <section className="fleet-section" data-testid="gpu-fleet-computer">
-          <h3>Computer GPU fleet</h3>
-          <p className="muted small">Agent terminal, downloads, and workspace. Same 30-minute failover rule.</p>
-          <SlotRow label="Primary" slot={fleet?.computer?.primary || s?.quotas?.computer} active={(fleet?.computer?.active || 'primary') === 'primary'} />
-          <SlotRow label="Backup" slot={fleet?.computer?.backup} active={fleet?.computer?.active === 'backup'} />
-          {s?.computer && (
-            <div className="computer-status muted small">
-              Computer: {s.computer.display_status || s.computer.status || (s.computer.online ? 'online' : 'offline')}
-              {s.computer_ready ? ' · ready' : ''}
+          <div className="gpu-kv">
+            <span>Account</span>
+            <span>{modelQuota?.account || modelSlots?.primary?.account || '—'}</span>
+          </div>
+          {elapsed != null && (
+            <div className="gpu-kv">
+              <span>Boot time</span>
+              <span className="gpu-elapsed-strong">{formatElapsed(elapsed)}</span>
             </div>
           )}
+          {s?.progress_step && (
+            <div className="muted small gpu-step">{s.progress_step}</div>
+          )}
+          {pct != null && (
+            <div className="gpu-progress" aria-label={`${pct}%`}>
+              <i style={{ width: `${pct}%` }} />
+              <span>
+                {s?.progress_bytes_done != null && s?.progress_bytes_total
+                  ? `${formatBytes(s.progress_bytes_done)} / ${formatBytes(s.progress_bytes_total)}`
+                  : s?.progress_stage != null
+                    ? `Stage ${s.progress_stage}/${s.progress_total_stages}`
+                    : `${pct}%`}
+              </span>
+            </div>
+          )}
+          <div className="fleet-grid">
+            <SlotRow label="Primary" slot={modelSlots?.primary} active={modelSlots?.active === 'primary'} />
+            <SlotRow label="Backup" slot={modelSlots?.backup} active={modelSlots?.active === 'backup'} />
+          </div>
         </section>
+
+        <section className="gpu-section">
+          <div className="gpu-section-title">Computer GPU</div>
+          <div className="gpu-kv">
+            <span>Status</span>
+            <span>
+              {s?.computer?.display_status || s?.computer?.status || '—'}
+              {s?.computer_ready ? ' · ready' : ''}
+            </span>
+          </div>
+          <div className="gpu-kv">
+            <span>Account</span>
+            <span>{compQuota?.account || compSlots?.primary?.account || '—'}</span>
+          </div>
+          <div className="gpu-kv">
+            <span>Transport</span>
+            <span>{s?.computer?.transport || s?.computer?.host || '—'}</span>
+          </div>
+          <div className="fleet-grid">
+            <SlotRow label="Primary" slot={compSlots?.primary} active={compSlots?.active === 'primary'} />
+            <SlotRow label="Backup" slot={compSlots?.backup} active={compSlots?.active === 'backup'} />
+          </div>
+        </section>
+
+        {s?.model_cache_dataset && (
+          <div className="muted small">Model cache: {s.model_cache_dataset}</div>
+        )}
 
         {auto && (
           <div className="auto-off-row">
@@ -187,6 +229,7 @@ export function GpuPanel({ gpu, onClose }: { gpu: GpuView; onClose: () => void }
                 <option key={m} value={m}>{m === 0 ? 'Never' : `${m} min`}</option>
               ))}
             </select>
+            {s?.auto_off?.reason && <span className="muted small">{s.auto_off.reason}</span>}
             {autoErr && <span className="notice error small">{autoErr}</span>}
           </div>
         )}

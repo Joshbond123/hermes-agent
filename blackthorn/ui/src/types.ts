@@ -62,7 +62,7 @@ export interface Session {
   message_count: number
 }
 
-export interface GpuQuota { used_hours: number; total_hours: number; remaining_hours: number; used_pct: number; refresh_time?: string }
+export interface GpuQuota { used_hours: number; total_hours: number; remaining_hours: number; used_pct: number; refresh_time?: string; account?: string }
 export interface FleetSlot extends GpuQuota { account?: string; slot?: string; error?: string }
 export interface GpuStatus {
   online: boolean
@@ -94,10 +94,12 @@ export interface GpuStatus {
   model_name?: string
   computer?: {
     status?: string; online?: boolean; booting?: boolean; display_status?: string; gpu_info?: string
-    host?: string; environment?: string; progress?: string
+    host?: string; environment?: string; progress?: string; transport?: string
     last_health?: { phase?: string; mode?: string; detail?: string; verified_at?: number; external_ip?: string; all_passed?: boolean; run_id?: string }
   }
   computer_ready?: boolean
+  transport?: string
+  auto_off?: { enabled?: boolean; minutes?: number; idle_seconds?: number; active_tasks?: number; should_stop?: boolean; reason?: string; computer_jobs?: number }
   error?: string
   can_turn_on: boolean
   can_turn_off: boolean

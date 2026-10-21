@@ -79,8 +79,11 @@ class GpuService:
             pub["progress_stalled"] = True
         if booting:
             started = await self._boot_started()
-            if started:
+            if started and started > 0:
                 pub["elapsed_seconds"] = max(0, int(time.time() - started))
+            else:
+                # No boot marker yet — report 0s so the UI never shows a stale multi-hour timer.
+                pub["elapsed_seconds"] = 0
         if status in READY and state.get("model_loaded") is False:
             pub["display_status"] = "Loading Model"
         info = str(state.get("gpu_info") or "")
@@ -225,6 +228,12 @@ class GpuService:
         import os
         from .fleet import accounts_from_env
         if hasattr(d1, "turn_on_fleet") and accounts_from_env(os.environ):
+            # Reset elapsed timer at the moment the user clicks Turn ON.
+            try:
+                if self._store is not None:
+                    await self._store.set_setting(BOOT_META_KEY, str(time.time()))
+            except Exception:
+                pass
             # Errors propagate: a failed fleet start must not silently fall back to a different code path.
             out = await asyncio.to_thread(d1.turn_on_fleet)
             st = await self.status(refresh=True)

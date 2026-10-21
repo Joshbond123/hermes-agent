@@ -1798,6 +1798,8 @@ def turn_on_fleet(blocking: bool = False) -> Dict[str, Any]:
     from blackthorn.kaggle_bundle import build_computer_notebook_text, build_notebook_text
 
     ensure_d1_schema()
+    # Boot timer always starts at 0s for this user-initiated turn-on.
+    _set_meta("blackthorn_gpu_boot_started", str(time.time()))
     accounts = accounts_from_env(os.environ)
     if not accounts:
         # legacy single-account behaviour
@@ -2001,6 +2003,10 @@ def turn_off_fleet(blocking: bool = True, source: str = "", roles: tuple = ("mod
     ensure_d1_schema()
     accounts = accounts_from_env(os.environ)
     _record_stop_event(source or "turn-off", "fleet stop requested" + (" (force)" if force else ""))
+    try:
+        _set_meta("blackthorn_gpu_boot_started", "")
+    except Exception:
+        pass
     if not accounts:
         return turn_off_kaggle_gpu()
     fleet = FleetManager(accounts)
