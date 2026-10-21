@@ -1749,10 +1749,12 @@ def launch_cloudflared(cloudflared_bin: str):
     """
     if inrok_enabled():
         try:
-            return launch_inrok()
+            proc, url = launch_inrok()
+            if proc is not None and url:
+                return proc, url
+            log("⚠️ inrok did not produce a live URL — falling back to Cloudflare/relay")
         except Exception as exc:
-            log("❌ inrok launch failed: " + type(exc).__name__ + ": " + str(exc)[:200])
-            return None, ""
+            log("❌ inrok launch failed: " + type(exc).__name__ + ": " + str(exc)[:200] + " — falling back")
     cf_log_path = "/tmp/cloudflared.log"
     handle = open(cf_log_path, "w")
     relay_base = (os.environ.get("BLACKTHORN_RELAY_URL") or "").strip().rstrip("/")
