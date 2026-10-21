@@ -89,7 +89,7 @@ STATE_DIR = "/tmp/computer_state"
 STATE_MANIFEST = f"{STATE_DIR}/manifest.json"
 CHECKPOINT_INTERVAL_S = int(os.environ.get("COMPUTER_CHECKPOINT_S") or "120")
 BLIND_DISK_DIR = f"{_tmp}/model_cache"
-UPLOAD_DIR = f"{WORK_ROOT}/cache_upload"
+UPLOAD_DIR = f"{_tmp}/cache_upload"  # same filesystem as model_cache: hardlink, no extra 16 GB copy
 MARKER_PATH = f"{BLIND_DISK_DIR}/.verified"
 LOG_PATH = "/tmp/qwen38_uncensored.log"
 
