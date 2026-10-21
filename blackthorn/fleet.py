@@ -492,10 +492,21 @@ def mirror_state_dataset(from_account: Account, to_account: Account, *,
     import zipfile
     from pathlib import Path
 
+    last_cli_error = ""
     def _run(cmd: List[str], env: Dict[str, str]) -> int:
+        nonlocal last_cli_error
         if runner is not None:
             return runner(cmd, env)
         proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=1800)
+        if proc.returncode:
+            import re
+            # Owner-facing diagnostics must never echo credentials or bearer headers.
+            last_cli_error = (proc.stderr or proc.stdout or "CLI failed")[-350:]
+            for secret in (from_account.token, to_account.token):
+                if secret:
+                    last_cli_error = last_cli_error.replace(secret, "[redacted]")
+            last_cli_error = re.sub(r"KGAT_[A-Za-z0-9_-]+", "[redacted]", last_cli_error)
+            last_cli_error = last_cli_error.replace("\n", " ")[:180]
         return proc.returncode
 
     src_slug = f"{from_account.user}/{dataset_slug}"
@@ -512,7 +523,7 @@ def mirror_state_dataset(from_account: Account, to_account: Account, *,
         env_down.pop("KAGGLE_KEY", None)
         rc = _run(["kaggle", "datasets", "download", "-p", str(download), src_slug], env_down)
         if rc != 0:
-            return {"ok": False, "error": f"download rc={rc}"}
+            return {"ok": False, "error": f"download rc={rc}: {last_cli_error}"}
         archives = list(download.glob("*.zip"))
         if len(archives) != 1:
             return {"ok": False, "error": "expected one downloaded state archive"}
@@ -544,7 +555,7 @@ def mirror_state_dataset(from_account: Account, to_account: Account, *,
             rc = _run(["kaggle", "datasets", "version", "-p", str(upload),
                        "-m", "mirror", "--dir-mode", "skip"], env_up)
         return {"ok": rc == 0, "from": src_slug, "to": dst_slug,
-                "error": "" if rc == 0 else f"upload rc={rc}"}
+                "error": "" if rc == 0 else f"upload rc={rc}: {last_cli_error}"}
 
 
 def accounts_from_env(env: Dict[str, str]) -> List[Account]:

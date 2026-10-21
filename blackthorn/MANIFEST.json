@@ -10,7 +10,7 @@
   "blackthorn/computer_assets/install_stack.py": "a3613c1e4b5224e5b22b05ec1f760901e4d690ebab3ba972ed91674acd0d9204",
   "blackthorn/computer_assets/skillctl.py": "773df12a1f4fc65256b5b590ead5f929598c633c0bc2c90c4187a81f73c725fb",
   "blackthorn/config.py": "77f18840d1234857ed75bcaa700d75682328f2d06e8f88b8e1e9832912be75e8",
-  "blackthorn/fleet.py": "60816e1c8dfb955f2df0c445c4f0065e2c0b5a1c9652e7d0bdd692509a0f0de7",
+  "blackthorn/fleet.py": "9ce55c8cdc9f26e8a379c881004c548b051e4db1af581a5e677502b30db4d798",
   "blackthorn/gpu.py": "f6e333f103d72daaedec6946e8e8f73f3913c3e81e31fa7e41e8ab936bba876b",
   "blackthorn/kaggle_bundle.py": "f05991c9ef0a3ec9c41231e71021378938a34dba504156d3a202f2b809f8bf92",
   "blackthorn/llm.py": "4aa857ec656e4360a1617723377b611cc69a32fd874549503a1c59d1648d75b8",
