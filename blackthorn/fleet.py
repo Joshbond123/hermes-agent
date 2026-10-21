@@ -298,8 +298,12 @@ class FleetManager:
         except FleetError as exc:
             if "409" not in str(exc) and "already in use" not in str(exc):
                 raise
-            # Kaggle titles are account-unique: fall back to a timestamped title and retry once
-            payload["newTitle"] = f"{title} {int(self._clock())}"[:100]
+            # Kaggle can reserve BOTH a title and a slug for minutes after
+            # DeleteKernel. A renamed title on the old slug still gets HTTP 409.
+            import secrets
+            suffix = f"{int(self._clock())}-{secrets.token_hex(3)}"
+            payload["newTitle"] = f"Blackthorn {account.role} ({account.user}) {suffix}"[:100]
+            payload["slug"] = f"{account.user}/blackthorn-{account.role}-{suffix}"
             out = self.rpc(account, "SaveKernel", payload)
         invalid = [x for x in (out.get("invalidDatasetSources") or []) if x]
         if invalid and datasets:

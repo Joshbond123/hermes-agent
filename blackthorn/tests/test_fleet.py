@@ -266,3 +266,24 @@ def test_stop_skips_already_absent_backup_without_false_error(monkeypatch):
     fleet = FleetManager([account], fetcher=rpc)
     assert fleet.stop_kernel_result(account, 'backup/blackthorn-model')['state'] == 'not_running'
     assert 'DeleteKernel' not in calls
+
+
+def test_recently_deleted_kaggle_slug_conflict_retries_with_new_slug_and_title():
+    import urllib.error
+    account = Account('primary', 'token', 'model', 'primary')
+    saves = []
+    def rpc(method, body, token):
+        if method == 'ListKernels':return {'kernels': []}
+        if method == 'GetKernelSessionStatus':return {'status': 'STOPPED'}
+        if method == 'SaveKernel':
+            saves.append(dict(body))
+            if len(saves)==1:
+                raise urllib.error.HTTPError('https://www.kaggle.com',409,'title and slug reserved',{},None)
+            return {'versionNumber':2}
+        raise AssertionError(method)
+    fleet=FleetManager([account],fetcher=rpc)
+    out=fleet.start_kernel(account,slug='primary/blackthorn-model',
+                           title='Blackthorn model (primary)',notebook_text='{}')
+    assert out['versionNumber']==2 and len(saves)==2
+    assert saves[0]['slug']!=saves[1]['slug']
+    assert saves[0]['newTitle']!=saves[1]['newTitle']
