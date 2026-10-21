@@ -63,6 +63,7 @@ export interface Session {
 }
 
 export interface GpuQuota { used_hours: number; total_hours: number; remaining_hours: number; used_pct: number; refresh_time?: string }
+export interface FleetSlot extends GpuQuota { account?: string; slot?: string; error?: string }
 export interface GpuStatus {
   online: boolean
   active: boolean
@@ -85,6 +86,12 @@ export interface GpuStatus {
   elapsed_seconds?: number
   quota?: GpuQuota
   quotas?: { model?: GpuQuota & { account?: string }; computer?: GpuQuota & { account?: string } }
+  fleet_slots?: {
+    model?: { primary?: FleetSlot; backup?: FleetSlot; active?: string }
+    computer?: { primary?: FleetSlot; backup?: FleetSlot; active?: string }
+  }
+  model_cache_dataset?: string
+  model_name?: string
   computer?: {
     status?: string; online?: boolean; booting?: boolean; display_status?: string; gpu_info?: string
     host?: string; environment?: string; progress?: string

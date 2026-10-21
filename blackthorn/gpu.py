@@ -181,28 +181,40 @@ class GpuService:
             if accounts:
                 fleet = FleetManager(accounts)
                 quotas = {}
+                fleet_slots = {}
                 for role in ("model", "computer"):
-                    if role == "computer":
-                        continue  # Com11 runs on GitHub Actions — no Kaggle GPU quota
-                    acc = next((a for a in accounts if a.role == role and getattr(a, "slot", "primary") in ("primary", None, "")), None)
-                    if acc is None:
-                        acc = next((a for a in accounts if a.role == role), None)
-                    if acc is None:
+                    role_accounts = [a for a in accounts if a.role == role]
+                    if not role_accounts:
                         continue
-                    try:
-                        q = fleet.quota(acc)
-                        quotas[role] = {
-                            "account": acc.user,
-                            "used_hours": round(float(q.get("used_seconds") or 0) / 3600.0, 2),
-                            "total_hours": round(float(q.get("total_seconds") or 108000) / 3600.0, 2),
-                            "remaining_hours": round(max(0.0, float(q.get("total_seconds") or 108000) - float(q.get("used_seconds") or 0)) / 3600.0, 2),
-                            "used_pct": round(100.0 * float(q.get("used_seconds") or 0) / max(1.0, float(q.get("total_seconds") or 108000)), 1),
-                            "refresh_time": q.get("refresh_time") or "",
-                        }
-                    except Exception:
-                        continue
+                    primary = next((a for a in role_accounts if a.slot == "primary"), role_accounts[0])
+                    backup = next((a for a in role_accounts if a.slot == "backup"), None)
+                    role_view = {"primary": None, "backup": None, "active": "primary"}
+                    for slot_name, acc in (("primary", primary), ("backup", backup)):
+                        if acc is None:
+                            continue
+                        try:
+                            q = fleet.quota(acc)
+                            entry = {
+                                "account": acc.user,
+                                "slot": slot_name,
+                                "used_hours": round(float(q.get("used_seconds") or 0) / 3600.0, 2),
+                                "total_hours": round(float(q.get("total_seconds") or 108000) / 3600.0, 2),
+                                "remaining_hours": round(max(0.0, float(q.get("total_seconds") or 108000) - float(q.get("used_seconds") or 0)) / 3600.0, 2),
+                                "used_pct": round(100.0 * float(q.get("used_seconds") or 0) / max(1.0, float(q.get("total_seconds") or 108000)), 1),
+                                "refresh_time": q.get("refresh_time") or "",
+                            }
+                            role_view[slot_name] = entry
+                            if slot_name == "primary":
+                                quotas[role] = entry
+                        except Exception as exc:
+                            role_view[slot_name] = {"account": acc.user, "slot": slot_name, "error": str(exc)[:120]}
+                    fleet_slots[role] = role_view
                 if quotas:
                     model_pub["quotas"] = quotas
+                if fleet_slots:
+                    model_pub["fleet_slots"] = fleet_slots
+                model_pub["model_cache_dataset"] = os.environ.get("QWEN38_CACHE_DATASET", "")
+                model_pub["model_name"] = "Qwen3.8-27B-Uncensored"
         except Exception:
             pass
         return model_pub

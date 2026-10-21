@@ -2,8 +2,8 @@
 
 Four accounts form two roles:
 
-* **model** — ``joshbond123`` (primary) and ``teslaarymo`` (backup) host the AI model.
-* **computer** — ``josh787`` (primary) and ``alagbo`` (backup) are the agent's computer.
+* **model** — ``black797`` (primary) and ``temilolo`` (backup) host the AI model.
+* **computer** — ``alagbo`` (primary) and ``teslaarymo`` (backup) are the agent's computer.
 
 Both accounts of a role are kept as synchronized clones (same notebook text, same kernels,
 same persistent datasets). The controller decides which account is *active* from real
@@ -510,10 +510,10 @@ def accounts_from_env(env: Dict[str, str]) -> List[Account]:
         return Account(user=user, token=token, role=role, slot=slot, label=label)
 
     out = [a for a in (
-        parse(env.get("KAGGLE_FLEET_MODEL_PRIMARY", ""), "model", "primary", "Joshbond123"),
-        parse(env.get("KAGGLE_FLEET_MODEL_BACKUP", ""), "model", "backup", "TeslaArymo"),
-        parse(env.get("KAGGLE_FLEET_COMPUTER_PRIMARY", ""), "computer", "primary", "Josh787"),
-        parse(env.get("KAGGLE_FLEET_COMPUTER_BACKUP", ""), "computer", "backup", "Alagbo"),
+        parse(env.get("KAGGLE_FLEET_MODEL_PRIMARY", ""), "model", "primary", "black797"),
+        parse(env.get("KAGGLE_FLEET_MODEL_BACKUP", ""), "model", "backup", "temilolo"),
+        parse(env.get("KAGGLE_FLEET_COMPUTER_PRIMARY", ""), "computer", "primary", "alagbo"),
+        parse(env.get("KAGGLE_FLEET_COMPUTER_BACKUP", ""), "computer", "backup", "teslaarymo"),
     ) if a]
     # legacy single-account fallback: the old model account only
     if not any(a.role == "model" and a.slot == "primary" for a in out):
