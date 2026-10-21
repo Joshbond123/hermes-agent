@@ -2367,7 +2367,7 @@ def start_permanent_gpu_daemon() -> None:
                                 try:
                                     from blackthorn.fleet import mirror_state_dataset
                                     # Best-effort periodic mirror (quota-gated inside decide)
-                                    if int(time.time()) % 900 < 25:  # roughly once per ~15 min window
+                                    if int(time.time()) % 300 < 30:  # roughly once per ~5 min window
                                         mirror_state_dataset(primary, backup)
                                 except Exception as mexc:
                                     logger.debug("computer mirror note: %s", mexc)

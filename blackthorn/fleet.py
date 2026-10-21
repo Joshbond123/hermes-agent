@@ -455,9 +455,23 @@ def notebook_env_for(account: Account, base_env: Dict[str, str]) -> Dict[str, st
     env = dict(base_env)
     env["KAGGLE_USERNAME"] = account.user
     env["KAGGLE_API_TOKEN"] = account.token
+    # Shared model cache across primary+backup so neither redownloads after first publish.
+    primary_model = None
+    primary_computer = None
+    # account objects in this function don't carry fleet; use env or conventional primary names.
+    if account.role == "model":
+        # Always use the controller-configured cache (primary owner) so primary and
+        # backup both hit the same permanent GGUF dataset and never redownload.
+        shared_cache = (base_env.get("QWEN38_CACHE_DATASET") or env.get("QWEN38_CACHE_DATASET") or "").strip()
+        if not shared_cache:
+            shared_cache = "black797/qwen38-27b-uncensored-model-cache"
+        env["QWEN38_CACHE_DATASET"] = shared_cache
+        env.setdefault("ORNITH_ROLE", "model")
     if account.role == "computer":
         env["ORNITH_ROLE"] = "computer"
+        # Primary owns the state dataset; backup restores from the mirrored copy under its own slug.
         env.setdefault("COMPUTER_STATE_DATASET", f"{account.user}/blackthorn-computer-state")
+        env.setdefault("COMPUTER_CHECKPOINT_S", "120")
     return env
 
 

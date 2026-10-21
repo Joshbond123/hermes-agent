@@ -87,7 +87,7 @@ COMPUTER_WORKSPACE = os.environ.get("COMPUTER_WORKSPACE") or f"{WORK_ROOT}/black
 STATE_DATASET = (os.environ.get("COMPUTER_STATE_DATASET") or "").strip()   # e.g. josh787/blackthorn-computer-state
 STATE_DIR = "/tmp/computer_state"
 STATE_MANIFEST = f"{STATE_DIR}/manifest.json"
-CHECKPOINT_INTERVAL_S = int(os.environ.get("COMPUTER_CHECKPOINT_S") or "300")
+CHECKPOINT_INTERVAL_S = int(os.environ.get("COMPUTER_CHECKPOINT_S") or "120")
 BLIND_DISK_DIR = f"{_tmp}/model_cache"
 UPLOAD_DIR = f"{WORK_ROOT}/cache_upload"
 MARKER_PATH = f"{BLIND_DISK_DIR}/.verified"
@@ -621,9 +621,21 @@ def _publish_once(gguf_path: str, gpu_out: str) -> None:
         log(f"⚠️ cache publish thread: {type(exc).__name__}: {exc}")
 
 
-def _start_cache_publish(gguf_path: str, gpu_out: str) -> None:
-    """Persist the freshly downloaded model in the private Kaggle dataset (one-time per model version)."""
-    threading.Thread(target=_publish_once, args=(gguf_path, gpu_out), name="cache-publish", daemon=True).start()
+def _start_cache_publish(gguf_path: str, gpu_out: str = "") -> None:
+    """Publish a permanent Kaggle dataset copy so the next boot skips HF.
+
+    Runs synchronously so a short-lived session still leaves a durable cache.
+    Failures are logged and never abort the boot.
+    """
+    try:
+        if cache_dataset_ready():
+            notify_workspace("CACHE_DATASET_READY", extra={"dataset": CACHE_DATASET_SLUG, "gpu": gpu_out})
+            log(f"✅ Model cache already published: {CACHE_DATASET_SLUG}")
+            return
+        log(f"📦 Publishing permanent model cache to {CACHE_DATASET_SLUG} …")
+        publish_cache_dataset(gguf_path)
+    except Exception as exc:
+        log(f"cache publish note: {exc}")
 
 
 def publish_cache_dataset(gguf_path: str) -> None:
@@ -1662,6 +1674,13 @@ async def computer_write(request: Request, _=Depends(verify_api_key)):
     target.parent.mkdir(parents=True, exist_ok=True)
     data = content if isinstance(content, str) else str(content)
     target.write_text(data, encoding="utf-8")
+    try:
+        import time as _t
+        os.makedirs("/tmp/computer_state", exist_ok=True)
+        with open("/tmp/computer_state/checkpoint.request", "w") as _cf:
+            _cf.write(str(_t.time_ns()))
+    except Exception:
+        pass
     return {"ok": True, "path": str(target), "bytes": len(data.encode("utf-8")), "host": "kaggle-computer"}
 
 @app.post("/computer/fetch_url")
@@ -2306,19 +2325,18 @@ def main() -> None:
                                               "note": "no persistent copy mounted — downloading once"})
         notify_workspace("DOWNLOADING_MODEL", extra={"gpu": gpu_out, "note": "first run only"})
         dest = os.path.join(BLIND_DISK_DIR, GGUF_BASENAME.format(quant=MODEL_QUANT))
-        # Speed-ordered sources: Hugging Face CDN measured ~60 s for the whole
-        # 5.6 GB from inside Kaggle, while the dataset archive took ~5 min. The
-        # dataset copy stays as the fallback so the GGUF is never fetched from HF
-        # when a permanent Kaggle-side copy can serve it.
-        try:
-            gguf, how = download_model(dest)
-        except Exception as exc:
-            log(f"⚠️ Hugging Face source failed: {exc}")
-            notify_workspace("DOWNLOADING_MODEL", extra={"gpu": gpu_out, "note": f"HF failed, trying Kaggle copy: {str(exc)[:160]}"})
-            gguf, how = "", ""
+        # Prefer permanent Kaggle cache so subsequent boots never redownload from HF.
+        notify_workspace("CHECKING_CACHE", extra={"gpu": gpu_out, "note": f"cache={CACHE_DATASET_SLUG}"})
+        gguf = download_from_cache_dataset(dest)
+        how = "kaggle-dataset" if gguf else ""
         if not gguf:
-            gguf = download_from_cache_dataset(dest)
-            how = "kaggle-dataset" if gguf else ""
+            notify_workspace("DOWNLOADING_MODEL", extra={"gpu": gpu_out, "note": "cache miss — one-time HF download"})
+            try:
+                gguf, how = download_model(dest)
+            except Exception as exc:
+                log(f"⚠️ Hugging Face source failed: {exc}")
+                notify_workspace("DOWNLOADING_MODEL", extra={"gpu": gpu_out, "note": f"HF failed: {str(exc)[:160]}"})
+                gguf, how = "", ""
         if not gguf:
             log("GGUF sources failed — attempting ollama pull as last resort")
             try:
