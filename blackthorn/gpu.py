@@ -253,13 +253,13 @@ class GpuService:
             # Never call the legacy single-kernel stop after the fleet has refused a
             # shutdown: that bypasses task and checkpoint protection.
             st = await self.status(refresh=True)
-            failed = {role: v for role, v in out.items() if isinstance(v, dict) and v.get("status") == "stop_failed"}
+            failed = {role: v for role, v in out.items() if isinstance(v, dict) and v.get("status") in ("stop_failed", "stop_unverified", "stopped_control_plane")}
             st["fleet"] = out
             refused = {role: v for role, v in out.items() if isinstance(v, dict) and v.get("status") in ("stop_refused",)}
-            # stop_unverified / stopped_control_plane: control plane is off; warn but accept user stop
+            # An OFF control-plane row does not prove the Kaggle session stopped billing.
             st["turn_off_ok"] = not failed and not refused
             if failed or refused:
-                reasons = "; ".join(f"{role}: {v.get('error') or 'stop refused'}" for role, v in {**failed, **refused}.items())
+                reasons = "; ".join(f"{role}: {v.get('error') or v.get('warning') or 'stop refused'}" for role, v in {**failed, **refused}.items())
                 st["error"] = (f"Turn-off did not complete: Kaggle did not confirm that the session stopped ({reasons}). "
                                "Check the session on kaggle.com; if it is still running, stop it there, or give the token kernels.delete.")
             return st

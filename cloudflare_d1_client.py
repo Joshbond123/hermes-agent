@@ -2217,6 +2217,9 @@ def start_permanent_gpu_daemon() -> None:
         last_ready_ts = 0.0
         last_boot_heal_ts = 0.0
         stale_boot_heals = 0
+        last_mirror_at = 0.0
+        mirror_thread = None
+        daemon_fleet = None
         while True:
             try:
                 now = time.monotonic()
@@ -2350,7 +2353,11 @@ def start_permanent_gpu_daemon() -> None:
                 from blackthorn.fleet import FleetManager, accounts_from_env
                 accounts = accounts_from_env(os.environ)
                 if accounts:
-                    fleet = FleetManager(accounts)
+                    # Preserve active-slot hysteresis across ticks; rebuilding resets the
+                    # failover decision to primary and can re-push an already-live backup.
+                    if daemon_fleet is None:
+                        daemon_fleet = FleetManager(accounts)
+                    fleet = daemon_fleet
                     for role in ("model", "computer"):
                         if not _role_intended_online(role):
                             continue
@@ -2369,14 +2376,21 @@ def start_permanent_gpu_daemon() -> None:
                         if role == "computer" and st.active == "primary":
                             primary = fleet.by_slot.get(("computer", "primary"))
                             backup = fleet.by_slot.get(("computer", "backup"))
-                            if primary and backup:
-                                try:
-                                    from blackthorn.fleet import mirror_state_dataset
-                                    # Best-effort periodic mirror (quota-gated inside decide)
-                                    if int(time.time()) % 300 < 30:  # roughly once per ~5 min window
-                                        mirror_state_dataset(primary, backup)
-                                except Exception as mexc:
-                                    logger.debug("computer mirror note: %s", mexc)
+                            if primary and backup and now - last_mirror_at >= 300 and \
+                                    (mirror_thread is None or not mirror_thread.is_alive()):
+                                from blackthorn.fleet import mirror_state_dataset
+                                last_mirror_at = now
+                                def _mirror_background(p=primary, b=backup):
+                                    try:
+                                        outcome = mirror_state_dataset(p, b)
+                                        if not outcome.get("ok"):
+                                            logger.warning("computer mirror failed: %s", outcome.get("error", "unknown"))
+                                    except Exception as mexc:
+                                        logger.warning("computer mirror failed: %s", type(mexc).__name__)
+                                # Large datasets must not stall the 20-second quota / auto-off watchdog.
+                                mirror_thread = threading.Thread(target=_mirror_background, daemon=True,
+                                                                  name="blackthorn-computer-mirror")
+                                mirror_thread.start()
             except Exception as fexc:
                 logger.debug("fleet failover tick note: %s", fexc)
 

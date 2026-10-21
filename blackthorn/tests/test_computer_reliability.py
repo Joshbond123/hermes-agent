@@ -213,7 +213,7 @@ async def test_explicit_model_only_control_never_targets_computer(monkeypatch):
         OffBody(confirm=True, role="invalid")
     calls = []
     class FakeD1:
-        def turn_off_fleet(self, blocking, source, roles):
+        def turn_off_fleet(self, blocking, source, roles, force=False):
             calls.append((blocking, source, roles))
             return {"model": {"status": "stopped"}}
     monkeypatch.setattr(fleet, "accounts_from_env", lambda env: ["fleet configured"])
@@ -260,3 +260,31 @@ def test_queued_boot_is_not_restarted_by_the_failover_watchdog(monkeypatch):
     monkeypatch.setattr(d1, "d1_query", lambda sql, params=None: [{"status": "BOOTING_KAGGLE_GPU", "updated_at": time.time()}])
     assert d1._role_boot_in_progress("computer")
     assert d1.failover_fleet_role("computer", "primary", "backup")["status"] == "already_booting"
+
+
+def test_cache_publisher_uses_existing_dataset_and_skips_repeat_upload(monkeypatch):
+    called = []
+    monkeypatch.setattr(srv, 'cache_dataset_is_ready', lambda: True)
+    monkeypatch.setattr(srv, 'publish_cache_dataset', lambda path: called.append(path))
+    monkeypatch.setattr(srv, 'notify_workspace', lambda *args, **kwargs: None)
+    srv._start_cache_publish('/tmp/model.gguf')
+    assert called == []
+    monkeypatch.setattr(srv, 'cache_dataset_is_ready', lambda: False)
+    srv._start_cache_publish('/tmp/model.gguf')
+    assert called == ['/tmp/model.gguf']
+
+
+async def test_unverified_stop_is_not_reported_as_success(monkeypatch):
+    from blackthorn import fleet as fm
+    from blackthorn.gpu import GpuService
+    class FakeD1:
+        def turn_off_fleet(self, *args):
+            return {'model': {'status': 'stopped_control_plane', 'warning': 'not verified'}}
+    monkeypatch.setattr(fm, 'accounts_from_env', lambda env: ['model'])
+    gpu = GpuService(d1_module=FakeD1())
+    async def status(refresh=False):
+        return {'online': False}
+    gpu.status = status
+    result = await gpu.turn_off(role='model')
+    assert result['turn_off_ok'] is False
+    assert 'Kaggle did not confirm' in result['error']

@@ -628,7 +628,7 @@ def _start_cache_publish(gguf_path: str, gpu_out: str = "") -> None:
     Failures are logged and never abort the boot.
     """
     try:
-        if cache_dataset_ready():
+        if cache_dataset_is_ready():
             notify_workspace("CACHE_DATASET_READY", extra={"dataset": CACHE_DATASET_SLUG, "gpu": gpu_out})
             log(f"✅ Model cache already published: {CACHE_DATASET_SLUG}")
             return
@@ -661,15 +661,7 @@ def publish_cache_dataset(gguf_path: str) -> None:
                 },
                 fh,
             )
-        env = dict(os.environ)
-        env["KAGGLE_USERNAME"] = KAGGLE_USERNAME
-        env["KAGGLE_KEY"] = KAGGLE_API_TOKEN
-        env["KAGGLE_API_TOKEN"] = KAGGLE_API_TOKEN
-        env["KAGGLE_CONFIG_DIR"] = "/tmp/.kaggle"
-        os.makedirs("/tmp/.kaggle", exist_ok=True)
-        with open("/tmp/.kaggle/kaggle.json", "w") as fh:
-            json.dump({"username": KAGGLE_USERNAME, "key": KAGGLE_API_TOKEN}, fh)
-        os.chmod("/tmp/.kaggle/kaggle.json", 0o600)
+        env = _kaggle_cli_env()  # KGAT bearer token, not legacy KAGGLE_KEY Basic auth.
 
         if shutil.which("kaggle") is None:
             subprocess.run(

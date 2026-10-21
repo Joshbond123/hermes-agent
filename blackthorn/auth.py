@@ -44,23 +44,14 @@ def verify(password: str, stored: str) -> bool:
 
 
 def _plain_password() -> str:
-    return (
-        os.environ.get("BLACKTHORN_ADMIN_PASSWORD")
-        or os.environ.get("BLACKTHORN_BOOTSTRAP_PASSWORD")
-        or "BlackthornAdmin2026"
-    ).strip()
+    # No source-controlled fallback password. Production must supply a secret.
+    return (os.environ.get("BLACKTHORN_ADMIN_PASSWORD") or os.environ.get("BLACKTHORN_BOOTSTRAP_PASSWORD") or "").strip()
 
 
 def active() -> bool:
-    """Configured when we have a signing key and either a password hash or a plain admin password."""
-    if not os.environ.get("BLACKTHORN_AUTH_SIGNING_KEY"):
-        return False
-    if os.environ.get("BLACKTHORN_AUTH_PASSWORD_HASH"):
-        return True
-    if os.environ.get("BLACKTHORN_ADMIN_PASSWORD") or os.environ.get("BLACKTHORN_BOOTSTRAP_PASSWORD"):
-        return True
-    # Bootstrap fallback is always available when a signing key is present.
-    return True
+    """Fail closed when production does not have a signing key and real password."""
+    return bool(os.environ.get("BLACKTHORN_AUTH_SIGNING_KEY") and
+                (os.environ.get("BLACKTHORN_AUTH_PASSWORD_HASH") or _plain_password()))
 
 
 def required(request: Request) -> bool:
@@ -85,8 +76,9 @@ async def _hash(request: Request) -> str:
     env_hash = os.environ.get("BLACKTHORN_AUTH_PASSWORD_HASH", "")
     if env_hash:
         return env_hash
-    # Deterministic bootstrap hash so tokens remain valid across restarts.
-    return hash_password(_plain_password(), salt=_BOOTSTRAP_SALT)
+    # Only an explicitly configured password may be used as a bootstrap credential.
+    plain = _plain_password()
+    return hash_password(plain, salt=_BOOTSTRAP_SALT) if plain else ""
 
 
 def _version(stored: str) -> str:
@@ -171,28 +163,20 @@ async def status(request: Request):
 
 @router.post("/api/auth/login")
 async def login(body: Login, request: Request) -> JSONResponse:
+    if not _same_origin(request):
+        return JSONResponse({"detail": {"code": "origin", "message": "Same-origin request required."}}, status_code=403)
     if not active():
         return JSONResponse(
             {"detail": {"code": "not_configured", "message": "Login is not configured."}},
             status_code=503,
         )
-    password = (body.password or "").strip()
     try:
         stored = await _hash(request)
-        # Accept either the stored/env hash or the plain admin/bootstrap password.
-        ok = False
-        if stored and verify(password, stored):
-            ok = True
-        else:
-            expected = _plain_password()
-            ok = hmac.compare_digest(password, expected)
-            if ok:
-                # Ensure token version matches what middleware will re-load.
-                stored = hash_password(expected, salt=_BOOTSTRAP_SALT)
-    except Exception as exc:
+        ok = bool(stored) and verify(body.password, stored)
+    except Exception:
         return JSONResponse(
-            {"detail": {"code": "error", "message": f"login_failed: {type(exc).__name__}: {exc}"}},
-            status_code=500,
+            {"detail": {"code": "storage", "message": "Login storage unavailable."}},
+            status_code=503,
         )
     if not ok:
         return JSONResponse(
@@ -209,10 +193,7 @@ async def reset(body: Reset, request: Request):
     if not _same_origin(request):
         return JSONResponse({"detail": {"code": "origin", "message": "Same-origin request required."}}, status_code=403)
     stored = await _hash(request)
-    plain = _plain_password()
-    ok = (stored and verify(body.current_password, stored)) or hmac.compare_digest(
-        body.current_password.strip(), plain
-    )
+    ok = bool(stored) and verify(body.current_password, stored)
     if not ok:
         return JSONResponse(
             {"detail": {"code": "invalid", "message": "Incorrect current password."}},
@@ -222,7 +203,10 @@ async def reset(body: Reset, request: Request):
     try:
         await request.app.state.bt.store.set_setting(HASH_KEY, changed)
     except Exception:
-        pass
+        return JSONResponse(
+            {"detail": {"code": "storage", "message": "Password change was not saved."}},
+            status_code=503,
+        )
     response = JSONResponse({"ok": True})
     _cookie(response, _sign(changed), request)
     return response

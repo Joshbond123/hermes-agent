@@ -60,3 +60,29 @@ async def test_browser_login_remembers_and_settings_reset(monkeypatch, tmp_path,
     finally:
         await ctx.close()
         server.stop()
+
+
+def test_public_source_password_cannot_bypass_configured_hash(monkeypatch, tmp_path):
+    monkeypatch.setenv('BLACKTHORN_AUTH_REQUIRED', '1')
+    monkeypatch.setenv('BLACKTHORN_AUTH_SIGNING_KEY', 'z' * 48)
+    monkeypatch.setenv('BLACKTHORN_AUTH_PASSWORD_HASH', hash_password('new-private-passphrase-123456'))
+    monkeypatch.setenv('BLACKTHORN_ADMIN_PASSWORD', 'old-public-default')
+    with TestClient(create_app(Settings(store='sqlite', sqlite_path=str(tmp_path / 'auth-only.sqlite')), gpu_daemon=False)) as client:
+        origin = {'Origin': 'http://testserver'}
+        assert client.post('/api/auth/login', json={'password': 'old-public-default'}, headers=origin).status_code == 401
+        assert client.post('/api/auth/login', json={'password': 'new-private-passphrase-123456'}, headers=origin).status_code == 200
+        assert client.post('/api/auth/reset', json={'current_password': 'old-public-default',
+                    'new_password': 'another-private-passphrase-123456'}, headers=origin).status_code == 401
+
+
+def test_production_auth_fails_closed_without_credentials(monkeypatch, tmp_path):
+    monkeypatch.setenv('BLACKTHORN_AUTH_REQUIRED', '1')
+    monkeypatch.delenv('BLACKTHORN_ADMIN_PASSWORD', raising=False)
+    monkeypatch.delenv('BLACKTHORN_BOOTSTRAP_PASSWORD', raising=False)
+    monkeypatch.delenv('BLACKTHORN_AUTH_PASSWORD_HASH', raising=False)
+    monkeypatch.setenv('BLACKTHORN_AUTH_SIGNING_KEY', 'z' * 48)
+    with TestClient(create_app(Settings(store='sqlite', sqlite_path=str(tmp_path / 'empty.sqlite')), gpu_daemon=False)) as client:
+        assert client.get('/api/auth/status').json()['configured'] is False
+        assert client.get('/api/chat/sessions').status_code == 503
+        assert client.post('/api/auth/login', json={'password': 'anything'},
+                           headers={'Origin':'http://testserver'}).status_code == 503

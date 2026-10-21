@@ -478,6 +478,22 @@ async def fleet_decide(request: Request):
     return out
 
 
+@router.post("/api/computer/checkpoint")
+async def computer_checkpoint(request: Request):
+    """Owner-only durability barrier before a reset or failover.
+
+    Never advertise success until the computer confirms the dataset version published.
+    """
+    try:
+        result = await svc(request).computer.call("/computer/checkpoint", {}, timeout=230.0,
+                                                  idempotent=False)
+    except ToolError as exc:
+        raise _err(502, "checkpoint_failed", "The computer could not confirm the checkpoint.") from exc
+    if not result.get("ok"):
+        raise _err(502, "checkpoint_failed", str(result.get("error") or "Checkpoint not published")[:160])
+    return result
+
+
 @router.post("/api/fleet/sync")
 async def fleet_sync(request: Request):
     """Mirror the computer pair's state dataset (primary -> backup) on demand."""

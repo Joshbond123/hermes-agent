@@ -470,7 +470,7 @@ def notebook_env_for(account: Account, base_env: Dict[str, str]) -> Dict[str, st
     if account.role == "computer":
         env["ORNITH_ROLE"] = "computer"
         # Primary owns the state dataset; backup restores from the mirrored copy under its own slug.
-        env.setdefault("COMPUTER_STATE_DATASET", f"{account.user}/blackthorn-computer-state")
+        env["COMPUTER_STATE_DATASET"] = f"{account.user}/blackthorn-computer-state"
         env.setdefault("COMPUTER_CHECKPOINT_S", "120")
     return env
 
@@ -484,9 +484,13 @@ def mirror_state_dataset(from_account: Account, to_account: Account, *,
     credentials) right after checkpoints and before failovers, so the backup always has
     the newest published generation to boot from.
     """
+    import os
+    import json
     import shutil
     import subprocess
     import tempfile
+    import zipfile
+    from pathlib import Path
 
     def _run(cmd: List[str], env: Dict[str, str]) -> int:
         if runner is not None:
@@ -497,17 +501,50 @@ def mirror_state_dataset(from_account: Account, to_account: Account, *,
     src_slug = f"{from_account.user}/{dataset_slug}"
     dst_slug = f"{to_account.user}/{dataset_slug}"
     with tempfile.TemporaryDirectory() as tmp:
-        env_down = {"KAGGLE_USERNAME": from_account.user, "KAGGLE_KEY": from_account.token,
-                    "PATH": os.environ.get("PATH", "")}
-        rc = _run(["kaggle", "datasets", "download", "-p", tmp, "-u", src_slug], env_down)
+        download = Path(tmp) / "download"
+        upload = Path(tmp) / "upload"
+        download.mkdir()
+        upload.mkdir()
+        # KGAT tokens require Bearer auth. KAGGLE_KEY is a legacy Basic credential.
+        base_env = dict(os.environ)
+        env_down = {**base_env, "KAGGLE_USERNAME": from_account.user,
+                    "KAGGLE_API_TOKEN": from_account.token}
+        env_down.pop("KAGGLE_KEY", None)
+        rc = _run(["kaggle", "datasets", "download", "-p", str(download), src_slug], env_down)
         if rc != 0:
             return {"ok": False, "error": f"download rc={rc}"}
-        env_up = {"KAGGLE_USERNAME": to_account.user, "KAGGLE_KEY": to_account.token,
-                  "PATH": os.environ.get("PATH", "")}
-        rc = _run(["kaggle", "datasets", "create", "-p", tmp, "--dir-mode", "zip"], env_up)
+        archives = list(download.glob("*.zip"))
+        if len(archives) != 1:
+            return {"ok": False, "error": "expected one downloaded state archive"}
+        try:
+            with zipfile.ZipFile(archives[0]) as zf:
+                # Only the known checkpoint payload belongs in the new dataset.
+                # Never publish a downloaded archive under the wrong dataset id.
+                members = {name: zf.getinfo(name) for name in ("workspace.zip", "blackthorn_workspace.zip")
+                           if name in zf.namelist()}
+                if len(members) != 1 or next(iter(members.values())).file_size > 25 * 1024**3:
+                    return {"ok": False, "error": "state archive has no valid workspace snapshot"}
+                for name in members:
+                    with zf.open(name) as src, (upload / name).open("wb") as dst:
+                        shutil.copyfileobj(src, dst, 8 * 1024 * 1024)
+                if "manifest.json" in zf.namelist():
+                    with zf.open("manifest.json") as src, (upload / "manifest.json").open("wb") as dst:
+                        shutil.copyfileobj(src, dst)
+        except (OSError, KeyError, zipfile.BadZipFile):
+            return {"ok": False, "error": "state archive is corrupt"}
+        (upload / "dataset-metadata.json").write_text(json.dumps({
+            "title": "Blackthorn Computer State", "id": dst_slug, "isPrivate": True,
+            "licenses": [{"name": "other"}]
+        }))
+        env_up = {**base_env, "KAGGLE_USERNAME": to_account.user,
+                  "KAGGLE_API_TOKEN": to_account.token}
+        env_up.pop("KAGGLE_KEY", None)
+        rc = _run(["kaggle", "datasets", "create", "-p", str(upload), "--dir-mode", "skip"], env_up)
         if rc != 0:
-            rc = _run(["kaggle", "datasets", "version", "-p", tmp, "-m", "mirror"], env_up)
-        return {"ok": rc == 0, "from": src_slug, "to": dst_slug, "error": "" if rc == 0 else f"upload rc={rc}"}
+            rc = _run(["kaggle", "datasets", "version", "-p", str(upload),
+                       "-m", "mirror", "--dir-mode", "skip"], env_up)
+        return {"ok": rc == 0, "from": src_slug, "to": dst_slug,
+                "error": "" if rc == 0 else f"upload rc={rc}"}
 
 
 def accounts_from_env(env: Dict[str, str]) -> List[Account]:

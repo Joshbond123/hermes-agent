@@ -172,3 +172,39 @@ def test_partial_fleet_still_works():
     assert status["computer"]["primary"] == {"configured": False}
     assert fleet.decide("model").active == "primary"
     assert fleet.decide("computer").active == "primary"     # no accounts at all -> no crash
+
+
+def test_mirror_uses_bearer_and_relabels_archive_for_backup(tmp_path):
+    import io
+    import json
+    import zipfile
+    from pathlib import Path
+    from blackthorn.fleet import mirror_state_dataset
+    calls = []
+    def runner(cmd, env):
+        calls.append((cmd[:3], 'KAGGLE_API_TOKEN' in env and 'KAGGLE_KEY' not in env))
+        assert 'KAGGLE_KEY' not in env
+        assert env['KAGGLE_API_TOKEN'] == ('primary-token' if cmd[2] == 'download' else 'backup-token')
+        dest = Path(cmd[cmd.index('-p') + 1])
+        if cmd[2] == 'download':
+            with zipfile.ZipFile(dest / 'blackthorn-computer-state.zip', 'w') as z:
+                z.writestr('workspace.zip', b'workspace bytes')
+        else:
+            metadata = json.loads((dest / 'dataset-metadata.json').read_text())
+            assert metadata['id'] == 'backup/blackthorn-computer-state'
+            assert metadata['isPrivate'] is True
+            assert (dest / 'workspace.zip').read_bytes() == b'workspace bytes'
+            assert not any(p.name == 'blackthorn-computer-state.zip' for p in dest.iterdir())
+        return 0
+    result = mirror_state_dataset(Account('primary', 'primary-token', 'computer', 'primary'),
+                                  Account('backup', 'backup-token', 'computer', 'backup'), runner=runner)
+    assert result['ok'] is True
+    assert all(bearer for _cmd, bearer in calls)
+    assert [cmd[2] for cmd, _ in calls] == ['download', 'create']
+
+
+def test_backup_computer_restores_its_own_mirrored_dataset():
+    from blackthorn.fleet import notebook_env_for
+    backup = Account('backup', 'backup-token', 'computer', 'backup')
+    env = notebook_env_for(backup, {'COMPUTER_STATE_DATASET': 'primary/blackthorn-computer-state'})
+    assert env['COMPUTER_STATE_DATASET'] == 'backup/blackthorn-computer-state'
