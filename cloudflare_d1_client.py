@@ -1809,33 +1809,18 @@ def turn_on_fleet(blocking: bool = False) -> Dict[str, Any]:
         st = fleet.decide(role, force=True) if not reusable else fleet.state[role]
         account = fleet.by_slot.get((role, st.active))
         plan[role] = {"state": st, "account": account, "reusable": reusable}
-    # Never re-push a live computer when merely turning the model back on.
     for role in ("model", "computer"):
-        if role != "computer" and plan[role]["account"] is not None and not plan[role]["reusable"]:
-            _write_fleet_row("primary", "BOOTING_KAGGLE_GPU",
+        if plan[role]["account"] is not None and not plan[role]["reusable"]:
+            row_id = "computer" if role == "computer" else "primary"
+            _write_fleet_row(row_id, "BOOTING_KAGGLE_GPU",
                              gpu_info=f"Allocating on {plan[role]['account'].user}...")
 
     def boot(role: str) -> Dict[str, Any]:
         st, account = plan[role]["state"], plan[role]["account"]
         if plan[role]["reusable"]:
             return {"role": role, "status": "already_online", "account": account.user if account else None}
-        if role == "computer":
-            # Com11: no Kaggle push — dispatch the GitHub Actions Kali session.
-            out = com11_start()
-            if out.get("ok"):
-                if out.get("status") == "already_running":
-                    # a live session owns its row status (COM11_READY/heartbeats) — do not clobber it
-                    return {"role": role, "account": "github-actions", "status": "already_running",
-                            "run_id": out.get("run_id")}
-                _write_fleet_row("computer", "COM11_BOOTING",
-                                 gpu_info="Dispatching GitHub Actions runner (com11)...",
-                                 preserve_link=True)
-                return {"role": role, "account": "github-actions", "status": "starting",
-                        "dispatch": out.get("status"), "run_id": out.get("run_id")}
-            _write_fleet_row("computer", "BOOT_FAILED", gpu_info=f"FAILED: com11 {out.get('error')}",
-                             preserve_link=True)
-            return {"role": role, "account": "github-actions", "status": "start_failed",
-                    "error": str(out.get("error"))[:200]}
+        # Computer runs on Kaggle (alagbo primary / teslaarymo backup), same path as model.
+        # Com11 GitHub Actions is disabled — account suspended and architecture is Kaggle-only.
         if account is None:
             _write_fleet_row("computer" if role == "computer" else "primary", "BOOT_FAILED")
             return {"role": role, "status": "unconfigured"}
@@ -1906,7 +1891,7 @@ def _role_boot_in_progress(role: str) -> bool:
 
 def failover_fleet_role(role: str, from_slot: str, to_slot: str) -> Dict[str, Any]:
     """Execute a failover the fleet engine decided: sync state, boot the new active, retire the old.
-    (The computer role no longer has a Kaggle account pair — see the guard below.)
+    (Applies to both model and computer Kaggle fleet roles.)
 
     The backup has been completely cold until this moment (zero quota burned); this is
     the first and only time its kernel starts.
@@ -1915,9 +1900,6 @@ def failover_fleet_role(role: str, from_slot: str, to_slot: str) -> Dict[str, An
                                   mirror_state_dataset, notebook_env_for)
     from blackthorn.kaggle_bundle import build_computer_notebook_text, build_notebook_text
 
-    if role == "computer":
-        return {"ok": False, "status": "not_applicable", "role": role,
-                "reason": "the computer runs on GitHub Actions (Com11); no Kaggle account failover applies"}
     if not _role_intended_online(role):
         return {"ok": False, "status": "skipped_off", "role": role,
                 "reason": "role intentionally stopped or control-plane state unavailable"}

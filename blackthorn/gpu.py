@@ -153,23 +153,23 @@ class GpuService:
                     "gpu_info": crow.get("gpu_info") or "",
                     "model": crow.get("model") or "",
                     # Com11: real backend details behind the indicator (req. 7)
-                    "host": "GitHub Actions (Com11)",
-                    "environment": "com11-kali",
+                    "host": "Kaggle Computer",
+                    "environment": "kaggle-workspace",
                     "progress": str(crow.get("gpu_info") or ""),
                     "last_health": _parse_detail(crow.get("detail")) or None,
                 }
                 if c_status and c_status not in ("", "OFF", "OFFLINE"):
                     model_online = bool(model_pub.get("online"))
                     if model_online and not c_online and not c_booting:
-                        model_pub["display_status"] = "Model ready — Com11 offline"
+                        model_pub["display_status"] = "Model ready — computer offline"
                         model_pub["computer_ready"] = False
                     elif model_online and c_booting:
-                        model_pub["display_status"] = "Waiting for Com11"
+                        model_pub["display_status"] = "Waiting for computer"
                         model_pub["computer_ready"] = False
                         model_pub["online"] = False
                         model_pub["can_turn_on"] = False
                     elif model_online and c_online:
-                        model_pub["display_status"] = "Model + Com11 Ready"
+                        model_pub["display_status"] = "Model + computer ready"
                         model_pub["computer_ready"] = True
                     model_pub["computer"] = computer_pub
         except Exception:
