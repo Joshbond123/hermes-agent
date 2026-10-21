@@ -306,9 +306,13 @@ class FleetManager:
             payload["slug"] = f"{account.user}/blackthorn-{account.role}-{suffix}"
             out = self.rpc(account, "SaveKernel", payload)
         invalid = [x for x in (out.get("invalidDatasetSources") or []) if x]
-        if invalid and datasets:
-            payload.pop("datasetDataSources", None)
-            out = self.rpc(account, "SaveKernel", payload)
+        if invalid:
+            # SaveKernel has ALREADY created and started a kernel. A second save
+            # to "remove" invalid attachments collides with its reserved title
+            # (HTTP 409), falsely reports BOOT_FAILED and may restart live work.
+            # The notebook's cache/restore fallback handles missing mounts.
+            log.warning("Kaggle ignored %s unavailable dataset attachment(s) for %s",
+                        len(invalid), account.role)
         return out
 
     def kernel_status(self, account: Account, slug: str) -> Optional[Dict[str, Any]]:

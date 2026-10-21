@@ -287,3 +287,22 @@ def test_recently_deleted_kaggle_slug_conflict_retries_with_new_slug_and_title()
     assert out['versionNumber']==2 and len(saves)==2
     assert saves[0]['slug']!=saves[1]['slug']
     assert saves[0]['newTitle']!=saves[1]['newTitle']
+
+
+def test_missing_cache_attachment_never_repushes_an_already_started_kernel():
+    account = Account('primary', 'token', 'model', 'primary')
+    saves = []
+    def rpc(method, body, token):
+        if method == 'ListKernels': return {'kernels': []}
+        if method == 'GetKernelSessionStatus': return {'status': 'STOPPED'}
+        if method == 'SaveKernel':
+            saves.append(body)
+            if len(saves) > 1: raise AssertionError('second save collides with newly created title')
+            return {'versionNumber':1, 'invalidDatasetSources':['primary/cache-not-published-yet']}
+        raise AssertionError(method)
+    fleet = FleetManager([account], fetcher=rpc)
+    result = fleet.start_kernel(account, slug='primary/blackthorn-model',
+                                title='Blackthorn model (primary)', notebook_text='{}',
+                                datasets=['primary/cache-not-published-yet'])
+    assert result['versionNumber'] == 1
+    assert len(saves) == 1
