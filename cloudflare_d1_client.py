@@ -2236,7 +2236,11 @@ def start_permanent_gpu_daemon() -> None:
                 }
                 if d1_status in BOOTING_STAGES and not st.get("active"):
                     quiet_for = time.time() - d1_updated if d1_updated else 9999
-                    if quiet_for > 240 and (now - last_boot_heal_ts) > 300 and stale_boot_heals < 3:
+                    # Large GGUF first-boot downloads (16GB+) need far more than 4 minutes.
+                    # Never re-push while the Kaggle kernel is still RUNNING/QUEUED.
+                    download_stages = {"DOWNLOADING_MODEL", "MODEL_DOWNLOADED", "VERIFYING_MODEL", "LOADING_MODEL"}
+                    quiet_limit = 3600 if d1_status in download_stages else 600
+                    if quiet_for > quiet_limit and (now - last_boot_heal_ts) > 300 and stale_boot_heals < 3:
                         kernel_status = ""
                         try:
                             kernel_status = str(_kaggle_rpc(
@@ -2245,17 +2249,24 @@ def start_permanent_gpu_daemon() -> None:
                             ).get("status") or "").upper()
                         except Exception as exc:
                             logger.debug("boot watchdog session probe note: %s", exc)
-                        logger.warning(
-                            "Boot watchdog: stuck on %s for %.0fs (kernel=%s) — re-pushing",
-                            d1_status, quiet_for, kernel_status or "unknown",
-                        )
-                        last_boot_heal_ts = now
-                        stale_boot_heals += 1
-                        _record_stop_event("boot-watchdog", f"stuck on {d1_status} for {quiet_for:.0f}s; re-push stops same-slug sessions")
-                        try:
-                            turn_on_kaggle_gpu()
-                        except Exception as exc:
-                            logger.warning("boot watchdog re-push failed: %s", exc)
+                        if kernel_status in ("RUNNING", "QUEUED", "PENDING"):
+                            logger.info(
+                                "Boot watchdog: %s quiet %.0fs but kernel is %s — leaving session alone",
+                                d1_status, quiet_for, kernel_status,
+                            )
+                            last_boot_heal_ts = now
+                        else:
+                            logger.warning(
+                                "Boot watchdog: stuck on %s for %.0fs (kernel=%s) — re-pushing",
+                                d1_status, quiet_for, kernel_status or "unknown",
+                            )
+                            last_boot_heal_ts = now
+                            stale_boot_heals += 1
+                            _record_stop_event("boot-watchdog", f"stuck on {d1_status} for {quiet_for:.0f}s; re-push stops same-slug sessions")
+                            try:
+                                turn_on_kaggle_gpu()
+                            except Exception as exc:
+                                logger.warning("boot watchdog re-push failed: %s", exc)
                 elif st.get("active"):
                     stale_boot_heals = 0
 
