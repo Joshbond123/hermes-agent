@@ -1283,7 +1283,12 @@ async def verify_api_key(authorization: str = Header(default=None), x_api_key: s
 @app.get("/")
 @app.get("/health")
 async def health():
-    """Liveness plus the honest model state."""
+    """Liveness plus the honest model state; boot state is written after gateway startup."""
+    try:
+        with open("/tmp/boot_state.json") as fh:
+            current_boot = json.load(fh)
+    except (OSError, ValueError):
+        current_boot = BOOT_STATE
     model_loaded = False
     engine = "unknown"
     try:
@@ -1302,17 +1307,17 @@ async def health():
                     names = [str(m.get("name") or m.get("model") or "") for m in (ps.json().get("models") or [])]
                     model_loaded = any(n.split(":")[0] == OLLAMA_MODEL.split(":")[0] for n in names)
     except Exception:
-        model_loaded = bool(BOOT_STATE.get("warmup_ok"))
+        model_loaded = bool(current_boot.get("warmup_ok"))
     return {
         "status": "online",
         "model": MODEL_ALIAS,
         "backend_model": OLLAMA_MODEL,
         "model_loaded": model_loaded,
-        "gpu": BOOT_STATE.get("gpu", ""),
+        "gpu": current_boot.get("gpu", ""),
         "gpu_roles": ({"0": "computer", "1": "computer"} if (os.environ.get("ORNITH_ROLE") or "model") == "computer"
                       else {"0": "model", "1": "model"}),
         "uptime_seconds": round(time.time() - START_TIME, 1),
-        "boot": {k: BOOT_STATE.get(k) for k in ("cache_source", "boot_seconds", "download_skipped", "warmup_ok")},
+        "boot": {k: current_boot.get(k) for k in ("cache_source", "boot_seconds", "download_skipped", "warmup_ok")},
         "endpoints": ["/v1/models", "/v1/chat/completions", "/chat", "/logs", "/health", "/computer/info", "/computer/exec", "/computer/list_files", "/computer/read_file", "/computer/write_file", "/computer/fetch_url"],
         "auth_required": True,
     }

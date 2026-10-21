@@ -288,3 +288,20 @@ async def test_unverified_stop_is_not_reported_as_success(monkeypatch):
     result = await gpu.turn_off(role='model')
     assert result['turn_off_ok'] is False
     assert 'Kaggle did not confirm' in result['error']
+
+
+async def test_gateway_health_reads_finished_boot_marker_after_early_start(tmp_path):
+    import asyncio
+    import json
+    marker = tmp_path / 'boot-state.json'
+    source = (srv.gateway_code().replace('/tmp/boot_state.json', str(marker))
+              .replace('/kaggle/working/blackthorn_workspace', str(tmp_path / 'workspace')))
+    env = {}
+    exec(compile(source, '<gateway>', 'exec'), env)
+    assert env['BOOT_STATE'] == {}
+    marker.write_text(json.dumps({'cache_source':'dataset', 'download_skipped':True,
+                                  'boot_seconds':81, 'warmup_ok':True}))
+    out = await env['health']()
+    assert out['boot']['cache_source'] == 'dataset'
+    assert out['boot']['download_skipped'] is True
+    assert out['boot']['boot_seconds'] == 81
