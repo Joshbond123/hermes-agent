@@ -208,3 +208,24 @@ def test_backup_computer_restores_its_own_mirrored_dataset():
     backup = Account('backup', 'backup-token', 'computer', 'backup')
     env = notebook_env_for(backup, {'COMPUTER_STATE_DATASET': 'primary/blackthorn-computer-state'})
     assert env['COMPUTER_STATE_DATASET'] == 'backup/blackthorn-computer-state'
+
+
+def test_mirror_preserves_flat_workspace_archive(tmp_path):
+    import json
+    import zipfile
+    from pathlib import Path
+    from blackthorn.fleet import mirror_state_dataset
+    def runner(cmd, env):
+        folder = Path(cmd[cmd.index('-p') + 1])
+        if cmd[2] == 'download':
+            with zipfile.ZipFile(folder / 'state.zip', 'w') as z:
+                z.writestr('uploads/old-file.txt', 'preserved')
+                z.writestr('.blackthorn/environment.json', '{}')
+        else:
+            assert (folder / 'uploads/old-file.txt').read_text() == 'preserved'
+            assert (folder / '.blackthorn/environment.json').read_text() == '{}'
+            assert json.loads((folder / 'dataset-metadata.json').read_text())['id'] == 'backup/blackthorn-computer-state'
+        return 0
+    result = mirror_state_dataset(Account('primary','token1','computer','primary'),
+                                  Account('backup','token2','computer','backup'), runner=runner)
+    assert result['ok'] is True

@@ -529,18 +529,27 @@ def mirror_state_dataset(from_account: Account, to_account: Account, *,
             return {"ok": False, "error": "expected one downloaded state archive"}
         try:
             with zipfile.ZipFile(archives[0]) as zf:
-                # Only the known checkpoint payload belongs in the new dataset.
-                # Never publish a downloaded archive under the wrong dataset id.
-                members = {name: zf.getinfo(name) for name in ("workspace.zip", "blackthorn_workspace.zip")
-                           if name in zf.namelist()}
-                if len(members) != 1 or next(iter(members.values())).file_size > 25 * 1024**3:
-                    return {"ok": False, "error": "state archive has no valid workspace snapshot"}
-                for name in members:
-                    with zf.open(name) as src, (upload / name).open("wb") as dst:
+                # Kaggle may return a flat workspace archive OR an archive with
+                # workspace.zip (older CLI). Both are valid snapshots.
+                copied = 0
+                total = 0
+                for info in zf.infolist():
+                    if info.is_dir() or info.filename == "dataset-metadata.json":
+                        continue
+                    path = Path(info.filename)
+                    mode = (info.external_attr >> 16) & 0o170000
+                    if path.is_absolute() or ".." in path.parts or mode == 0o120000:
+                        return {"ok": False, "error": "unsafe path in state archive"}
+                    total += info.file_size
+                    if total > 25 * 1024**3 or copied >= 10000:
+                        return {"ok": False, "error": "state archive exceeds mirror limits"}
+                    dest = upload / path
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    with zf.open(info) as src, dest.open("wb") as dst:
                         shutil.copyfileobj(src, dst, 8 * 1024 * 1024)
-                if "manifest.json" in zf.namelist():
-                    with zf.open("manifest.json") as src, (upload / "manifest.json").open("wb") as dst:
-                        shutil.copyfileobj(src, dst)
+                    copied += 1
+                if copied == 0:
+                    return {"ok": False, "error": "state archive has no workspace snapshot"}
         except (OSError, KeyError, zipfile.BadZipFile):
             return {"ok": False, "error": "state archive is corrupt"}
         (upload / "dataset-metadata.json").write_text(json.dumps({
