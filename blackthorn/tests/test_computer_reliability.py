@@ -310,3 +310,21 @@ async def test_gateway_health_reads_finished_boot_marker_after_early_start(tmp_p
 def test_hf_gguf_url_has_actual_quant_not_template_placeholder():
     assert '{quant}' not in srv.HF_GGUF_URL
     assert srv.HF_GGUF_URL.endswith(f'-{srv.MODEL_QUANT}.gguf')
+
+
+async def test_turn_on_waits_for_kernel_push_before_user_can_turn_off(monkeypatch):
+    from blackthorn import fleet as fm
+    from blackthorn.gpu import GpuService
+    calls = []
+    class FakeD1:
+        def turn_on_fleet(self, blocking=False):
+            calls.append(blocking)
+            return {'model': {'status':'starting'}, 'computer': {'status':'starting'}}
+    monkeypatch.setattr(fm, 'accounts_from_env', lambda env: ['configured'])
+    gpu = GpuService(d1_module=FakeD1())
+    async def status(refresh=False):
+        return {'status':'BOOTING_KAGGLE_GPU'}
+    gpu.status = status
+    out = await gpu.turn_on()
+    assert calls == [True]
+    assert out['fleet']['model']['status'] == 'starting'

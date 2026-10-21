@@ -237,7 +237,10 @@ class GpuService:
             except Exception:
                 pass
             # Errors propagate: a failed fleet start must not silently fall back to a different code path.
-            out = await asyncio.to_thread(d1.turn_on_fleet)
+            # Wait for BOTH SaveKernel submissions before acknowledging ON. A
+            # detached boot thread can otherwise create new paid sessions AFTER
+            # the user immediately turns the GPU off.
+            out = await asyncio.to_thread(d1.turn_on_fleet, True)
             st = await self.status(refresh=True)
             st["fleet"] = out
             return st
