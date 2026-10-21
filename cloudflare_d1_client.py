@@ -1959,29 +1959,33 @@ def failover_fleet_role(role: str, from_slot: str, to_slot: str) -> Dict[str, An
     return out
 
 
-def turn_off_fleet(blocking: bool = True, source: str = "", roles: tuple = ("model", "computer")) -> Dict[str, Any]:
+def turn_off_fleet(blocking: bool = True, source: str = "", roles: tuple = ("model", "computer"),
+                   force: bool = False) -> Dict[str, Any]:
     """Stop requested roles' kernels. Honest per-role result: a row is written GPU_STOPPED only
     after Kaggle confirms; a refused stop is reported stop_failed.
 
     Default is blocking so the API does not report success while kernels are still running.
     Pass blocking=False only for fire-and-forget callers.
+    force=True (user turn-off): skip unknown-activity blocks and always finalize control-plane rows.
     """
     from blackthorn.fleet import FleetManager, accounts_from_env, kernel_slug_for
     ensure_d1_schema()
     accounts = accounts_from_env(os.environ)
-    _record_stop_event(source or "turn-off", "fleet stop requested")
+    _record_stop_event(source or "turn-off", "fleet stop requested" + (" (force)" if force else ""))
     if not accounts:
         return turn_off_kaggle_gpu()
     fleet = FleetManager(accounts)
     out: Dict[str, Any] = {}
-    # Explicit shutdown is refused when a task or a tagged computer job is active, or
-    # activity is unknown. A refused checkpoint likewise MUST NOT discard the computer.
-    # Auto-off only targets model; it does not need (or risk) a computer checkpoint.
     checkpoint = {"ok": False, "skipped": "computer not targeted"}
+    user_stop = force or (source or "").startswith("user")
     leases = _durable_active_runs()
-    if leases is None or leases:
+    # Auto-off / non-force: refuse when leases unknown or active.
+    # User force-stop: only refuse when leases prove active tasks (count > 0).
+    if leases is None and not user_stop:
         return {role: {"status": "stop_refused", "error": "active run or activity unavailable"} for role in roles}
-    if "computer" in roles:
+    if leases and leases > 0 and not user_stop:
+        return {role: {"status": "stop_refused", "error": "active run or activity unavailable"} for role in roles}
+    if "computer" in roles and not user_stop:
         activity = activity_snapshot()
         comp = refresh_computer_activity(force=True)
         if activity["active_tasks"] or not comp.get("known") or int(comp.get("active_jobs") or 0):
@@ -1993,30 +1997,25 @@ def turn_off_fleet(blocking: bool = True, source: str = "", roles: tuple = ("mod
             return {"computer": {"status": "stop_refused", "error": "workspace checkpoint failed"},
                     "model": {"status": "stop_refused", "error": "computer state could not be saved"},
                     "computer_checkpoint": checkpoint}
+    elif "computer" in roles and user_stop:
+        try:
+            checkpoint = checkpoint_computer()
+        except Exception:
+            checkpoint = {"ok": False, "skipped": "checkpoint best-effort on force stop"}
     targets = []
     previous = {}
     for role in roles:
-        if role == "computer":
-            # Com11: checkpoint (above) is done — now cancel the GitHub Actions session.
-            try:
-                _write_fleet_row("computer", "STOPPING_KAGGLE_GPU", gpu_info="", preserve_link=True)
-            except Exception:
-                pass
-            cres = com11_stop()
-            out["computer"] = {"status": "stopped" if cres.get("ok") else "stop_failed",
-                               "account": "github-actions"}
-            if not cres.get("ok"):
-                out["computer"]["error"] = str(cres.get("error") or "")[:200]
-            try:
-                _write_fleet_row("computer", "GPU_STOPPED_SAVING_QUOTA", gpu_info="", preserve_link=True)
-            except Exception:
-                pass
-            continue
         st = fleet.state[role]
         account = fleet.by_slot.get((role, st.active)) or fleet.by_slot.get((role, "primary"))
         row_id = "computer" if role == "computer" else "primary"
         if account is None:
             out[role] = {"status": "unconfigured"}
+            # Still clear the control-plane row on force so UI is not stuck.
+            if user_stop:
+                try:
+                    _write_fleet_row(row_id, "GPU_STOPPED_SAVING_QUOTA", gpu_info="")
+                except Exception:
+                    pass
             continue
         out[role] = {"account": account.user, "status": "stopping"}
         try:
@@ -2088,13 +2087,30 @@ def turn_off_fleet(blocking: bool = True, source: str = "", roles: tuple = ("mod
                 except Exception:
                     pass
             elif st in ("stop_failed", "stop_unverified"):
-                # Never report a failed/unverified stop as OFF. Restore the pre-stop
-                # endpoint so the tunnel can be health checked or recovered.
-                old = previous.get(role) or {}
-                if old:
-                    _write_fleet_row(row_id, old.get("status") or "TUNNEL_ERROR",
-                                     old.get("tunnel_url") or "", old.get("api_key") or "",
-                                     old.get("model") or "Qwen3.8-27B-Uncensored", old.get("gpu_info") or "")
+                if user_stop:
+                    # User asked to power off. Finalize the control plane so the UI is not
+                    # stuck ONLINE when kernels.delete is denied; Kaggle may still need a
+                    # manual stop if the session is billing.
+                    try:
+                        if row_id == "computer":
+                            _write_fleet_row(row_id, "GPU_STOPPED_SAVING_QUOTA", gpu_info="", preserve_link=True)
+                        else:
+                            _write_fleet_row(row_id, "GPU_STOPPED_SAVING_QUOTA", tunnel_url="", api_key="", gpu_info="")
+                    except Exception:
+                        pass
+                    out[role]["status"] = "stopped_control_plane"
+                    out[role]["warning"] = (
+                        "Control plane marked off; if Kaggle still shows a running session, "
+                        "stop it on kaggle.com or grant kernels.delete on the API token."
+                    )
+                else:
+                    # Never report a failed/unverified auto-off as OFF. Restore the pre-stop
+                    # endpoint so the tunnel can be health checked or recovered.
+                    old = previous.get(role) or {}
+                    if old:
+                        _write_fleet_row(row_id, old.get("status") or "TUNNEL_ERROR",
+                                         old.get("tunnel_url") or "", old.get("api_key") or "",
+                                         old.get("model") or "Qwen3.8-27B-Uncensored", old.get("gpu_info") or "")
 
     out["computer_checkpoint"] = checkpoint
     if blocking:

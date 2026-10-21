@@ -240,13 +240,14 @@ class GpuService:
         if hasattr(d1, "turn_off_fleet") and accounts_from_env(os.environ):
             # Blocking stop so the UI does not report offline while the kernel is still up.
             roles = ("model", "computer") if role == "all" else (role,)
-            out = await asyncio.to_thread(d1.turn_off_fleet, True, "user turn-off", roles)
+            out = await asyncio.to_thread(d1.turn_off_fleet, True, "user turn-off", roles, True)
             # Never call the legacy single-kernel stop after the fleet has refused a
             # shutdown: that bypasses task and checkpoint protection.
             st = await self.status(refresh=True)
             failed = {role: v for role, v in out.items() if isinstance(v, dict) and v.get("status") == "stop_failed"}
             st["fleet"] = out
-            refused = {role: v for role, v in out.items() if isinstance(v, dict) and v.get("status") in ("stop_refused", "stop_unverified")}
+            refused = {role: v for role, v in out.items() if isinstance(v, dict) and v.get("status") in ("stop_refused",)}
+            # stop_unverified / stopped_control_plane: control plane is off; warn but accept user stop
             st["turn_off_ok"] = not failed and not refused
             if failed or refused:
                 reasons = "; ".join(f"{role}: {v.get('error') or 'stop refused'}" for role, v in {**failed, **refused}.items())
