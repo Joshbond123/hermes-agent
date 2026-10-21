@@ -229,3 +229,24 @@ def test_mirror_preserves_flat_workspace_archive(tmp_path):
     result = mirror_state_dataset(Account('primary','token1','computer','primary'),
                                   Account('backup','token2','computer','backup'), runner=runner)
     assert result['ok'] is True
+
+
+def test_delete_verified_by_listing_when_deleted_session_returns_403(monkeypatch):
+    import urllib.error
+    from blackthorn.fleet import FleetManager
+    monkeypatch.setattr('time.sleep', lambda seconds: None)
+    account = Account('primary', 'token', 'model', 'primary')
+    state = {'deleted': False}
+    def rpc(method, body, token):
+        if method == 'DeleteKernel':
+            state['deleted'] = True
+            return {}
+        if method == 'GetKernelSessionStatus':
+            if state['deleted']:
+                raise urllib.error.HTTPError('https://www.kaggle.com', 403, 'gone', {}, None)
+            return {'status': 'RUNNING'}
+        if method == 'ListKernels':
+            return {'kernels': [] if state['deleted'] else [{'ref':'primary/blackthorn-model', 'title':'Blackthorn model'}]}
+        raise AssertionError(method)
+    fleet = FleetManager([account], fetcher=rpc)
+    assert fleet.stop_kernel_result(account, 'primary/blackthorn-model')['state'] == 'stopped'

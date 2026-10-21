@@ -216,6 +216,22 @@ class FleetManager:
             return {"state": "not_running", "error": ""}
         last_error = ""
         accepted = False
+
+        def missing_after_delete() -> bool:
+            """A successful DeleteKernel can make GetKernelSessionStatus return 403.
+
+            A readable listing that no longer contains the very kernel we saw is
+            independent confirmation; a listing error or a still-present kernel is not.
+            """
+            try:
+                listing = self.rpc(account, "ListKernels", {"pageSize": 100, "user": account.user})
+                kernels = listing.get("kernels") or listing.get("results") or []
+                return not any(str(k.get("ref") or k.get("slug") or "").split("/")[-1] == name or
+                               str(k.get("title") or "").startswith(f"Blackthorn {account.role}")
+                               for k in kernels)
+            except FleetError:
+                return False
+
         for _ in range(3):
             try:
                 self.rpc(account, "DeleteKernel", {"userName": account.user, "kernelSlug": name})
@@ -231,13 +247,15 @@ class FleetManager:
             if not status_readable:
                 # Cannot re-read status (permission). If delete was accepted, trust the stop.
                 if accepted:
-                    return {"state": "unverified", "error": "stop accepted; session status cannot be read (kernels.get denied)"}
+                    return ({"state": "stopped", "error": ""} if missing_after_delete() else
+                            {"state": "unverified", "error": "stop accepted; session status cannot be read (kernels.get denied)"})
                 continue
             try:
                 again = self.rpc(account, "GetKernelSessionStatus", {"userName": account.user, "kernelSlug": name})
             except FleetError as exc:
                 if accepted:
-                    return {"state": "unverified", "error": f"Kaggle accepted the stop; the status read was refused: {str(exc)[:120]}"}
+                    return ({"state": "stopped", "error": ""} if missing_after_delete() else
+                            {"state": "unverified", "error": f"Kaggle accepted the stop; the status read was refused: {str(exc)[:120]}"})
                 return {"state": "failed", "error": f"could not verify the stop: {str(exc)[:160]}"}
             if str(again.get("status") or "").upper() not in ("RUNNING", "QUEUED", "PENDING"):
                 return {"state": "stopped", "error": ""}
