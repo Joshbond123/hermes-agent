@@ -305,3 +305,8 @@ async def test_gateway_health_reads_finished_boot_marker_after_early_start(tmp_p
     assert out['boot']['cache_source'] == 'dataset'
     assert out['boot']['download_skipped'] is True
     assert out['boot']['boot_seconds'] == 81
+
+
+def test_hf_gguf_url_has_actual_quant_not_template_placeholder():
+    assert '{quant}' not in srv.HF_GGUF_URL
+    assert srv.HF_GGUF_URL.endswith(f'-{srv.MODEL_QUANT}.gguf')

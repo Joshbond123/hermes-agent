@@ -216,7 +216,9 @@ class GpuService:
                     model_pub["quotas"] = quotas
                 if fleet_slots:
                     model_pub["fleet_slots"] = fleet_slots
-                model_pub["model_cache_dataset"] = os.environ.get("QWEN38_CACHE_DATASET", "")
+                # A configured slug is not evidence that Kaggle holds a usable cache.
+                model_pub["model_cache_dataset"] = (await asyncio.to_thread(d1._model_cache_dataset_slug)
+                                                       if hasattr(d1, "_model_cache_dataset_slug") else "")
                 model_pub["model_name"] = "Qwen3.8-27B-Uncensored"
         except Exception:
             pass

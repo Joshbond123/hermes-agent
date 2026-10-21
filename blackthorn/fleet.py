@@ -214,6 +214,16 @@ class FleetManager:
             sess = {}
         if status_readable and str(sess.get("status") or "").upper() not in ("RUNNING", "QUEUED", "PENDING"):
             return {"state": "not_running", "error": ""}
+        if not status_readable:
+            try:
+                listing = self.rpc(account, "ListKernels", {"pageSize": 100, "user": account.user})
+                kernels = listing.get("kernels") or listing.get("results") or []
+                if not any(str(k.get("ref") or k.get("slug") or "").split("/")[-1] == name or
+                           str(k.get("title") or "").startswith(f"Blackthorn {account.role}")
+                           for k in kernels):
+                    return {"state": "not_running", "error": ""}
+            except FleetError:
+                pass  # An unreadable listing proves nothing; attempt deletion.
         last_error = ""
         accepted = False
 

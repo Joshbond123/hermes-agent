@@ -1124,6 +1124,11 @@ def get_kaggle_gpu_status(force_refresh: bool = False) -> Dict[str, Any]:
                     if h_data.get("gpu"):
                         state["gpu_info"] = str(h_data["gpu"]).replace("\n", " + ")
                     state["model_loaded"] = bool(h_data.get("model_loaded"))
+                    boot = h_data.get("boot") or {}
+                    if boot:
+                        state["boot_seconds"] = boot.get("boot_seconds")
+                        state["cache_source"] = boot.get("cache_source")
+                        state["download_skipped"] = boot.get("download_skipped")
                     if h_data.get("status") not in (None, "online", "ready", "ok"):
                         _fast_dead = True
             except Exception as _fast_exc:

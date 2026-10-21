@@ -41,7 +41,7 @@ MODEL_ALIAS = "Qwen3.8-27B-Uncensored"
 OLLAMA_MODEL_NAME = "qwen38:uncensored"
 GGUF_BASENAME = "Qwen3.8-27B-uncensored-{quant}.gguf"
 HF_REPO = "ressl/Qwen3.8-27B-uncensored-GGUF"
-HF_GGUF_URL = f"https://huggingface.co/{HF_REPO}/resolve/main/{GGUF_BASENAME}"
+HF_GGUF_URL = f"https://huggingface.co/{HF_REPO}/resolve/main/{GGUF_BASENAME.format(quant=MODEL_QUANT)}"
 FALLBACK_REPO = "orcarouter/Qwen3.8-27B-Uncensored-GGUF"
 # Sizes from HF API (bytes). SHA left empty when unknown — size check still applies.
 MODEL_SHA256 = {
@@ -104,9 +104,18 @@ _LOGS: list = []
 
 # --------------------- STATUS / TELEMETRY ---------------------
 def log(msg: str) -> None:
-    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+    # The gateway's owner-only /logs endpoint reads this same boot log. Never
+    # write Kaggle access tokens or bearer headers to notebook output or disk.
+    safe = re.sub(r"KGAT_[A-Za-z0-9_-]+|github_pat_[A-Za-z0-9_]+|rnd_[A-Za-z0-9]+", "[redacted]", str(msg))
+    safe = re.sub(r"(?i)Bearer\s+[^\s]+", "Bearer [redacted]", safe)
+    line = f"[{time.strftime('%H:%M:%S')}] {safe}"
     _LOGS.append(line)
     del _LOGS[:-400]
+    try:
+        with open("/tmp/qwen38.log", "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
     print(line, flush=True)
 
 
@@ -658,6 +667,7 @@ def publish_cache_dataset(gguf_path: str) -> None:
                     "title": CACHE_DATASET_TITLE,
                     "id": CACHE_DATASET_SLUG,
                     "licenses": [{"name": "other"}],
+                    "isPrivate": True,
                 },
                 fh,
             )
@@ -1323,8 +1333,8 @@ async def health():
     }
 
 
-@app.get("/logs")
-async def logs(dependencies=[Depends(verify_api_key)]):
+@app.get("/logs", dependencies=[Depends(verify_api_key)])
+async def logs():
     try:
         with open(LOGS, "r", errors="ignore") as fh:
             return {"lines": fh.read().splitlines()[-200:]}
@@ -2372,9 +2382,13 @@ def main() -> None:
             log("✅ sha256 verified")
         else:
             log(f"⚠️ mirror source used ({how}) — size-checked only, sha256 not comparable")
-        source = "download"
-        boot_state["download_skipped"] = False
-        _start_cache_publish(gguf, gpu_out)
+        source = ("dataset-copy" if how == "kaggle-dataset" else
+                  "ollama-pull" if how == "ollama-pull" else "hf-download")
+        boot_state["download_skipped"] = how == "kaggle-dataset"
+        if gguf != "ollama-registry" and _healthy_file(gguf, expected):
+            _start_cache_publish(gguf, gpu_out)
+        else:
+            log("⚠️ No verified GGUF file is available to publish as a model cache")
     else:
         boot_state["download_skipped"] = True
         log(f"⏭️  Download skipped — reusing {source} model")
