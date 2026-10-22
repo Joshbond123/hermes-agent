@@ -1169,7 +1169,9 @@ def start_llama_server(gguf_path: str) -> None:
             "-ngl", ngl,
             "--split-mode", "layer", "--tensor-split", "1,1",
             "-c", str(n_ctx),
-            "--host", "0.0.0.0",
+            # Only the authenticated local gateway may reach the unauthenticated
+            # llama.cpp backend; never expose it on the Kaggle container network.
+            "--host", "127.0.0.1",
             "--port", str(LLAMA_PORT),
             "-np", "1",
             "--flash-attn", "on",
