@@ -221,6 +221,28 @@ def test_model_registration_does_not_delete_cached_blobs():
                    and n.func.attr in ('remove', 'unlink', 'rmtree') for n in ast.walk(fn))
 
 
+def test_mounted_computer_state_restores_without_download_or_overwrite(srv, monkeypatch, tmp_path):
+    root = tmp_path / 'input'
+    mount = root / 'datasets' / 'alagbo' / 'blackthorn-computer-state'
+    (mount / 'live_verification').mkdir(parents=True)
+    (mount / 'live_verification' / 'marker.txt').write_text('published')
+    (mount / 'live_verification' / 'new.txt').write_text('from snapshot')
+    (mount / 'dataset-metadata.json').write_text('{}')
+    (mount / 'private.key').write_text('not-copied')
+    (mount / 'link.txt').symlink_to('marker.txt')
+    live = tmp_path / 'workspace'
+    (live / 'live_verification').mkdir(parents=True)
+    (live / 'live_verification' / 'marker.txt').write_text('newer local')
+    monkeypatch.setattr(srv, 'INPUT_ROOT', str(root))
+    monkeypatch.setattr(srv, 'COMPUTER_WORKSPACE', str(live))
+    monkeypatch.setattr(srv, 'STATE_DATASET', 'alagbo/blackthorn-computer-state')
+    monkeypatch.setattr(srv.subprocess, 'run', lambda *a, **k: (_ for _ in ()).throw(AssertionError('download should not run')))
+    assert srv.restore_workspace() is True
+    assert (live / 'live_verification' / 'marker.txt').read_text() == 'newer local'
+    assert (live / 'live_verification' / 'new.txt').read_text() == 'from snapshot'
+    assert not (live / 'private.key').exists() and not (live / 'link.txt').exists()
+
+
 def test_late_notebook_heartbeat_cannot_resurrect_verified_off(srv, monkeypatch):
     calls = []
     def fake_urlopen(req, **kwargs):

@@ -1916,6 +1916,46 @@ def _kaggle_cli_env() -> dict:
     return env
 
 
+def _restore_mounted_workspace() -> tuple[int, int]:
+    """Restore an attached account-owned dataset without a second Kaggle API call.
+
+    Kaggle sometimes mounts a dataset but rejects datasets.download with 404 on
+    the SAME account. The mount is read-only and contains the published workspace
+    files directly. Existing live files win; never follow symlinks or copy secrets.
+    Returns (files_copied, snapshot_files_seen).
+    """
+    parts = STATE_DATASET.split("/")
+    if len(parts) != 2 or not all(re.fullmatch(r"[A-Za-z0-9_-]+", p) for p in parts):
+        return 0, 0
+    candidates = (os.path.join(INPUT_ROOT, "datasets", *parts),
+                  os.path.join(INPUT_ROOT, parts[1]))
+    for root in candidates:
+        if not os.path.isdir(root):
+            continue
+        copied = seen = 0
+        for directory, dirs, files in os.walk(root, followlinks=False):
+            dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(directory, d))
+                       and d not in CHECKPOINT_EXCLUDE_DIRS]
+            relative = os.path.relpath(directory, root)
+            for name in files:
+                src = os.path.join(directory, name)
+                if (os.path.islink(src) or name in CHECKPOINT_SECRET_NAMES
+                        or name in ("dataset-metadata.json", "manifest.json", "workspace.zip", "state.zip")
+                        or name.endswith((".pem", ".key", ".p12"))
+                        or os.path.getsize(src) > CHECKPOINT_MAX_FILE_BYTES):
+                    continue
+                seen += 1
+                dst = os.path.join(COMPUTER_WORKSPACE, relative, name)
+                if os.path.exists(dst):
+                    continue
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(src, dst)
+                copied += 1
+        if seen:
+            return copied, seen
+    return 0, 0
+
+
 def restore_workspace() -> bool:
     """Bring the computer workspace back from the state dataset before any work begins.
 
@@ -1925,6 +1965,13 @@ def restore_workspace() -> bool:
     if not STATE_DATASET:
         log("Persistence: no COMPUTER_STATE_DATASET configured — starting with a live workspace")
         return False
+    try:
+        copied, seen = _restore_mounted_workspace()
+        if seen:
+            log(f"✅ Persistence: restored {copied} of {seen} mounted snapshot files into {COMPUTER_WORKSPACE}")
+            return True
+    except (OSError, ValueError) as exc:
+        log(f"Persistence: mounted snapshot unavailable ({type(exc).__name__}) — trying API download")
     os.makedirs(STATE_DIR, exist_ok=True)
     archive_dir = os.path.join(STATE_DIR, "download")
     if os.path.isdir(archive_dir):
