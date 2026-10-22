@@ -72,7 +72,10 @@ async def _hash(request: Request) -> str:
         if from_store:
             return from_store
     except Exception:
-        pass
+        # A reset hash may live only in D1. If D1 is unavailable, falling back
+        # to the old bootstrap hash would re-enable a revoked owner password.
+        if required(request):
+            raise
     env_hash = os.environ.get("BLACKTHORN_AUTH_PASSWORD_HASH", "")
     if env_hash:
         return env_hash

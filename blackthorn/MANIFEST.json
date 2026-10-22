@@ -5,7 +5,7 @@
   "blackthorn/agent.py": "18aa438855bcfc9d73aa0c6126fa91f5065d884d37f1b74d8285af0502887850",
   "blackthorn/api.py": "c2e8045513d3580a9c92e2b448d0531ef8674c86e0616389c4ae93dd1a47d3b1",
   "blackthorn/app.py": "f230cafa3e4ab51d5814b9018952893ba6f2e8ca8006749f6bfdd634a479403d",
-  "blackthorn/auth.py": "2e82b15dcca3cd19366458b257d974d272b057bd44eae2a959d539c8d4bf5cf2",
+  "blackthorn/auth.py": "daa51b4209187b523912b663bc793cb3fdf760603440cf3c971cc787d9bbea32",
   "blackthorn/computer_assets/browse.py": "6935fadc3c70d47bc9a4f878baafb1ba1a5640e0a7900128b03357beccafe075",
   "blackthorn/computer_assets/install_stack.py": "a3613c1e4b5224e5b22b05ec1f760901e4d690ebab3ba972ed91674acd0d9204",
   "blackthorn/computer_assets/skillctl.py": "773df12a1f4fc65256b5b590ead5f929598c633c0bc2c90c4187a81f73c725fb",

@@ -55,6 +55,7 @@ async def test_browser_login_remembers_and_settings_reset(monkeypatch, tmp_path,
         await page.get_by_test_id('settings-open').click()
         await page.get_by_label('Current password').fill('owner-first-passphrase-123')
         await page.get_by_label('New password (16+ characters)').fill('new-owner-passphrase-123')
+        await page.get_by_label('Confirm new password').fill('new-owner-passphrase-123')
         await page.get_by_role('button', name='Change password').click()
         await page.get_by_text('Password changed. Other sessions have been signed out.').wait_for(timeout=10000)
     finally:
@@ -86,3 +87,17 @@ def test_production_auth_fails_closed_without_credentials(monkeypatch, tmp_path)
         assert client.get('/api/chat/sessions').status_code == 503
         assert client.post('/api/auth/login', json={'password': 'anything'},
                            headers={'Origin':'http://testserver'}).status_code == 503
+
+
+def test_reset_hash_never_falls_back_to_old_password_on_storage_outage(monkeypatch, tmp_path):
+    monkeypatch.setenv('BLACKTHORN_AUTH_REQUIRED', '1')
+    monkeypatch.setenv('BLACKTHORN_AUTH_SIGNING_KEY', 'z' * 48)
+    monkeypatch.setenv('BLACKTHORN_AUTH_PASSWORD_HASH', hash_password('obsolete-bootstrap-password'))
+    with TestClient(create_app(Settings(store='sqlite', sqlite_path=str(tmp_path / 'outage.sqlite')), gpu_daemon=False)) as client:
+        store = client.app.state.bt.store
+        async def broken(_key):
+            raise OSError('D1 unavailable')
+        monkeypatch.setattr(store, 'get_setting', broken)
+        assert client.post('/api/auth/login', json={'password': 'obsolete-bootstrap-password'},
+                           headers={'Origin': 'http://testserver'}).status_code == 503
+        assert client.get('/api/chat/sessions').status_code == 401
