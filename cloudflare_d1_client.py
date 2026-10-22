@@ -1194,14 +1194,20 @@ def get_kaggle_gpu_status(force_refresh: bool = False) -> Dict[str, Any]:
             if quota:
                 state["quota"] = quota
 
-            try:
-                st_dict = _kaggle_rpc(
-                    "GetKernelSessionStatus",
-                    {"userName": KAGGLE_USERNAME, "kernelSlug": KAGGLE_KERNEL_SLUG},
-                )
-                state["worker_status"] = str(st_dict.get("status") or "OFF")
-            except Exception:
-                state["worker_status"] = "OFF"
+            from blackthorn.fleet import accounts_from_env
+            if accounts_from_env(os.environ):
+                # The legacy fixed slug is not the fleet's canonical notebook.
+                # Do not call that unrelated session OFF or RUNNING in the UI.
+                state["worker_status"] = "UNVERIFIED"
+            else:
+                try:
+                    st_dict = _kaggle_rpc(
+                        "GetKernelSessionStatus",
+                        {"userName": KAGGLE_USERNAME, "kernelSlug": KAGGLE_KERNEL_SLUG},
+                    )
+                    state["worker_status"] = str(st_dict.get("status") or "UNVERIFIED")
+                except Exception:
+                    state["worker_status"] = "UNVERIFIED"
         except Exception as k_err:
             logger.debug("Kaggle RPC status note: %s", k_err)
 
@@ -1216,36 +1222,9 @@ def get_kaggle_gpu_status(force_refresh: bool = False) -> Dict[str, Any]:
             logger.debug("auto-off snapshot note: %s", exc)
             state["auto_off"] = {"enabled": False, "minutes": AUTO_OFF_DEFAULT_MINUTES, "should_stop": False}
 
-        # 3. If not explicitly stopped, also check ntfy.sh telemetry ONLY for messages strictly newer than D1
-        d1_already_online = (
-            bool(state["tunnel_url"])
-            and state["status"] in ("ONLINE", "MODEL_READY_AND_WARMED", "TUNNEL_ONLINE", "HEARTBEAT_ONLINE")
-        )
-        if state["status"] != "GPU_STOPPED_SAVING_QUOTA" and not d1_already_online:
-            try:
-                req = urllib.request.urlopen(
-                    f"https://ntfy.sh/{TELEMETRY_TOPIC}/json?poll=1&since=10m", timeout=4
-                )
-                lines = req.read().decode("utf-8", errors="ignore").strip().splitlines()
-                for line in lines:
-                    if not line.strip():
-                        continue
-                    msg = json.loads(line)
-                    try:
-                        payload = json.loads(msg.get("message", ""))
-                        if isinstance(payload, dict) and payload.get("status"):
-                            msg_ts = float(payload.get("timestamp") or msg.get("time") or 0)
-                            d1_ts = float(d1_row.get("updated_at") or 0)
-                            if msg_ts > d1_ts + 1.0:
-                                state["status"] = payload["status"]
-                                if payload.get("tunnel_url"):
-                                    state["tunnel_url"] = payload["tunnel_url"].rstrip("/")
-                                if payload.get("gpu"):
-                                    state["gpu_info"] = str(payload["gpu"]).replace("\n", " + ")
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+        # 3. Public ntfy telemetry is unauthenticated and not session-bound. It
+        # must never replace the authenticated D1 stage or advertise progress for
+        # a kernel that Kaggle no longer runs.
 
         # 4. Verify live health of the tunnel if present and not stopped by the user
         tunnel_healthy = False

@@ -282,9 +282,12 @@ def test_recently_deleted_kaggle_slug_conflict_retries_with_new_slug_and_title()
             return {'versionNumber':2}
         raise AssertionError(method)
     fleet=FleetManager([account],fetcher=rpc)
-    out=fleet.start_kernel(account,slug='primary/blackthorn-model',
+    # Save without a ref and an empty owner listing cannot identify the kernel
+    # to create. Report the unconfirmed startup, never guess the old slug.
+    with pytest.raises(Exception, match="not found in the authenticated owner listing"):
+        fleet.start_kernel(account,slug='primary/blackthorn-model',
                            title='Blackthorn model (primary)',notebook_text='{}')
-    assert out['versionNumber']==2 and len(saves)==2
+    assert len(saves)==2
     assert saves[0]['slug']!=saves[1]['slug']
     assert saves[0]['newTitle']!=saves[1]['newTitle']
 
@@ -301,10 +304,10 @@ def test_missing_cache_attachment_never_repushes_an_already_started_kernel():
             return {'versionNumber':1, 'invalidDatasetSources':['primary/cache-not-published-yet']}
         raise AssertionError(method)
     fleet = FleetManager([account], fetcher=rpc)
-    result = fleet.start_kernel(account, slug='primary/blackthorn-model',
-                                title='Blackthorn model (primary)', notebook_text='{}',
-                                datasets=['primary/cache-not-published-yet'])
-    assert result['versionNumber'] == 1
+    with pytest.raises(Exception, match="not found in the authenticated owner listing"):
+        fleet.start_kernel(account, slug='primary/blackthorn-model',
+                           title='Blackthorn model (primary)', notebook_text='{}',
+                           datasets=['primary/cache-not-published-yet'])
     assert len(saves) == 1
 
 
@@ -375,13 +378,15 @@ def test_409_recovery_creates_session_for_saved_slug_and_never_assumes_version(m
     def rpc(method, body, token):
         seen.append((method, dict(body or {})))
         if method == 'ListKernels':
-            return {'kernels': []}
+            return ({'kernels': [{'title': [p['newTitle'] for m,p in seen if m == 'SaveKernel'][-1],
+                                  'ref': 'tester/blackthorn-computer-tester-canonical'}]}
+                    if sum(m == 'SaveKernel' for m,_ in seen) >= 2 else {'kernels': []})
         if method == 'GetKernelSessionStatus':
             return {'status': 'STOPPED'}
         if method == 'SaveKernel':
             if sum(name == 'SaveKernel' for name, _ in seen) == 1:
                 raise FleetError('HTTP 409 reserved title')
-            return {'versionNumber': 7, 'ref': 'tester/blackthorn-computer-tester-canonical'}
+            return {'versionNumber': 7, 'ref': 'unexpected-slug-only-ref'}
         if method == 'CreateKernelSession':
             return {'ok': True}  # accepted submission, not a running session
         raise AssertionError(method)

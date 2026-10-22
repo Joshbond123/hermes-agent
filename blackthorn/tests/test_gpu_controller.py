@@ -132,8 +132,11 @@ def test_a_gpu_that_was_online_and_lost_its_tunnel_is_marked_once_and_the_url_is
     # the next look at the (now error) row must not bring the dead URL back or write it into D1
     writes2, probed2 = _capture(monkeypatch, _row("TUNNEL_ERROR"), _dead)
     again = d1.get_kaggle_gpu_status(True)
-    assert again["status"] == "TUNNEL_ERROR" and not [u for u in probed2 if "t.example" in u]               # the dead URL is not probed
-    assert not [w for w in writes2 if "SET tunnel_url" in w[0]]                                              # nor written back to D1
+    # The authenticated Kaggle session is still RUNNING, so a recent tunnel
+    # error should enter recovery, not remain a permanent false OFF/error.
+    assert again["status"] == "STARTING_GATEWAY" and again["booting"] is True
+    assert not [u for u in probed2 if "t.example" in u]  # dead URL is not probed
+    assert not [w for w in writes2 if "SET tunnel_url" in w[0]]  # nor resurrected in D1
 
 
 def test_a_new_tunnel_published_by_the_notebook_is_trusted_and_remembered(monkeypatch):
@@ -142,3 +145,12 @@ def test_a_new_tunnel_published_by_the_notebook_is_trusted_and_remembered(monkey
     _capture(monkeypatch, _row("HEARTBEAT_ONLINE", "https://fresh.example"), ok)
     state = d1.get_kaggle_gpu_status(True)
     assert state["status"] == "HEARTBEAT_ONLINE" and state["active"] is True and state["model_loaded"] is True
+
+
+def test_public_telemetry_cannot_spoof_boot_stage(monkeypatch):
+    row = _row("BOOTING_KAGGLE_GPU", url="", age=15.0)
+    writes, probed = _capture(monkeypatch, row, lambda _: _Resp({"status": "ONLINE"}))
+    state = d1.get_kaggle_gpu_status(True)
+    assert state["status"] == "BOOTING_KAGGLE_GPU"
+    assert not any("ntfy.sh" in url for url in probed)
+    assert not [w for w in writes if "ONLINE" in str(w[1])]

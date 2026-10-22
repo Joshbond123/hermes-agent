@@ -368,11 +368,22 @@ class FleetManager:
         if invalid:
             log.warning("Kaggle ignored %s unavailable dataset attachment(s) for %s",
                         len(invalid), account.role)
-        # Kaggle's canonical ref can differ from the requested slug: its slug is
-        # derived from the notebook title. Always prefer the SaveKernel response.
-        full_slug = str(out.get("ref") or payload["slug"]).strip()
-        if not full_slug.startswith(f"{account.user}/"):
-            raise FleetError("Saved kernel ref does not belong to the authenticated account")
+        # Kaggle's canonical ref can differ from the requested slug: it derives
+        # the slug from the notebook title. SaveKernel may return a slug-only ref.
+        # Resolve the exact saved title through the authenticated owner listing.
+        ref = str(out.get("ref") or "").strip()
+        if not ref.startswith(f"{account.user}/"):
+            try:
+                listing = self.rpc(account, "ListKernels", {"pageSize": 100, "user": account.user})
+                candidates = [str(k.get("ref") or k.get("slug") or "")
+                              for k in (listing.get("kernels") or [])
+                              if str(k.get("title") or "") == payload["newTitle"]]
+                ref = next((item for item in candidates if item.startswith(f"{account.user}/")), "")
+            except FleetError:
+                ref = ""
+        if not ref:
+            raise FleetError("Saved notebook was not found in the authenticated owner listing; session was not started")
+        full_slug = ref
         name = full_slug.split("/", 1)[-1]
 
         def _session_running() -> bool:
