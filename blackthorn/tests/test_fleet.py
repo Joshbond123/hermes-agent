@@ -306,3 +306,61 @@ def test_missing_cache_attachment_never_repushes_an_already_started_kernel():
                                 datasets=['primary/cache-not-published-yet'])
     assert result['versionNumber'] == 1
     assert len(saves) == 1
+
+
+def test_delete_denied_but_kernel_disappears_from_listing(monkeypatch):
+    import urllib.error
+    monkeypatch.setattr('time.sleep', lambda seconds: None)
+    account = Account('backup', 'token', 'model', 'backup')
+    calls = {'delete': 0}
+    def rpc(method, body, token):
+        if method == 'GetKernelSessionStatus':
+            raise urllib.error.HTTPError('https://www.kaggle.com', 403, 'gone', {}, None)
+        if method == 'ListKernels':
+            return {'kernels': [] if calls['delete'] >= 3 else [{'ref': 'backup/blackthorn-model', 'title': 'Blackthorn model'}]}
+        if method == 'DeleteKernel':
+            calls['delete'] += 1
+            raise urllib.error.HTTPError('https://www.kaggle.com', 403, 'denied', {}, None)
+        raise AssertionError(method)
+    fleet = FleetManager([account], fetcher=rpc)
+    assert fleet.stop_kernel_result(account, 'backup/blackthorn-model')['state'] == 'not_running'
+
+
+def test_mirror_retries_transient_dataset_download_404(monkeypatch):
+    import zipfile
+    from pathlib import Path
+    from blackthorn.fleet import mirror_state_dataset
+    monkeypatch.setattr('time.sleep', lambda seconds: None)
+    count = {'download': 0}
+    def runner(cmd, env):
+        if cmd[2] == 'download':
+            count['download'] += 1
+            if count['download'] == 1:
+                return 1
+            folder = Path(cmd[cmd.index('-p') + 1])
+            with zipfile.ZipFile(folder / 'state.zip', 'w') as z:
+                z.writestr('uploads/file.txt', 'saved')
+        return 0
+    # An injectable runner has no stderr. For a deterministic transient failure,
+    # invoke the production retry condition through a CLI-shaped fake subprocess.
+    def fake_subprocess(cmd, **kwargs):
+        import types
+        rc = runner(cmd, kwargs['env'])
+        return types.SimpleNamespace(returncode=rc, stderr='404 Client Error: Not Found' if rc else '', stdout='')
+    monkeypatch.setattr('subprocess.run', fake_subprocess)
+    result = mirror_state_dataset(Account('primary', 'token1', 'computer', 'primary'),
+                                  Account('backup', 'token2', 'computer', 'backup'))
+    assert result['ok'] is True
+    assert count['download'] == 2
+
+
+def test_empty_protobuf_listing_proves_backup_absent():
+    import urllib.error
+    account = Account('backup', 'token', 'model', 'backup')
+    def rpc(method, body, token):
+        if method == 'GetKernelSessionStatus':
+            raise urllib.error.HTTPError('https://www.kaggle.com', 403, 'gone', {}, None)
+        if method == 'ListKernels':
+            return {}  # Kaggle omits empty repeated `kernels` in protobuf JSON.
+        raise AssertionError('no deletion when an authenticated listing is empty')
+    assert FleetManager([account], fetcher=rpc).stop_kernel_result(account, 'backup/blackthorn-model')['state'] == 'not_running'

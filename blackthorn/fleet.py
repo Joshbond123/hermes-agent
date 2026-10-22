@@ -217,7 +217,9 @@ class FleetManager:
         if not status_readable:
             try:
                 listing = self.rpc(account, "ListKernels", {"pageSize": 100, "user": account.user})
-                if not isinstance(listing, dict) or not any(k in listing for k in ("kernels", "results")):
+                # Kaggle protobuf JSON omits an empty repeated `kernels` field,
+                # so a successful ListKernels response may be plain {}.
+                if not isinstance(listing, dict):
                     raise FleetError("kernel listing unavailable")
                 kernels = listing.get("kernels") or listing.get("results") or []
                 if not any(str(k.get("ref") or k.get("slug") or "").split("/")[-1] == name or
@@ -237,7 +239,7 @@ class FleetManager:
             """
             try:
                 listing = self.rpc(account, "ListKernels", {"pageSize": 100, "user": account.user})
-                if not isinstance(listing, dict) or not any(k in listing for k in ("kernels", "results")):
+                if not isinstance(listing, dict):
                     return False
                 kernels = listing.get("kernels") or listing.get("results") or []
                 return not any(str(k.get("ref") or k.get("slug") or "").split("/")[-1] == name or
@@ -275,6 +277,11 @@ class FleetManager:
                 return {"state": "stopped", "error": ""}
         if accepted:
             return {"state": "unverified", "error": "Kaggle accepted the stop but the session still reads as running" if status_readable else "stop accepted; status unreadable"}
+        # A backup token may be denied kernels.delete when Kaggle has already
+        # removed the kernel. Recheck the listing *after* the retries rather than
+        # treating that 403 as evidence that a session is still billing.
+        if missing_after_delete():
+            return {"state": "not_running", "error": ""}
         return {"state": "failed", "error": last_error or "the session is still running after 3 stop attempts"}
 
     def start_kernel(self, account: Account, *, slug: str, title: str, notebook_text: str,
@@ -561,9 +568,18 @@ def mirror_state_dataset(from_account: Account, to_account: Account, *,
         env_down = {**base_env, "KAGGLE_USERNAME": from_account.user,
                     "KAGGLE_API_TOKEN": from_account.token}
         env_down.pop("KAGGLE_KEY", None)
-        rc = _run(["kaggle", "datasets", "download", "-p", str(download), src_slug], env_down)
-        if rc != 0:
-            return {"ok": False, "error": f"download rc={rc}: {last_cli_error}"}
+        # A freshly published Kaggle dataset version can briefly return 404 on
+        # the download endpoint even while datasets/view reports the new version.
+        # Retry only transient 404/429/5xx responses, never authentication errors.
+        import time as _t
+        for attempt in range(5):
+            rc = _run(["kaggle", "datasets", "download", "-p", str(download), src_slug], env_down)
+            if rc == 0:
+                break
+            transient = any(code in last_cli_error for code in ("404", "429", "500", "502", "503", "504"))
+            if not transient or attempt == 4:
+                return {"ok": False, "error": f"download rc={rc}: {last_cli_error}"}
+            _t.sleep((4, 8, 12, 20)[attempt])
         archives = list(download.glob("*.zip"))
         if len(archives) != 1:
             return {"ok": False, "error": "expected one downloaded state archive"}
