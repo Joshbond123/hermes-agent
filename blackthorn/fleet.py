@@ -324,6 +324,54 @@ class FleetManager:
             # The notebook's cache/restore fallback handles missing mounts.
             log.warning("Kaggle ignored %s unavailable dataset attachment(s) for %s",
                         len(invalid), account.role)
+        # Confirm a session actually started. Empty GetKernelSessionStatus means
+        # the push saved source but did not run — retry once with a clean slug.
+        name = str(slug).split("/", 1)[-1]
+        running = False
+        for _ in range(8):
+            import time as _t
+            _t.sleep(3)
+            try:
+                sess = self.rpc(account, "GetKernelSessionStatus",
+                                {"userName": account.user, "kernelSlug": name})
+                st = str((sess or {}).get("status") or "").upper()
+                if st in ("RUNNING", "QUEUED", "PENDING"):
+                    running = True
+                    break
+            except FleetError:
+                continue
+        if not running:
+            log.warning("SaveKernel did not leave a running session for %s — retrying push once", slug)
+            try:
+                self.stop_kernel_session(account, slug)
+            except Exception:
+                pass
+            import secrets
+            suffix = secrets.token_hex(3)
+            payload["newTitle"] = f"Blackthorn {account.role} ({account.user}) {suffix}"[:100]
+            payload["slug"] = f"{account.user}/blackthorn-{account.role}-{account.user}"
+            # Drop dataset attachments on retry — invalid mounts can abort the run.
+            payload.pop("datasetDataSources", None)
+            out = self.rpc(account, "SaveKernel", payload)
+            name = str(payload["slug"]).split("/", 1)[-1]
+            for _ in range(8):
+                import time as _t
+                _t.sleep(3)
+                try:
+                    sess = self.rpc(account, "GetKernelSessionStatus",
+                                    {"userName": account.user, "kernelSlug": name})
+                    st = str((sess or {}).get("status") or "").upper()
+                    if st in ("RUNNING", "QUEUED", "PENDING"):
+                        running = True
+                        break
+                except FleetError:
+                    continue
+            if not running:
+                raise FleetError(
+                    f"Kaggle SaveKernel returned but no session is RUNNING for {account.user}/{name}. "
+                    f"version={out.get('versionNumber')!r} error={out.get('error') or out.get('status')!r}"
+                )
+        out["_session_running"] = running
         return out
 
     def kernel_status(self, account: Account, slug: str) -> Optional[Dict[str, Any]]:
