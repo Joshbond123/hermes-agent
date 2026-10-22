@@ -243,6 +243,54 @@ def test_mounted_computer_state_restores_without_download_or_overwrite(srv, monk
     assert not (live / 'private.key').exists() and not (live / 'link.txt').exists()
 
 
+def test_restore_uses_intact_older_dataset_version_when_latest_is_inventory_only(srv, monkeypatch, tmp_path):
+    import io
+    root = tmp_path / 'input'
+    mount = root / 'datasets' / 'alagbo' / 'blackthorn-computer-state'
+    mount.mkdir(parents=True)
+    (mount / 'environment.json').write_text('{}')
+    live = tmp_path / 'workspace'
+    monkeypatch.setattr(srv, 'INPUT_ROOT', str(root))
+    monkeypatch.setattr(srv, 'COMPUTER_WORKSPACE', str(live))
+    monkeypatch.setattr(srv, 'STATE_DIR', str(tmp_path / 'state'))
+    monkeypatch.setattr(srv, 'STATE_DATASET', 'alagbo/blackthorn-computer-state')
+    monkeypatch.setattr(srv, '_kaggle_cli_env', lambda: {'KAGGLE_API_TOKEN': 'test-token'})
+    zbytes = io.BytesIO()
+    with zipfile.ZipFile(zbytes, 'w') as z:
+        z.writestr('live_verification/marker.txt', 'older intact data')
+        z.writestr('.blackthorn/environment.json', '{}')
+    class Response(io.BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *args): self.close()
+    def urlopen(request, **kwargs):
+        url = request.full_url
+        if 'GetDataset' in url:
+            return Response(json.dumps({'currentVersionNumber': 337}).encode())
+        if 'ListDatasetFiles' in url:
+            version = json.loads(request.data)['datasetVersionNumber']
+            files = [{'name':'environment.json'}] if version == 337 else [
+                {'name':'live_verification/marker.txt'}, {'name':'.blackthorn/environment.json'}]
+            return Response(json.dumps({'datasetFiles': files}).encode())
+        if 'datasetVersionNumber=336' in url:
+            return Response(zbytes.getvalue())
+        raise AssertionError('unexpected network request: ' + url)
+    monkeypatch.setattr(srv.urllib.request, 'urlopen', urlopen)
+    monkeypatch.setattr(srv.subprocess, 'run', lambda *a, **k: (_ for _ in ()).throw(AssertionError('CLI should not run')))
+    assert srv.restore_workspace() is True
+    assert (live / 'live_verification' / 'marker.txt').read_text() == 'older intact data'
+
+
+def test_inventory_only_checkpoint_fails_closed(srv, monkeypatch, tmp_path):
+    live = tmp_path / 'workspace'
+    live.mkdir()
+    (live / 'environment.json').write_text('{}')
+    monkeypatch.setattr(srv, 'COMPUTER_WORKSPACE', str(live))
+    monkeypatch.setattr(srv, 'STATE_DIR', str(tmp_path / 'state'))
+    monkeypatch.setattr(srv, 'STATE_DATASET', 'alagbo/blackthorn-computer-state')
+    assert srv.checkpoint_workspace()['ok'] is False
+    assert 'inventory-only' in srv.checkpoint_workspace()['error']
+
+
 def test_late_notebook_heartbeat_cannot_resurrect_verified_off(srv, monkeypatch):
     calls = []
     def fake_urlopen(req, **kwargs):

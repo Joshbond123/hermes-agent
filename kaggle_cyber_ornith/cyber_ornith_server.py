@@ -1934,7 +1934,7 @@ def _restore_mounted_workspace() -> tuple[int, int]:
     for root in candidates:
         if not os.path.isdir(root):
             continue
-        copied = seen = 0
+        copied = seen = useful = 0
         for directory, dirs, files in os.walk(root, followlinks=False):
             dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(directory, d))
                        and d not in CHECKPOINT_EXCLUDE_DIRS]
@@ -1947,15 +1947,73 @@ def _restore_mounted_workspace() -> tuple[int, int]:
                         or os.path.getsize(src) > CHECKPOINT_MAX_FILE_BYTES):
                     continue
                 seen += 1
+                if name != "environment.json":
+                    useful += 1
                 dst = os.path.join(COMPUTER_WORKSPACE, relative, name)
                 if os.path.exists(dst):
                     continue
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 shutil.copy2(src, dst)
                 copied += 1
-        if seen:
+        # A prior bad checkpoint can publish only environment.json. That is
+        # NOT a restored user workspace: search older immutable versions.
+        if seen and useful:
             return copied, seen
     return 0, 0
+
+
+def _historical_workspace_archive(destination: str) -> int:
+    """Download the newest intact immutable dataset version; no destructive reset.
+
+    The attached latest dataset has previously contained ONLY environment.json
+    despite checkpoint() reporting 11 files. Kaggle's api.kaggle.com download
+    returned 404, but the authenticated www.kaggle.com versioned ZIP worked.
+    """
+    parts = STATE_DATASET.split("/")
+    if len(parts) != 2 or not all(re.fullmatch(r"[A-Za-z0-9_-]+", p) for p in parts):
+        return 0
+    owner, slug = parts
+    token = _kaggle_cli_env().get("KAGGLE_API_TOKEN", "")
+    if not token:
+        return 0
+    headers = {"Authorization": "Bearer " + token, "Content-Type": "application/json",
+               "User-Agent": "kaggle-api/v1.7.0"}
+    def rpc(method, body):
+        req = urllib.request.Request(
+            "https://api.kaggle.com/v1/datasets.DatasetApiService/" + method,
+            data=json.dumps(body).encode(), headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=25) as response:
+            return json.load(response)
+    try:
+        info = rpc("GetDataset", {"ownerSlug": owner, "datasetSlug": slug})
+        latest = int(info.get("currentVersionNumber") or 0)
+        for version in range(latest, max(0, latest - 40), -1):
+            files = rpc("ListDatasetFiles", {"ownerSlug": owner, "datasetSlug": slug,
+                                             "datasetVersionNumber": version, "pageSize": 200}).get("datasetFiles") or []
+            useful = [f for f in files if str(f.get("name") or "").split("/")[-1]
+                      not in ("environment.json", "dataset-metadata.json", "manifest.json")]
+            if not useful:
+                continue
+            url = (f"https://www.kaggle.com/api/v1/datasets/download/{owner}/{slug}"
+                   f"?datasetVersionNumber={version}")
+            req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token,
+                                                      "User-Agent": "kaggle-api/v1.7.0"})
+            with urllib.request.urlopen(req, timeout=60) as response, open(destination, "wb") as out:
+                total = 0
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max(1024 * 1024 * 1024, CHECKPOINT_MAX_FILE_BYTES * 2):
+                        raise ValueError("historical snapshot archive exceeds safe size")
+                    out.write(chunk)
+            if zipfile.is_zipfile(destination):
+                log(f"Persistence: selected intact historical generation {version} ({len(files)} files)")
+                return version
+    except (OSError, ValueError, KeyError, TypeError, urllib.error.URLError) as exc:
+        log(f"Persistence: historical lookup unavailable ({type(exc).__name__})")
+    return 0
 
 
 def restore_workspace() -> bool:
@@ -1993,10 +2051,12 @@ def restore_workspace() -> bool:
             stdout = ""
         return _R()
 
-    proc = _kaggle(["datasets", "download", "-p", archive_dir, STATE_DATASET])
-    if proc.returncode != 0:
-        log(f"Persistence: no snapshot to restore ({(proc.stderr or proc.stdout or '')[-160:]})")
-        return False
+    historical = _historical_workspace_archive(os.path.join(archive_dir, "historical.zip"))
+    if not historical:
+        proc = _kaggle(["datasets", "download", "-p", archive_dir, STATE_DATASET])
+        if proc.returncode != 0:
+            log(f"Persistence: no snapshot to restore ({(proc.stderr or proc.stdout or '')[-160:]})")
+            return False
     try:
         extracted = os.path.join(archive_dir, "unzipped")
         os.makedirs(extracted, exist_ok=True)
@@ -2143,6 +2203,12 @@ def checkpoint_workspace(label: str = "") -> dict:
     if os.path.isdir(snap):
         shutil.rmtree(snap, ignore_errors=True)
     shutil.copytree(COMPUTER_WORKSPACE, snap, ignore=_checkpoint_ignore, dirs_exist_ok=True)
+    user_files = [os.path.join(root, name) for root, _dirs, names in os.walk(snap)
+                  for name in names if name != "environment.json"
+                  and os.path.relpath(root, snap).split(os.sep)[0] not in (".blackthorn", "skills")]
+    if not user_files:
+        log("Persistence: refusing inventory-only checkpoint; preserving older dataset versions")
+        return {"ok": False, "error": "inventory-only workspace; refusing to replace the durable snapshot"}
     os.makedirs(os.path.join(snap, ".blackthorn"), exist_ok=True)
     with open(os.path.join(snap, ".blackthorn", "environment.json"), "w") as fh:
         json.dump(_environment_inventory(), fh)
