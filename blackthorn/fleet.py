@@ -318,43 +318,22 @@ class FleetManager:
             out = self.rpc(account, "SaveKernel", payload)
         invalid = [x for x in (out.get("invalidDatasetSources") or []) if x]
         if invalid:
-            # SaveKernel has ALREADY created and started a kernel. A second save
-            # to "remove" invalid attachments collides with its reserved title
-            # (HTTP 409), falsely reports BOOT_FAILED and may restart live work.
-            # The notebook's cache/restore fallback handles missing mounts.
             log.warning("Kaggle ignored %s unavailable dataset attachment(s) for %s",
                         len(invalid), account.role)
-        # Confirm a session actually started. Empty GetKernelSessionStatus means
-        # the push saved source but did not run — retry once with a clean slug.
-        name = str(slug).split("/", 1)[-1]
+        if out.get("error"):
+            err = str(out.get("error"))
+            # Session slots full: try starting the existing kernel via CreateKernelSession.
+            if "Maximum batch GPU session count" in err or "session count" in err.lower():
+                log.warning("GPU session limit for %s — trying CreateKernelSession on existing slug", slug)
+            else:
+                raise FleetError(f"SaveKernel rejected: {err[:240]}")
+        # Ensure a session is RUNNING. SaveKernel usually auto-runs; when it does not
+        # (or hits the concurrent session limit), CreateKernelSession starts it.
+        full_slug = slug if "/" in str(slug) else f"{account.user}/{slug}"
+        name = full_slug.split("/", 1)[-1]
         running = False
-        for _ in range(8):
-            import time as _t
-            _t.sleep(3)
-            try:
-                sess = self.rpc(account, "GetKernelSessionStatus",
-                                {"userName": account.user, "kernelSlug": name})
-                st = str((sess or {}).get("status") or "").upper()
-                if st in ("RUNNING", "QUEUED", "PENDING"):
-                    running = True
-                    break
-            except FleetError:
-                continue
-        if not running:
-            log.warning("SaveKernel did not leave a running session for %s — retrying push once", slug)
-            try:
-                self.stop_kernel_session(account, slug)
-            except Exception:
-                pass
-            import secrets
-            suffix = secrets.token_hex(3)
-            payload["newTitle"] = f"Blackthorn {account.role} ({account.user}) {suffix}"[:100]
-            payload["slug"] = f"{account.user}/blackthorn-{account.role}-{account.user}"
-            # Drop dataset attachments on retry — invalid mounts can abort the run.
-            payload.pop("datasetDataSources", None)
-            out = self.rpc(account, "SaveKernel", payload)
-            name = str(payload["slug"]).split("/", 1)[-1]
-            for _ in range(8):
+        for attempt in range(2):
+            for _ in range(6):
                 import time as _t
                 _t.sleep(3)
                 try:
@@ -366,12 +345,37 @@ class FleetManager:
                         break
                 except FleetError:
                     continue
-            if not running:
-                raise FleetError(
-                    f"Kaggle SaveKernel returned but no session is RUNNING for {account.user}/{name}. "
-                    f"version={out.get('versionNumber')!r} error={out.get('error') or out.get('status')!r}"
-                )
-        out["_session_running"] = running
+            if running:
+                break
+            try:
+                log.info("Starting kernel session via CreateKernelSession for %s", full_slug)
+                self.rpc(account, "CreateKernelSession", {"slug": full_slug})
+            except FleetError as exc:
+                log.warning("CreateKernelSession for %s: %s", full_slug, exc)
+                if attempt == 0:
+                    # Drop invalid dataset mounts and re-save once, then start session.
+                    payload.pop("datasetDataSources", None)
+                    try:
+                        out = self.rpc(account, "SaveKernel", payload)
+                    except FleetError:
+                        pass
+        if not running:
+            # Final status probe
+            try:
+                sess = self.rpc(account, "GetKernelSessionStatus",
+                                {"userName": account.user, "kernelSlug": name})
+                st = str((sess or {}).get("status") or "").upper()
+                running = st in ("RUNNING", "QUEUED", "PENDING")
+            except FleetError:
+                pass
+        if not running:
+            raise FleetError(
+                f"No RUNNING Kaggle session for {full_slug} after SaveKernel/CreateKernelSession. "
+                f"version={out.get('versionNumber')!r} error={out.get('error')!r}. "
+                f"If Kaggle reports max GPU sessions, stop leftover sessions on kaggle.com."
+            )
+        out["_session_running"] = True
+        out["_slug"] = full_slug
         return out
 
     def kernel_status(self, account: Account, slug: str) -> Optional[Dict[str, Any]]:
