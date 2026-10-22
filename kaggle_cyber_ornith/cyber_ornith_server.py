@@ -1060,7 +1060,16 @@ def ensure_llama_server_bin() -> str:
         "-DGGML_CUDA=ON",
         "-DCMAKE_BUILD_TYPE=Release",
         "-DLLAMA_CURL=OFF",
+        "-DCMAKE_CUDA_ARCHITECTURES=75",  # two Tesla T4s (sm_75)
     ]
+    # Kaggle ships nvcc but puts libcuda.so outside the toolkit search path.
+    # Without this CMake cannot create CUDA::cuda_driver (reproduced on T4).
+    for driver in ("/usr/local/nvidia/lib64/libcuda.so",
+                   "/usr/lib/x86_64-linux-gnu/libcuda.so",
+                   "/usr/local/cuda/lib64/stubs/libcuda.so"):
+        if os.path.isfile(driver):
+            cmake_cmd.append("-DCUDA_cuda_driver_LIBRARY=" + driver)
+            break
     subprocess.run(cmake_cmd, cwd=build_dir, check=True, timeout=300)
     subprocess.run(
         ["cmake", "--build", "build", "--config", "Release", "-j", "4"],
@@ -1222,15 +1231,7 @@ def register_model(ollama_bin: str, gguf_path: str) -> None:
                 start_llama_server(gguf_path)
                 return
             log("Low working-disk space; attempting Ollama import of the cached GGUF")
-        # purge any partial blobs
-        blobs = os.path.join(PERSIST_MODELS_DIR, "blobs")
-        if os.path.isdir(blobs):
-            for name in os.listdir(blobs):
-                try:
-                    os.remove(os.path.join(blobs, name))
-                except Exception:
-                    pass
-            log("Purged partial ollama blobs to reclaim space")
+        # Do not delete blobs heuristically: preserve existing cached models.
     except Exception as e:
         log(f"disk check note: {e}")
     modelfile = "/tmp/Modelfile"

@@ -161,3 +161,28 @@ def test_thinking_disabled_maps_blackthorn_flags(srv):
     assert f({"think": False}) is True
     assert f({"messages": []}) is False
     assert f({"chat_template_kwargs": {"enable_thinking": True}}) is False
+
+
+def test_llama_cmake_on_t4_uses_driver_library_and_sm75(srv, monkeypatch):
+    """Reproduces Kaggle's CUDA::cuda_driver configure failure without a driver hint."""
+    import subprocess
+    commands = []
+    monkeypatch.setattr(srv.os.path, "isdir", lambda path: True)
+    driver = "/usr/local/nvidia/lib64/libcuda.so"
+    monkeypatch.setattr(srv.os.path, "isfile", lambda path: path == driver)
+    monkeypatch.setattr(srv.subprocess, "run",
+                        lambda cmd, **kw: commands.append(cmd) or subprocess.CompletedProcess(cmd, 0))
+    with pytest.raises(RuntimeError, match="binary not found"):
+        srv.ensure_llama_server_bin()
+    cmake = next(cmd for cmd in commands if isinstance(cmd, list) and cmd[:2] == ["cmake", "-B"])
+    assert "-DGGML_CUDA=ON" in cmake
+    assert "-DCMAKE_CUDA_ARCHITECTURES=75" in cmake
+    assert "-DCUDA_cuda_driver_LIBRARY=" + driver in cmake
+
+
+def test_model_registration_does_not_delete_cached_blobs():
+    import ast
+    tree = ast.parse(SRC.read_text())
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == 'register_model')
+    assert not any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                   and n.func.attr in ('remove', 'unlink', 'rmtree') for n in ast.walk(fn))
