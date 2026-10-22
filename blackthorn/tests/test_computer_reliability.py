@@ -328,3 +328,9 @@ async def test_turn_on_waits_for_kernel_push_before_user_can_turn_off(monkeypatc
     out = await gpu.turn_on()
     assert calls == [True]
     assert out['fleet']['model']['status'] == 'starting'
+
+
+def test_main_cache_publish_checks_model_size_without_undefined_variable():
+    import inspect
+    src = inspect.getsource(srv.main)
+    assert '_healthy_file(gguf, MODEL_BYTES.get(MODEL_QUANT, 0))' in src

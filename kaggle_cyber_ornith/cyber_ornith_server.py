@@ -2385,7 +2385,7 @@ def main() -> None:
         source = ("dataset-copy" if how == "kaggle-dataset" else
                   "ollama-pull" if how == "ollama-pull" else "hf-download")
         boot_state["download_skipped"] = how == "kaggle-dataset"
-        if gguf != "ollama-registry" and _healthy_file(gguf, expected):
+        if gguf != "ollama-registry" and _healthy_file(gguf, MODEL_BYTES.get(MODEL_QUANT, 0)):
             _start_cache_publish(gguf, gpu_out)
         else:
             log("⚠️ No verified GGUF file is available to publish as a model cache")
