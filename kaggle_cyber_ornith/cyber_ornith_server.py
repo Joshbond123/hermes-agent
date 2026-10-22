@@ -440,18 +440,11 @@ def find_dataset_gguf() -> str:
     log(f"🔎 Scanning {INPUT_ROOT}: {len(candidates)} .gguf candidate(s)")
     for path in candidates[:20]:
         log(f"   • {path} ({os.path.getsize(path) if os.path.exists(path) else '?'} bytes)")
-    # exact-size match first, then any file that at least looks like the model
+    # Never accept a truncated/wrong GGUF as a cache hit. A previous 1% size
+    # tolerance could skip the download then fail during model loading.
     for path in candidates:
         if _healthy_file(path, expected):
             log(f"✅ Persistent model found in dataset mount: {path}")
-            return path
-    for path in candidates:
-        try:
-            size = os.path.getsize(path)
-        except OSError:
-            continue
-        if expected and abs(size - expected) <= max(1024 * 1024, expected * 0.01):
-            log(f"✅ Persistent model found (size within 1%): {path}")
             return path
     return ""
 
@@ -1146,9 +1139,10 @@ def start_llama_server(gguf_path: str) -> None:
 
     The agent's computer runs on its own dedicated hosts (josh787 / alagbo), so this
     machine hosts the model only: all 2x T4 work for it. The 27B Q4 weights (~15.7 GiB)
-    fit fully in the combined VRAM with room for the KV cache, which gives the fastest
-    prefill and first token. If a smaller or split-only arrangement must be used, the
-    -ngl ladder still degrades gracefully (99 -> 56 -> 40 layers on GPU, rest in RAM).
+    fit in the combined VRAM with room for the KV cache only at the measured
+    working offload. The previously attempted 99-layer start repeatedly spent up
+    to 240 seconds before 56-layer serving succeeded. Start with the validated
+    configuration; full offload is an explicit experiment, not the default.
     """
     binary = ensure_llama_server_bin()
     # Context window: prefer env, default 8192 to match the agent's context budget.
@@ -1197,10 +1191,12 @@ def start_llama_server(gguf_path: str) -> None:
                 time.sleep(2)
         return False
 
-    # The 27B Q4 weights (~15.7 GiB) can exceed one T4 once the KV cache is reserved.
-    # Ask for full offload first; if the engine cannot start, retry with fewer GPU layers.
-    # Use both T4s explicitly; layer split prevents a 16.8 GB GGUF overflowing one card.
-    for ngl in ("99", "56", "40"):
+    # 56-layer offload served real inference on both T4s; 99 previously timed
+    # out before the same 56-layer attempt succeeded. Do not add that known
+    # 240-second failed probe to every cold start. Operators may explicitly
+    # opt in to the full-offload experiment without changing the safe default.
+    layers = ("99", "56", "40") if os.environ.get("LLAMA_TRY_FULL_OFFLOAD") == "1" else ("56", "40")
+    for ngl in layers:
         proc = _launch(ngl)
         if _wait(proc, 240):
             log("llama-server healthy (ngl=" + ngl + ")")
@@ -1268,11 +1264,15 @@ def register_model(ollama_bin: str, gguf_path: str) -> None:
         except (OSError, RuntimeError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             log(f"CUDA llama-server unavailable ({type(exc).__name__}); using Ollama")
 
+    # This fallback is cold on the successful llama.cpp path. Install/start it
+    # only when the selected model genuinely needs Ollama, not on every boot.
     if ollama_model_present():
         log("✅ Model already registered in the ollama store — skipping create")
         with open("/tmp/engine_mode.txt", "w") as fh:
             fh.write("ollama")
         return
+    if not ollama_bin:
+        ollama_bin = ensure_ollama_serving()
     # Free space check — ollama create can need ~2x the GGUF size briefly
     try:
         usage = shutil.disk_usage(WORK_ROOT)
@@ -2500,13 +2500,15 @@ def main() -> None:
         fail("INTERNET_UNAVAILABLE", f"Kaggle internet is off ({exc}). Enable Internet in session options.")
         return
 
-    # ---- installs run in the background while the model is fetched ----
-    # These three steps are independent of the model transfer, so overlapping them
-    # removes ~40-70 s from every cold start. The result arrives via futures.
+    # Install only the engine that the boot intends to use. The preferred
+    # llama.cpp path served real inference, while unconditional Ollama setup
+    # unnecessarily competed for disk/network resources on every cache hit.
+    # On a llama.cpp failure, register_model installs Ollama as a fallback.
     install_pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
     deps_future = install_pool.submit(ensure_python_deps)
     cloudflared_future = install_pool.submit(ensure_cloudflared)
-    ollama_future = install_pool.submit(ensure_ollama_serving)
+    ollama_future = (install_pool.submit(ensure_ollama_serving)
+                     if os.environ.get("PREFER_LLAMA", "1") != "1" else None)
     notify_workspace("INSTALLING_DEPS", extra={"gpu": gpu_out, "note": "in parallel with the model transfer"})
 
     # ---- 1/2: find an existing persistent copy (no download) ----
@@ -2596,7 +2598,7 @@ def main() -> None:
     try:
         deps_future.result(timeout=420)
         cloudflared_bin = cloudflared_future.result(timeout=420)
-        ollama_bin = ollama_future.result(timeout=420)
+        ollama_bin = ollama_future.result(timeout=420) if ollama_future else ""
     except Exception as exc:
         fail("BOOT_FAILED", f"dependency install failed: {exc}")
         return
@@ -2604,17 +2606,18 @@ def main() -> None:
         install_pool.shutdown(wait=False)
     log("✅ Parallel install stage complete")
 
-    # ---- engine should already be serving (it was started during the download) ----
-    notify_workspace("STARTING_OLLAMA", extra={"gpu": gpu_out})
-    start_ollama_daemon(ollama_bin)   # no-op when already up
+    # ---- only the opted-in Ollama engine should already be serving ----
+    if ollama_bin:
+        notify_workspace("STARTING_OLLAMA", extra={"gpu": gpu_out})
+        start_ollama_daemon(ollama_bin)   # no-op when already up
 
     # ---- register + load the model on the GPU ----
     notify_workspace("LOADING_MODEL", extra={"gpu": gpu_out})
     if source == "ollama-pull" or gguf == "ollama-registry":
         log("Model already in ollama store via pull — skip create")
         if not ollama_model_present():
-            # ensure pull once more
-            ollama_pull_model(ollama_bin)
+            # The preferred llama.cpp path did not pre-install Ollama.
+            ollama_pull_model(ollama_bin or ensure_ollama_serving())
     else:
         register_model(ollama_bin, gguf)
 

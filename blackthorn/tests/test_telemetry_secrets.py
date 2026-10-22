@@ -31,4 +31,8 @@ def test_api_key_is_stripped_before_publishing():
 
 def test_d1_write_still_stores_the_key():
     src = ast.get_source_segment(SERVER.read_text(encoding="utf-8"), _notify_workspace())
-    assert "INSERT OR REPLACE INTO kaggle_gpu_state" in src and "API_KEY" in src
+    # Guarded UPSERT preserves the key in D1, but refuses late heartbeats
+    # after an explicit OFF (the old unguarded REPLACE must not return).
+    assert "INSERT INTO kaggle_gpu_state" in src and "API_KEY" in src
+    assert "ON CONFLICT(id) DO UPDATE" in src
+    assert "GPU_STOPPED_SAVING_QUOTA" in src

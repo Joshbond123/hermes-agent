@@ -162,8 +162,43 @@ async def browse(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
                             "screenshot": result.get("screenshot"), "elapsed_s": result.get("elapsed_s")})
 
 
+SAMPLE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
+
+
+async def sample_triage(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
+    """Inspect an uploaded sample without running it; no VM is claimed."""
+    sample_id = str(args.get("sample_id") or "")
+    if not SAMPLE_ID.fullmatch(sample_id) or sample_id in (".", ".."):
+        return _fail("sample_id must be one file name in malware_samples/ (no path separators)")
+    await _upload(ctx, "sample_triage.py")
+    cmd = f"python3 {REMOTE_BIN}/sample_triage.py --analyze {shlex.quote(sample_id)}"
+    data = await ctx.computer.call("/computer/exec", {"command": cmd, "timeout_seconds": 45, "cwd": "."},
+                                   timeout=65.0, idempotent=True)
+    try:
+        result = json.loads(str(data.get("output") or "").strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return _fail("static triage returned no result", {"kind": "triage"})
+    if not result.get("ok"):
+        return _fail(str(result.get("error") or "static triage failed"), {"kind": "triage"})
+    content = (f"Read-only static sample metadata: {sample_id}\n"
+               f"Format: {result['format']} ({result['architecture']})\n"
+               f"Size: {result['bytes']} bytes; SHA-256: {result['sha256']}\n"
+               f"First-64-KiB entropy: {result['entropy_first_64k']}; URL-like count: {result['url_like_count']}\n"
+               "No sample was executed. Dynamic Linux/Windows malware analysis requires a separate "
+               "verified VM isolation host; this production computer is not one.")
+    return ToolResult(ok=True, content=content, summary=f"static triage of {sample_id}",
+                      data={"sha256": result["sha256"], "format": result["format"], "dynamic_execution_allowed": False})
+
+
 def specs() -> List[ToolSpec]:
     return [
+        ToolSpec("sample_triage",
+                 "Read-only static analysis of an uploaded PE, ELF or script in malware_samples/ on the computer. "
+                 "Returns bounded metadata and SHA-256. Never executes samples; there is no VM on the production computer.",
+                 {"type": "object", "properties": {
+                     "sample_id": {"type": "string", "minLength": 1, "maxLength": 80}},
+                  "required": ["sample_id"]},
+                 sample_triage, timeout=75.0, describe=lambda a: str(a.get("sample_id") or "")),
         ToolSpec("skill_search",
                  "Find cybersecurity skills (step-by-step playbooks) by keyword. Returns names and one-line descriptions only. "
                  "Use it before a security task, then skill_load the best match.",

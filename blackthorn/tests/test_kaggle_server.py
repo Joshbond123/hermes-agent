@@ -127,6 +127,21 @@ def test_dataset_download_reports_download_then_unpack(srv, monkeypatch):
     assert detail_of(srv.posts[-1])["bytes_done"] == 2000
 
 
+def test_cache_mount_is_reused_only_for_exact_complete_model(srv, monkeypatch, tmp_path):
+    root = tmp_path / 'input' / 'datasets' / 'owner' / 'model-cache'
+    root.mkdir(parents=True)
+    path = root / srv.GGUF_BASENAME.format(quant=srv.MODEL_QUANT)
+    expected = 2 * 1024 * 1024
+    monkeypatch.setattr(srv, 'INPUT_ROOT', str(tmp_path / 'input'))
+    monkeypatch.setattr(srv, 'MODEL_BYTES', {srv.MODEL_QUANT: expected})
+    with path.open('wb') as fh:
+        fh.truncate(expected)
+    assert srv.find_dataset_gguf() == str(path)
+    with path.open('r+b') as fh:
+        fh.truncate(expected - 3000)
+    assert srv.find_dataset_gguf() == ''
+
+
 def test_ollama_pull_reports_the_growing_model_store(srv, monkeypatch):
     monkeypatch.setattr(srv, "PERSIST_MODELS_DIR", str(srv.tmp / "ollama_models"))
     monkeypatch.setattr(srv, "MODEL_BYTES", {srv.MODEL_QUANT: 5000})
@@ -197,6 +212,43 @@ def test_default_model_registration_prefers_direct_cuda_serving(srv, monkeypatch
     monkeypatch.setattr(srv, "ollama_model_present", lambda: False)
     srv.register_model("ollama", str(model))
     assert srv.posts == [("llama", str(model))]
+
+
+def test_cached_model_starts_with_measured_working_offload_not_slow_full_probe(srv, monkeypatch, tmp_path):
+    model = tmp_path / 'cached.gguf'
+    model.write_bytes(b'fixture')
+    monkeypatch.setattr(srv, 'ensure_llama_server_bin', lambda: '/verified/llama-server')
+    monkeypatch.setenv('LLAMA_TRY_FULL_OFFLOAD', '0')
+    seen = []
+    class Proc:
+        def poll(self): return None
+    def launch(cmd, **kw):
+        seen.append(cmd[cmd.index('-ngl') + 1])
+        return Proc()
+    monkeypatch.setattr(srv.subprocess, 'Popen', launch)
+    monkeypatch.setattr(srv.urllib.request, 'urlopen', lambda *a, **kw: object())
+    srv.start_llama_server(str(model))
+    assert seen == ['56']
+
+
+def test_full_offload_requires_explicit_opt_in_and_falls_back(srv, monkeypatch, tmp_path):
+    monkeypatch.setattr(srv, 'ensure_llama_server_bin', lambda: '/verified/llama-server')
+    monkeypatch.setenv('LLAMA_TRY_FULL_OFFLOAD', '1')
+    seen = []
+    class Proc:
+        def __init__(self, mode): self.mode = mode
+        def poll(self): return 1 if self.mode == '99' else None
+        def terminate(self): pass
+        def wait(self, timeout=None): return 1
+    def launch(cmd, **kw):
+        mode = cmd[cmd.index('-ngl') + 1]
+        seen.append(mode)
+        return Proc(mode)
+    monkeypatch.setattr(srv.subprocess, 'Popen', launch)
+    monkeypatch.setattr(srv.urllib.request, 'urlopen', lambda *a, **kw: (_ for _ in ()).throw(OSError('not ready')) if seen[-1] == '99' else object())
+    monkeypatch.setattr(srv.time, 'sleep', lambda *a: None)
+    srv.start_llama_server(str(tmp_path / 'fixture.gguf'))
+    assert seen == ['99', '56']
 
 
 def test_gateway_routes_official_llama_engine_to_separate_port(srv, monkeypatch):
