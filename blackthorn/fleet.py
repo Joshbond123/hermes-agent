@@ -362,12 +362,17 @@ class FleetManager:
             payload["newTitle"] = f"Blackthorn {account.role} ({account.user}) {suffix}"[:100]
             payload["slug"] = f"{account.user}/blackthorn-{account.role}-{suffix}"
             out = self.rpc(account, "SaveKernel", payload)
+        if out.get("error"):
+            raise FleetError(f"Kaggle rejected the saved notebook: {str(out['error'])[:160]}")
         invalid = [x for x in (out.get("invalidDatasetSources") or []) if x]
         if invalid:
             log.warning("Kaggle ignored %s unavailable dataset attachment(s) for %s",
                         len(invalid), account.role)
-        # SaveKernel may choose a new ref after a 409; CREATE/CHECK that ref.
-        full_slug = payload["slug"]
+        # Kaggle's canonical ref can differ from the requested slug: its slug is
+        # derived from the notebook title. Always prefer the SaveKernel response.
+        full_slug = str(out.get("ref") or payload["slug"]).strip()
+        if not full_slug.startswith(f"{account.user}/"):
+            raise FleetError("Saved kernel ref does not belong to the authenticated account")
         name = full_slug.split("/", 1)[-1]
 
         def _session_running() -> bool:

@@ -381,7 +381,7 @@ def test_409_recovery_creates_session_for_saved_slug_and_never_assumes_version(m
         if method == 'SaveKernel':
             if sum(name == 'SaveKernel' for name, _ in seen) == 1:
                 raise FleetError('HTTP 409 reserved title')
-            return {'versionNumber': 7}
+            return {'versionNumber': 7, 'ref': 'tester/blackthorn-computer-tester-canonical'}
         if method == 'CreateKernelSession':
             return {'ok': True}  # accepted submission, not a running session
         raise AssertionError(method)
@@ -392,10 +392,10 @@ def test_409_recovery_creates_session_for_saved_slug_and_never_assumes_version(m
     saved = [payload for method, payload in seen if method == 'SaveKernel'][-1]
     created = [payload for method, payload in seen if method == 'CreateKernelSession']
     checked = [payload for method, payload in seen[seen.index(('SaveKernel', saved))+1:] if method == 'GetKernelSessionStatus']
-    assert created == [{'slug': saved['slug']}]
-    assert all(payload['kernelSlug'] == saved['slug'].split('/')[-1] for payload in checked)
+    assert created == [{'slug': 'tester/blackthorn-computer-tester-canonical'}]
+    assert all(payload['kernelSlug'] == 'blackthorn-computer-tester-canonical' for payload in checked)
     assert out['_session_running'] is False and out['_session_pending'] is True
-    assert out['_slug'] == saved['slug']
+    assert out['_slug'] == created[0]['slug']
     assert not any(method == 'DeleteKernel' for method, _ in seen)
 
 
