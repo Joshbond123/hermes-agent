@@ -63,7 +63,35 @@ def _navigate(page, url: str, timeout_ms: int, notes: list):
         return page.goto(url, wait_until="domcontentloaded", timeout=min(60000, timeout_ms * 2))
 
 
+def _ensure_browser_runtime(notes: list) -> None:
+    """Rehydrate rebuildable browser deps after a Kaggle session restart.
+
+    Workspace checkpoints retain the package inventory but exclude .cache, so
+    the browser release must be fetched again. Never overwrite workspace data.
+    """
+    import importlib.util
+    import pathlib
+    import subprocess
+    if importlib.util.find_spec("camoufox") is None:
+        subprocess.run([sys.executable, "-m", "pip", "install", "--no-input",
+                        "--disable-pip-version-check", "camoufox"],
+                       check=True, capture_output=True, timeout=180)
+        notes.append("restored Camoufox Python package")
+    cache = pathlib.Path(os.path.expanduser("~/.cache/camoufox/browsers"))
+    if not cache.exists() or not any(cache.rglob("camoufox-bin")):
+        subprocess.run([sys.executable, "-m", "camoufox", "fetch"],
+                       check=True, capture_output=True, timeout=220)
+        notes.append("downloaded Camoufox browser after restart")
+    if sys.platform.startswith("linux"):
+        import ctypes.util
+        if ctypes.util.find_library("gtk-3") is None:
+            subprocess.run(["apt-get", "install", "-y", "-qq", "libgtk-3-0t64"],
+                           check=True, capture_output=True, timeout=180)
+            notes.append("restored GTK runtime for browser")
+
+
 def _session(req: dict, notes: list, started: float) -> dict:
+    _ensure_browser_runtime(notes)
     from camoufox.sync_api import Camoufox
     url = req["url"]
     timeout_ms = max(5000, min(60000, int(req.get("timeout_ms") or 25000)))

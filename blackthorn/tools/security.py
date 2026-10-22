@@ -132,9 +132,9 @@ async def browse(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
         request["screenshot"] = f"{SCREENSHOT_DIR}/shot-{time.time_ns()}.png"
     await _upload(ctx, "browse.py")
     payload = base64.b64encode(json.dumps(request).encode()).decode()
-    cmd = f"mkdir -p {SCREENSHOT_DIR} && timeout 150 python3 {REMOTE_BIN}/browse.py {payload}"
-    data = await ctx.computer.call("/computer/exec", {"command": cmd, "timeout_seconds": 160, "cwd": "."},
-                                   timeout=190.0, idempotent=False)
+    cmd = f"mkdir -p {SCREENSHOT_DIR} && timeout 320 python3 {REMOTE_BIN}/browse.py {payload}"
+    data = await ctx.computer.call("/computer/exec", {"command": cmd, "timeout_seconds": 330, "cwd": "."},
+                                   timeout=350.0, idempotent=False)
     raw = str(data.get("output") or "").strip().splitlines()
     result = None
     for line in reversed(raw):
@@ -201,5 +201,5 @@ def specs() -> List[ToolSpec]:
                      "timeout_ms": {"type": "integer", "minimum": 5000, "maximum": 60000, "default": 25000},
                      "screenshot": {"type": "boolean", "default": False}},
                   "required": ["url"]},
-                 browse, timeout=200.0, kind="net", describe=lambda a: str(a.get("url") or "")),
+                 browse, timeout=360.0, kind="net", describe=lambda a: str(a.get("url") or "")),
     ]

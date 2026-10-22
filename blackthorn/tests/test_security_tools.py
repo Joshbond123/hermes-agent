@@ -171,3 +171,36 @@ def test_browse_live_camoufox_example_com(fixture_root):
     assert res.ok, res.content
     assert "Example Domain" in res.content
     assert res.data.get("status") == 200
+
+
+def test_browser_rehydrates_missing_package_and_binary_without_touching_workspace(tmp_path, monkeypatch):
+    import importlib.util
+    import ctypes.util
+    from blackthorn.computer_assets import browse as helper
+    monkeypatch.setenv('HOME', str(tmp_path))
+    monkeypatch.setattr(importlib.util, 'find_spec', lambda name: None if name == 'camoufox' else object())
+    monkeypatch.setattr(ctypes.util, 'find_library', lambda name: None)
+    calls = []
+    monkeypatch.setattr(subprocess, 'run', lambda command, **kw: calls.append((command, kw)) or
+                        subprocess.CompletedProcess(command, 0), raising=False)
+    notes = []
+    helper._ensure_browser_runtime(notes)
+    assert [c[0][0] for c in calls] == [os.sys.executable, os.sys.executable, 'apt-get']
+    assert all(c[1]['check'] and c[1]['timeout'] <= 220 for c in calls)
+    assert len(notes) == 3
+
+
+def test_browser_skips_install_when_rebuildable_cache_is_present(tmp_path, monkeypatch):
+    import importlib.util
+    import ctypes.util
+    from blackthorn.computer_assets import browse as helper
+    monkeypatch.setenv('HOME', str(tmp_path))
+    browser = tmp_path / '.cache' / 'camoufox' / 'browsers' / 'official' / 'bin'
+    browser.mkdir(parents=True)
+    (browser / 'camoufox-bin').write_bytes(b'installed')
+    monkeypatch.setattr(importlib.util, 'find_spec', lambda name: object())
+    monkeypatch.setattr(ctypes.util, 'find_library', lambda name: 'libgtk-3.so.0')
+    monkeypatch.setattr(subprocess, 'run', lambda *a, **kw: (_ for _ in ()).throw(AssertionError('should not reinstall')), raising=False)
+    notes = []
+    helper._ensure_browser_runtime(notes)
+    assert notes == []
