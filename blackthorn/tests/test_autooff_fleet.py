@@ -13,6 +13,19 @@ def _module():
     return m
 
 
+def test_boot_watchdog_does_not_repush_on_empty_kaggle_status():
+    """Kaggle returns an empty session status during accepted GPU allocation."""
+    src = MODULE.read_text(encoding='utf-8')
+    tree = ast.parse(src)
+    daemon = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+                  and n.name == 'start_permanent_gpu_daemon')
+    body = ast.get_source_segment(src, daemon)
+    assert 'role_kernel["slug"].split("/")[-1]' in body
+    assert 'kernel_status not in ("COMPLETE", "ERROR", "CANCELLED"' in body
+    assert 'kernel_status in ("RUNNING", "QUEUED", "PENDING")' not in body
+    assert 'age < 3600 and state in ("BOOTING_KAGGLE_GPU"' in src
+
+
 def test_daemon_auto_off_branch_uses_the_fleet_aware_stop():
     src = MODULE.read_text(encoding="utf-8")
     tree = ast.parse(src)

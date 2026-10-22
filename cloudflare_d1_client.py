@@ -1842,7 +1842,7 @@ def turn_on_fleet(blocking: bool = False) -> Dict[str, Any]:
                 state = str(row.get("status") or "").upper()
                 if age < 180 and state in READY_STATUSES:
                     reusable = "reconnecting"
-                elif age < 600 and state in ("BOOTING_KAGGLE_GPU", "INSTALLING_DEPS", "LOADING_MODEL",
+                elif age < 3600 and state in ("BOOTING_KAGGLE_GPU", "INSTALLING_DEPS", "LOADING_MODEL",
                                               "RESTORING_WORKSPACE", "DOWNLOADING_MODEL", "STARTING_TUNNEL"):
                     reusable = "already_starting"
             except Exception:
@@ -2339,15 +2339,33 @@ def start_permanent_gpu_daemon() -> None:
                     if quiet_for > quiet_limit and (now - last_boot_heal_ts) > 300 and stale_boot_heals < 3:
                         kernel_status = ""
                         try:
-                            kernel_status = str(_kaggle_rpc(
-                                "GetKernelSessionStatus",
-                                {"userName": KAGGLE_USERNAME, "kernelSlug": KAGGLE_KERNEL_SLUG},
-                            ).get("status") or "").upper()
+                            from blackthorn.fleet import FleetManager, accounts_from_env
+                            configured = accounts_from_env(os.environ)
+                            if configured:
+                                # The legacy slug belongs to a DIFFERENT notebook. An
+                                # empty response for it cannot justify deleting a queued
+                                # fleet session. Query the real fleet role notebook.
+                                fleet = FleetManager(configured)
+                                primary = next((a for a in configured if a.role == "model" and a.slot == "primary"), None)
+                                if primary:
+                                    role_kernel = fleet.find_role_kernel(primary)
+                                    if role_kernel and role_kernel.get("slug"):
+                                        kernel_status = str(fleet.rpc(primary, "GetKernelSessionStatus", {
+                                            "userName": primary.user,
+                                            "kernelSlug": role_kernel["slug"].split("/")[-1],
+                                        }).get("status") or "").upper()
+                            else:
+                                kernel_status = str(_kaggle_rpc(
+                                    "GetKernelSessionStatus",
+                                    {"userName": KAGGLE_USERNAME, "kernelSlug": KAGGLE_KERNEL_SLUG},
+                                ).get("status") or "").upper()
                         except Exception as exc:
                             logger.debug("boot watchdog session probe note: %s", exc)
-                        if kernel_status in ("RUNNING", "QUEUED", "PENDING"):
+                        # Kaggle returns {} while an accepted CreateKernelSession
+                        # still waits for allocation. Unknown is NOT stopped.
+                        if kernel_status not in ("COMPLETE", "ERROR", "CANCELLED", "CANCEL_REQUESTED", "CANCEL_ACKNOWLEDGED"):
                             logger.info(
-                                "Boot watchdog: %s quiet %.0fs but kernel is %s — leaving session alone",
+                                "Boot watchdog: %s quiet %.0fs; kernel %s is not proven stopped — leaving session alone",
                                 d1_status, quiet_for, kernel_status,
                             )
                             last_boot_heal_ts = now
