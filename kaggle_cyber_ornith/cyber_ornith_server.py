@@ -1139,10 +1139,10 @@ def start_llama_server(gguf_path: str) -> None:
 
     The agent's computer runs on its own dedicated hosts (josh787 / alagbo), so this
     machine hosts the model only: all 2x T4 work for it. The 27B Q4 weights (~15.7 GiB)
-    fit in the combined VRAM with room for the KV cache only at the measured
-    working offload. The previously attempted 99-layer start repeatedly spent up
-    to 240 seconds before 56-layer serving succeeded. Start with the validated
-    configuration; full offload is an explicit experiment, not the default.
+    fit in the combined VRAM with room for the KV cache only at a measured
+    working offload. In a fresh deployment, 56 did not become healthy within
+    240s and 40 did; a previous boot had succeeded at 56. Prioritize the latest
+    reliable configuration and keep larger offloads only as fallback/opt-in.
     """
     binary = ensure_llama_server_bin()
     # Context window: prefer env, default 8192 to match the agent's context budget.
@@ -1157,6 +1157,10 @@ def start_llama_server(gguf_path: str) -> None:
     env.pop("CUDA_VISIBLE_DEVICES", None)      # both T4s serve the model
 
     def _launch(ngl: str):
+        nonlocal logf_path
+        # Keep each failed attempt's evidence; overwriting one shared log hid
+        # why an otherwise healthy cache hit spent four minutes loading.
+        logf_path = f"/tmp/llama_server_ngl{ngl}.log"
         cmd = [
             binary,
             "-m", gguf_path,
@@ -1191,11 +1195,11 @@ def start_llama_server(gguf_path: str) -> None:
                 time.sleep(2)
         return False
 
-    # 56-layer offload served real inference on both T4s; 99 previously timed
-    # out before the same 56-layer attempt succeeded. Do not add that known
-    # 240-second failed probe to every cold start. Operators may explicitly
-    # opt in to the full-offload experiment without changing the safe default.
-    layers = ("99", "56", "40") if os.environ.get("LLAMA_TRY_FULL_OFFLOAD") == "1" else ("56", "40")
+    # Latest measured boot: 56-layer attempt spent 240s without health; 40
+    # loaded and answered actual inference (cold 12s, warm 3.25s). An earlier
+    # session served 56, so keep it as fallback, not an obligatory delay.
+    # Operators may explicitly opt in to the unproven full-offload experiment.
+    layers = ("99", "56", "40") if os.environ.get("LLAMA_TRY_FULL_OFFLOAD") == "1" else ("40", "56")
     for ngl in layers:
         proc = _launch(ngl)
         if _wait(proc, 240):

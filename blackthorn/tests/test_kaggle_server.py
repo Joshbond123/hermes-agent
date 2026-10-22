@@ -214,7 +214,7 @@ def test_default_model_registration_prefers_direct_cuda_serving(srv, monkeypatch
     assert srv.posts == [("llama", str(model))]
 
 
-def test_cached_model_starts_with_measured_working_offload_not_slow_full_probe(srv, monkeypatch, tmp_path):
+def test_cached_model_starts_with_latest_working_offload_not_slow_full_probe(srv, monkeypatch, tmp_path):
     model = tmp_path / 'cached.gguf'
     model.write_bytes(b'fixture')
     monkeypatch.setattr(srv, 'ensure_llama_server_bin', lambda: '/verified/llama-server')
@@ -228,7 +228,7 @@ def test_cached_model_starts_with_measured_working_offload_not_slow_full_probe(s
     monkeypatch.setattr(srv.subprocess, 'Popen', launch)
     monkeypatch.setattr(srv.urllib.request, 'urlopen', lambda *a, **kw: object())
     srv.start_llama_server(str(model))
-    assert seen == ['56']
+    assert seen == ['40']
 
 
 def test_full_offload_requires_explicit_opt_in_and_falls_back(srv, monkeypatch, tmp_path):

@@ -1082,7 +1082,7 @@ def get_kaggle_gpu_status(force_refresh: bool = False) -> Dict[str, Any]:
                         state["booting"] = False
                         state["worker_status"] = "RUNNING"
                         state["progress_pct"] = 100
-                        state["progress_step"] = "GPU Permanently Connected & Active"
+                        state["progress_step"] = "Kaggle GPU ready (session-limited)"
                         state["display_status"] = "Kaggle Ready"
                 if not row_url and _LAST_SAVED_TUNNEL_URL and row_steady:
                     try:
@@ -1113,7 +1113,7 @@ def get_kaggle_gpu_status(force_refresh: bool = False) -> Dict[str, Any]:
             state["booting"] = False
             state["worker_status"] = state.get("worker_status") or "RUNNING"
             state["progress_pct"] = 100
-            state["progress_step"] = "GPU Permanently Connected & Active"
+            state["progress_step"] = "Kaggle GPU ready (session-limited)"
             state["display_status"] = "Kaggle Ready"
             state["engine_state"] = "ready"
             # quick health (never block UI more than 2.5s). On confirmed dead tunnel,
@@ -1259,7 +1259,7 @@ def get_kaggle_gpu_status(force_refresh: bool = False) -> Dict[str, Any]:
                         state["status"] = "ONLINE"
                         state["worker_status"] = "RUNNING"
                         state["progress_pct"] = 100
-                        state["progress_step"] = "GPU Permanently Connected & Active"
+                        state["progress_step"] = "Kaggle GPU ready (session-limited)"
                         if h_data.get("gpu"):
                             state["gpu_info"] = str(h_data["gpu"]).replace("\n", " + ")
                         boot = h_data.get("boot") or {}
@@ -2519,7 +2519,7 @@ def _turn_on_kaggle_gpu_single(blocking: bool = False) -> Dict[str, Any]:
             # Already healthy and already known: answer from memory so the button
             # reacts instantly instead of waiting on another quota/kernel round-trip.
             cached["status"] = cached.get("status") or "ONLINE"
-            cached["progress_step"] = cached.get("progress_step") or "GPU Permanently Connected & Active"
+            cached["progress_step"] = cached.get("progress_step") or "Kaggle GPU ready (session-limited)"
             return cached
         return get_kaggle_gpu_status(force_refresh=False)
 
