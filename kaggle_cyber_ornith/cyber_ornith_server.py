@@ -1039,6 +1039,49 @@ def start_tunnel_watchdog(interval_s: float = 45.0) -> None:
 
 
 def ensure_llama_server_bin() -> str:
+    """Use a pinned, SHA-verified official CUDA 12.8 release on Kaggle's 12.8 T4 image.
+
+    Building the latest CUDA source on the Kaggle container timed out after 900s;
+    the official release was downloaded and executed on the same computer image.
+    No executable or shared library is accepted from an unverified download.
+    """
+    release = "b11819"
+    filename = f"llama-{release}-bin-ubuntu-cuda-12.8-x64.tar.gz"
+    expected = "5940eaa8b4fdd9a9e050a70baaeded3c69d269abbea2565641c2510fc3891e04"
+    dest = f"/tmp/blackthorn-llama-{release}"
+    binary = os.path.join(dest, f"llama-{release}", "llama-server")
+    if os.path.isfile(binary) and os.access(binary, os.X_OK):
+        return binary
+    archive = f"/tmp/{filename}"
+    try:
+        url = f"https://github.com/ggml-org/llama.cpp/releases/download/{release}/{filename}"
+        subprocess.run(["curl", "-fLsS", "--retry", "2", "--max-time", "120", url,
+                        "-o", archive], check=True, timeout=135)
+        if _sha256(archive) != expected:
+            raise RuntimeError("official llama.cpp CUDA archive checksum mismatch")
+        os.makedirs(dest, exist_ok=True)
+        # The archive hash is pinned above; check its contents' paths as well.
+        import tarfile
+        with tarfile.open(archive, "r:gz") as tf:
+            for member in tf.getmembers():
+                if not member.name.startswith(f"llama-{release}/") or ".." in member.name.split("/"):
+                    raise RuntimeError("unexpected llama.cpp archive path")
+                if member.issym() and ("/" in member.linkname or ".." in member.linkname):
+                    raise RuntimeError("unexpected llama.cpp archive link")
+            tf.extractall(dest, filter="data")
+        os.chmod(binary, 0o755)
+        out = subprocess.check_output([binary, "--version"], stderr=subprocess.STDOUT, timeout=15)
+        if b"build 11819" not in out:
+            raise RuntimeError("unexpected llama.cpp binary version")
+        log("✅ Official CUDA 12.8 llama-server ready (SHA-256 verified)")
+        return binary
+    except Exception:
+        if os.environ.get("LLAMA_BUILD_FROM_SOURCE") == "1":
+            return build_llama_server_bin()
+        raise
+
+
+def build_llama_server_bin() -> str:
     """Build or reuse a CUDA-enabled llama-server for dual T4."""
     binary = "/tmp/llama-server"
     if os.path.isfile(binary) and os.access(binary, os.X_OK):
@@ -1123,6 +1166,7 @@ def start_llama_server(gguf_path: str) -> None:
             binary,
             "-m", gguf_path,
             "-ngl", ngl,
+            "--split-mode", "layer", "--tensor-split", "1,1",
             "-c", str(n_ctx),
             "--host", "0.0.0.0",
             "--port", str(OLLAMA_PORT),
@@ -1153,7 +1197,7 @@ def start_llama_server(gguf_path: str) -> None:
 
     # The 27B Q4 weights (~15.7 GiB) can exceed one T4 once the KV cache is reserved.
     # Ask for full offload first; if the engine cannot start, retry with fewer GPU layers.
-    # Every attempt is pinned to GPU 0: weights never land on GPU 1, no matter the fallback.
+    # Use both T4s explicitly; layer split prevents a 16.8 GB GGUF overflowing one card.
     for ngl in ("99", "56", "40"):
         proc = _launch(ngl)
         if _wait(proc, 240):
@@ -1207,14 +1251,13 @@ def ollama_pull_model(ollama_bin: str) -> bool:
 
 
 def register_model(ollama_bin: str, gguf_path: str) -> None:
-    """Prefer CUDA llama-server for large GGUF stability on dual T4.
-    Ollama create is attempted only when disk allows; failures fall through
-    cleanly to llama-server without aborting the boot.
+    """Prefer official CUDA llama-server for large GGUF stability on dual T4.
+    Ollama is an opt-out fallback if prebuilt CUDA cannot be used.
     """
-    # Kaggle's CUDA toolkit/compiler changes between images; a fresh llama.cpp
-    # CMake build can fail before any model serves. Reuse the already-running
-    # Ollama engine by default, with an explicit opt-in for custom llama.cpp.
-    prefer_llama = os.environ.get("PREFER_LLAMA", "0") == "1"
+    # Serve the GGUF directly using the verified official CUDA binary. Ollama
+    # create timed out after 600s even from the attached dataset; source builds
+    # timed out after a further 900s. An opt-out keeps the old engine available.
+    prefer_llama = os.environ.get("PREFER_LLAMA", "1") == "1"
     if prefer_llama and gguf_path and os.path.isfile(gguf_path):
         try:
             log("Trying CUDA llama-server on dual T4")

@@ -173,11 +173,30 @@ def test_llama_cmake_on_t4_uses_driver_library_and_sm75(srv, monkeypatch):
     monkeypatch.setattr(srv.subprocess, "run",
                         lambda cmd, **kw: commands.append(cmd) or subprocess.CompletedProcess(cmd, 0))
     with pytest.raises(RuntimeError, match="binary not found"):
-        srv.ensure_llama_server_bin()
+        srv.build_llama_server_bin()
     cmake = next(cmd for cmd in commands if isinstance(cmd, list) and cmd[:2] == ["cmake", "-B"])
     assert "-DGGML_CUDA=ON" in cmake
     assert "-DCMAKE_CUDA_ARCHITECTURES=75" in cmake
     assert "-DCUDA_cuda_driver_LIBRARY=" + driver in cmake
+
+
+def test_official_cuda_binary_is_pinned_and_fails_closed(srv, monkeypatch, tmp_path):
+    monkeypatch.setattr(srv.os.path, "isfile", lambda path: False)
+    monkeypatch.setattr(srv.subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess(a[0], 0))
+    monkeypatch.setattr(srv, "_sha256", lambda path: "incorrect")
+    monkeypatch.setenv("LLAMA_BUILD_FROM_SOURCE", "0")
+    with pytest.raises(RuntimeError, match="checksum mismatch"):
+        srv.ensure_llama_server_bin()
+
+
+def test_default_model_registration_prefers_direct_cuda_serving(srv, monkeypatch, tmp_path):
+    model = tmp_path / "cached.gguf"
+    model.write_bytes(b"model")
+    monkeypatch.delenv("PREFER_LLAMA", raising=False)
+    monkeypatch.setattr(srv, "start_llama_server", lambda path: srv.posts.append(("llama", path)))
+    monkeypatch.setattr(srv, "ollama_model_present", lambda: False)
+    srv.register_model("ollama", str(model))
+    assert srv.posts == [("llama", str(model))]
 
 
 def test_model_registration_does_not_delete_cached_blobs():

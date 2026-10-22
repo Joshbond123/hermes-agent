@@ -336,11 +336,11 @@ def test_main_cache_publish_checks_model_size_without_undefined_variable():
     assert '_healthy_file(gguf, MODEL_BYTES.get(MODEL_QUANT, 0))' in src
 
 
-def test_model_registration_defaults_to_ollama_without_compiling_cuda(monkeypatch, tmp_path):
+def test_model_registration_can_opt_out_of_cuda_to_ollama(monkeypatch, tmp_path):
     import types
     gguf = tmp_path / 'model.gguf'
     gguf.write_text('test model')
-    monkeypatch.delenv('PREFER_LLAMA', raising=False)
+    monkeypatch.setenv('PREFER_LLAMA', '0')
     monkeypatch.setattr(srv, 'WORK_ROOT', str(tmp_path))
     monkeypatch.setattr(srv, 'PERSIST_MODELS_DIR', str(tmp_path / 'ollama'))
     monkeypatch.setattr(srv, 'ollama_model_present', lambda: False)
