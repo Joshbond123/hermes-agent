@@ -2158,7 +2158,7 @@ def turn_off_fleet(blocking: bool = True, source: str = "", roles: tuple = ("mod
             if st in ("stopped", "not_running", "unconfigured"):
                 try:
                     if row_id == "computer":
-                        _write_fleet_row(row_id, "GPU_STOPPED_SAVING_QUOTA", gpu_info="", preserve_link=True)
+                        _write_fleet_row(row_id, "GPU_STOPPED_SAVING_QUOTA", tunnel_url="", api_key="", gpu_info="")
                     else:
                         _write_fleet_row(row_id, "GPU_STOPPED_SAVING_QUOTA", tunnel_url="", api_key="", gpu_info="")
                 except Exception:
@@ -2170,7 +2170,7 @@ def turn_off_fleet(blocking: bool = True, source: str = "", roles: tuple = ("mod
                     # manual stop if the session is billing.
                     try:
                         if row_id == "computer":
-                            _write_fleet_row(row_id, "GPU_STOPPED_SAVING_QUOTA", gpu_info="", preserve_link=True)
+                            _write_fleet_row(row_id, "GPU_STOPPED_SAVING_QUOTA", tunnel_url="", api_key="", gpu_info="")
                         else:
                             _write_fleet_row(row_id, "GPU_STOPPED_SAVING_QUOTA", tunnel_url="", api_key="", gpu_info="")
                     except Exception:

@@ -186,3 +186,21 @@ def test_model_registration_does_not_delete_cached_blobs():
     fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == 'register_model')
     assert not any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
                    and n.func.attr in ('remove', 'unlink', 'rmtree') for n in ast.walk(fn))
+
+
+def test_late_notebook_heartbeat_cannot_resurrect_verified_off(srv, monkeypatch):
+    calls = []
+    def fake_urlopen(req, **kwargs):
+        if '/d1/database/' in getattr(req, 'full_url', ''):
+            calls.append(json.loads(req.data))
+        return None
+    monkeypatch.setattr(srv.urllib.request, 'urlopen', fake_urlopen)
+    for name in ('CLOUDFLARE_ACCOUNT_ID', 'CLOUDFLARE_D1_DATABASE_ID', 'CLOUDFLARE_API_TOKEN'):
+        monkeypatch.setenv(name, 'test-secret-not-logged')
+    srv.notify_workspace('HEARTBEAT_ONLINE')
+    assert len(calls) == 1
+    sql, params = calls[0]['sql'], calls[0]['params']
+    assert "ON CONFLICT(id) DO UPDATE" in sql
+    assert "WHERE kaggle_gpu_state.status NOT IN" in sql
+    assert "'GPU_STOPPED_SAVING_QUOTA'" in sql
+    assert params[1] == 'HEARTBEAT_ONLINE'

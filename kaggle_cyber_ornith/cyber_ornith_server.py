@@ -299,9 +299,16 @@ def notify_workspace(status: str, tunnel_url: str = "", extra: dict = None) -> N
             f"https://api.cloudflare.com/client/v4/accounts/{_cf_acct}"
             f"/d1/database/{_cf_db}/query"
         )
+        # A late notebook heartbeat must never resurrect a role after the
+        # controller has stopped it. The next authorised ON writes BOOTING first.
         cf_sql = (
-            "INSERT OR REPLACE INTO kaggle_gpu_state (id, status, tunnel_url, api_key, model, gpu_info, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?);"
+            "INSERT INTO kaggle_gpu_state (id, status, tunnel_url, api_key, model, gpu_info, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET status=excluded.status, tunnel_url=excluded.tunnel_url, "
+            "api_key=excluded.api_key, model=excluded.model, gpu_info=excluded.gpu_info, "
+            "updated_at=excluded.updated_at "
+            "WHERE kaggle_gpu_state.status NOT IN "
+            "('GPU_STOPPED_SAVING_QUOTA','OFF','STOPPING_KAGGLE_GPU');"
         )
         cf_params = [
             "computer" if ROLE == "computer" else "primary",
