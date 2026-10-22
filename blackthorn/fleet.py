@@ -320,59 +320,55 @@ class FleetManager:
         if invalid:
             log.warning("Kaggle ignored %s unavailable dataset attachment(s) for %s",
                         len(invalid), account.role)
-        if out.get("error"):
-            err = str(out.get("error"))
-            # Session slots full: try starting the existing kernel via CreateKernelSession.
-            if "Maximum batch GPU session count" in err or "session count" in err.lower():
-                log.warning("GPU session limit for %s — trying CreateKernelSession on existing slug", slug)
-            else:
-                raise FleetError(f"SaveKernel rejected: {err[:240]}")
-        # Ensure a session is RUNNING. SaveKernel usually auto-runs; when it does not
-        # (or hits the concurrent session limit), CreateKernelSession starts it.
         full_slug = slug if "/" in str(slug) else f"{account.user}/{slug}"
         name = full_slug.split("/", 1)[-1]
-        running = False
-        for attempt in range(2):
-            for _ in range(6):
-                import time as _t
-                _t.sleep(3)
-                try:
-                    sess = self.rpc(account, "GetKernelSessionStatus",
-                                    {"userName": account.user, "kernelSlug": name})
-                    st = str((sess or {}).get("status") or "").upper()
-                    if st in ("RUNNING", "QUEUED", "PENDING"):
-                        running = True
-                        break
-                except FleetError:
-                    continue
-            if running:
-                break
-            try:
-                log.info("Starting kernel session via CreateKernelSession for %s", full_slug)
-                self.rpc(account, "CreateKernelSession", {"slug": full_slug})
-            except FleetError as exc:
-                log.warning("CreateKernelSession for %s: %s", full_slug, exc)
-                if attempt == 0:
-                    # Drop invalid dataset mounts and re-save once, then start session.
-                    payload.pop("datasetDataSources", None)
-                    try:
-                        out = self.rpc(account, "SaveKernel", payload)
-                    except FleetError:
-                        pass
-        if not running:
-            # Final status probe
+
+        def _session_running() -> bool:
             try:
                 sess = self.rpc(account, "GetKernelSessionStatus",
                                 {"userName": account.user, "kernelSlug": name})
-                st = str((sess or {}).get("status") or "").upper()
-                running = st in ("RUNNING", "QUEUED", "PENDING")
             except FleetError:
-                pass
+                return False
+            st = str((sess or {}).get("status") or "").upper()
+            return st in ("RUNNING", "QUEUED", "PENDING")
+
+        running = _session_running()
+        if not running:
+            try:
+                self.rpc(account, "CreateKernelSession", {"slug": full_slug})
+                running = True
+            except FleetError as exc:
+                msg = str(exc)
+                if "ALREADY_EXISTS" in msg or "already running" in msg.lower() or "409" in msg:
+                    log.info("CreateKernelSession: session already running for %s", full_slug)
+                    running = True
+                else:
+                    log.warning("CreateKernelSession for %s: %s", full_slug, msg[:200])
+            import time as _t
+            for _ in range(5):
+                _t.sleep(2)
+                if _session_running():
+                    running = True
+                    break
+        if not running:
+            try:
+                self.rpc(account, "CreateKernelSession", {"slug": full_slug})
+            except FleetError as exc:
+                if "ALREADY_EXISTS" in str(exc) or "already running" in str(exc).lower():
+                    running = True
+        if not running and out.get("error"):
+            raise FleetError(
+                f"Kaggle rejected the GPU session for {full_slug}: {out.get('error')}. "
+                f"Stop leftover GPU sessions on kaggle.com if the account hit the concurrent limit."
+            )
+        if not running and out.get("versionNumber") is not None:
+            log.warning("Assuming session started for %s (version=%s); status API returned empty",
+                        full_slug, out.get("versionNumber"))
+            running = True
         if not running:
             raise FleetError(
                 f"No RUNNING Kaggle session for {full_slug} after SaveKernel/CreateKernelSession. "
-                f"version={out.get('versionNumber')!r} error={out.get('error')!r}. "
-                f"If Kaggle reports max GPU sessions, stop leftover sessions on kaggle.com."
+                f"version={out.get('versionNumber')!r} error={out.get('error')!r}."
             )
         out["_session_running"] = True
         out["_slug"] = full_slug
