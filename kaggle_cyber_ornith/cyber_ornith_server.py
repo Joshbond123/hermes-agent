@@ -695,8 +695,9 @@ def publish_cache_dataset(gguf_path: str) -> None:
             if version.returncode != 0:
                 log(f"⚠️ Cache dataset publish failed: {version.stderr.strip()[:200]}")
                 return
+        # This runs asynchronously. Never overwrite a genuinely ready model
+        # status with an unrelated cache-publication event (or vice versa).
         log(f"✅ Cache dataset published: {CACHE_DATASET_SLUG}")
-        notify_workspace("CACHE_DATASET_PUBLISHED", extra={"dataset": CACHE_DATASET_SLUG})
     except Exception as exc:
         log(f"⚠️ Cache dataset publish skipped: {exc}")
 
@@ -1153,14 +1154,16 @@ def start_llama_server(gguf_path: str) -> None:
     n_ctx = max(4096, min(n_ctx, 32768))
     log(f"Starting CUDA llama-server on :{LLAMA_PORT} with {gguf_path} (all GPUs, ctx={n_ctx})")
     logf_path = "/tmp/llama_server.log"
+    attempt = 0
     env = os.environ.copy()
     env.pop("CUDA_VISIBLE_DEVICES", None)      # both T4s serve the model
 
     def _launch(ngl: str):
-        nonlocal logf_path
-        # Keep each failed attempt's evidence; overwriting one shared log hid
-        # why an otherwise healthy cache hit spent four minutes loading.
-        logf_path = f"/tmp/llama_server_ngl{ngl}.log"
+        nonlocal logf_path, attempt
+        # Keep each failed attempt's evidence; the old shared log was overwritten
+        # by retries and concealed an almost-finished model load.
+        attempt += 1
+        logf_path = f"/tmp/llama_server_ngl{ngl}_attempt{attempt}.log"
         cmd = [
             binary,
             "-m", gguf_path,
@@ -1195,14 +1198,19 @@ def start_llama_server(gguf_path: str) -> None:
                 time.sleep(2)
         return False
 
-    # Latest measured boot: 56-layer attempt spent 240s without health; 40
-    # loaded and answered actual inference (cold 12s, warm 3.25s). An earlier
-    # session served 56, so keep it as fallback, not an obligatory delay.
-    # Operators may explicitly opt in to the unproven full-offload experiment.
+    # A cold 16.8 GB Kaggle dataset mount can take longer than four minutes to
+    # page in. One observed process was still alive and initializing after 195s;
+    # killing it at 240s and starting over caused a 31-minute boot. Allow the
+    # same live process to finish, but keep a bounded maximum and retain crash
+    # detection. This does not bypass Kaggle's allocation queue or GPU load.
+    try:
+        load_timeout = max(240, min(int(os.environ.get("LLAMA_LOAD_TIMEOUT_S", "600")), 1200))
+    except ValueError:
+        load_timeout = 600
     layers = ("99", "56", "40") if os.environ.get("LLAMA_TRY_FULL_OFFLOAD") == "1" else ("40", "56")
     for ngl in layers:
         proc = _launch(ngl)
-        if _wait(proc, 240):
+        if _wait(proc, load_timeout):
             log("llama-server healthy (ngl=" + ngl + ")")
             with open("/tmp/engine_mode.txt", "w") as fh:
                 fh.write("llama")
@@ -1223,7 +1231,7 @@ def start_llama_server(gguf_path: str) -> None:
         log("llama-server log tail: " + tail)
     except Exception:
         pass
-    raise RuntimeError("llama-server failed to start — see /tmp/llama_server.log")
+    raise RuntimeError("llama-server failed to start — see /tmp/llama_server_ngl*_attempt*.log")
 
 
 
@@ -1275,21 +1283,20 @@ def register_model(ollama_bin: str, gguf_path: str) -> None:
         with open("/tmp/engine_mode.txt", "w") as fh:
             fh.write("ollama")
         return
+    # Free space check — an Ollama import of this 16.8 GB GGUF needs more than
+    # the 20 GB working disk. Do not retry llama.cpp again, run a 600-second
+    # doomed import, then retry llama.cpp yet again as the old path did.
+    try:
+        free_gb = shutil.disk_usage(WORK_ROOT).free / (1024**3)
+        log(f"Disk free on {WORK_ROOT}: {free_gb:.1f} GB")
+    except OSError:
+        free_gb = None
+    if free_gb is not None and free_gb < 20 and prefer_llama:
+        raise RuntimeError("CUDA loader failed; insufficient disk for Ollama import; cached GGUF preserved")
+    if free_gb is not None and free_gb < 20:
+        log("Low working-disk space; attempting the explicitly selected Ollama import")
     if not ollama_bin:
         ollama_bin = ensure_ollama_serving()
-    # Free space check — ollama create can need ~2x the GGUF size briefly
-    try:
-        usage = shutil.disk_usage(WORK_ROOT)
-        free_gb = usage.free / (1024**3)
-        log(f"Disk free on {WORK_ROOT}: {free_gb:.1f} GB")
-        if free_gb < 20:  # avoid a guaranteed out-of-space copy
-            if prefer_llama:
-                start_llama_server(gguf_path)
-                return
-            log("Low working-disk space; attempting Ollama import of the cached GGUF")
-        # Do not delete blobs heuristically: preserve existing cached models.
-    except Exception as e:
-        log(f"disk check note: {e}")
     modelfile = "/tmp/Modelfile"
     with open(modelfile, "w") as fh:
         fh.write(f"FROM {gguf_path}\n")

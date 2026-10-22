@@ -231,6 +231,49 @@ def test_cached_model_starts_with_latest_working_offload_not_slow_full_probe(srv
     assert seen == ['40']
 
 
+def test_slow_but_live_cached_loader_is_not_killed_at_four_minutes(srv, monkeypatch, tmp_path):
+    model = tmp_path / 'cached.gguf'
+    model.write_bytes(b'fixture')
+    monkeypatch.setattr(srv, 'ensure_llama_server_bin', lambda: '/verified/llama-server')
+    monkeypatch.delenv('LLAMA_TRY_FULL_OFFLOAD', raising=False)
+    monkeypatch.setenv('LLAMA_LOAD_TIMEOUT_S', '600')
+    modes = []
+    class Proc:
+        def poll(self): return None
+    def launch(cmd, **kw):
+        modes.append(cmd[cmd.index('-ngl') + 1])
+        return Proc()
+    probes = [0]
+    def delayed_health(*args, **kw):
+        probes[0] += 1
+        if probes[0] < 151:  # 300 seconds of live loading
+            raise OSError('still loading mounted weights')
+        return object()
+    monkeypatch.setattr(srv.subprocess, 'Popen', launch)
+    monkeypatch.setattr(srv.urllib.request, 'urlopen', delayed_health)
+    monkeypatch.setattr(srv.time, 'sleep', lambda *a: None)
+    srv.start_llama_server(str(model))
+    assert modes == ['40'] and probes[0] == 151
+
+
+def test_failed_loader_with_insufficient_disk_does_not_repeat_or_import_ollama(srv, monkeypatch, tmp_path):
+    import types
+    model = tmp_path / 'cached.gguf'
+    model.write_bytes(b'fixture')
+    calls = []
+    def failed(path):
+        calls.append(path)
+        raise RuntimeError('model still unavailable')
+    monkeypatch.setenv('PREFER_LLAMA', '1')
+    monkeypatch.setattr(srv, 'start_llama_server', failed)
+    monkeypatch.setattr(srv, 'ollama_model_present', lambda: False)
+    monkeypatch.setattr(srv, 'ensure_ollama_serving', lambda: (_ for _ in ()).throw(AssertionError('doomed import')))
+    monkeypatch.setattr(srv.shutil, 'disk_usage', lambda path: types.SimpleNamespace(free=19.5 * 1024**3))
+    with pytest.raises(RuntimeError, match='insufficient disk'):
+        srv.register_model('', str(model))
+    assert calls == [str(model)] and model.exists()
+
+
 def test_full_offload_requires_explicit_opt_in_and_falls_back(srv, monkeypatch, tmp_path):
     monkeypatch.setattr(srv, 'ensure_llama_server_bin', lambda: '/verified/llama-server')
     monkeypatch.setenv('LLAMA_TRY_FULL_OFFLOAD', '1')
