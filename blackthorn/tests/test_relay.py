@@ -218,20 +218,22 @@ async def test_enrolled_computer_never_falls_back_to_model_puller(stack, monkeyp
     assert not stack.services.relay_hubs.get('model')  # never dispatched to model
 
 
-async def test_computer_chunked_long_reply_survives_header_wait(stack, monkeypatch):
+@pytest.mark.parametrize('channel,path', [('computer','computer/exec'), ('model','v1/chat/completions')])
+async def test_both_channels_chunked_long_reply_survives_header_wait(stack, monkeypatch, channel, path):
     import time
     monkeypatch.setattr(relay_mod, "HEADERS_TIMEOUT_S", 0.5)
-    await stack.executor.query(
-        "INSERT OR REPLACE INTO kaggle_gpu_state (id,status,tunnel_url,api_key,model,gpu_info,updated_at) "
-        "VALUES ('computer','HEARTBEAT_ONLINE','', 'test-key','','', ?)", [time.time()])
-    call = asyncio.create_task(_proxy(stack, path="computer/exec", method="GET", body=b""))
+    if channel == 'computer':
+        await stack.executor.query(
+            "INSERT OR REPLACE INTO kaggle_gpu_state (id,status,tunnel_url,api_key,model,gpu_info,updated_at) "
+            "VALUES ('computer','HEARTBEAT_ONLINE','', 'test-key','','', ?)", [time.time()])
+    call = asyncio.create_task(_proxy(stack, path=path, method="GET", body=b""))
     await asyncio.sleep(0.05)
     async with httpx.AsyncClient(timeout=10) as c:
-        pull = await c.get(f"{stack.url}/api/kaggle-relay/pull?channel=computer",
+        pull = await c.get(f"{stack.url}/api/kaggle-relay/pull?channel={channel}",
                            headers={"X-Blackthorn-Key": KEY})
         assert pull.status_code == 200
         job = pull.json()
-        assert job['path'] == '/computer/exec'
+        assert job['path'] == '/' + path
         headers = {"X-Blackthorn-Key": KEY, "X-Relay-Status": "200",
                    "X-Relay-Content-Type": "application/json"}
         head = await c.post(f"{stack.url}/api/kaggle-relay/headers/{job['id']}", headers=headers)

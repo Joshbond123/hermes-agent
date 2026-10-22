@@ -64,6 +64,7 @@ MODEL_BYTES = {
 
 GATEWAY_PORT = 8000
 OLLAMA_PORT = 11434
+LLAMA_PORT = 11435  # separate from the Ollama daemon installed in parallel
 # Dual T4 (~15GB each): keep model on GPU, limit context to avoid OOM on KV cache
 OLLAMA_NUM_PARALLEL = int(os.environ.get("OLLAMA_NUM_PARALLEL", "1"))
 OLLAMA_MAX_LOADED_MODELS = "1"
@@ -1064,7 +1065,7 @@ def ensure_llama_server_bin() -> str:
         import tarfile
         with tarfile.open(archive, "r:gz") as tf:
             for member in tf.getmembers():
-                if not member.name.startswith(f"llama-{release}/") or ".." in member.name.split("/"):
+                if (member.name != f"llama-{release}" and not member.name.startswith(f"llama-{release}/")) or ".." in member.name.split("/"):
                     raise RuntimeError("unexpected llama.cpp archive path")
                 if member.issym() and ("/" in member.linkname or ".." in member.linkname):
                     raise RuntimeError("unexpected llama.cpp archive link")
@@ -1156,7 +1157,7 @@ def start_llama_server(gguf_path: str) -> None:
     except ValueError:
         n_ctx = 8192
     n_ctx = max(4096, min(n_ctx, 32768))
-    log(f"Starting CUDA llama-server on :{OLLAMA_PORT} with {gguf_path} (all GPUs, ctx={n_ctx})")
+    log(f"Starting CUDA llama-server on :{LLAMA_PORT} with {gguf_path} (all GPUs, ctx={n_ctx})")
     logf_path = "/tmp/llama_server.log"
     env = os.environ.copy()
     env.pop("CUDA_VISIBLE_DEVICES", None)      # both T4s serve the model
@@ -1169,12 +1170,11 @@ def start_llama_server(gguf_path: str) -> None:
             "--split-mode", "layer", "--tensor-split", "1,1",
             "-c", str(n_ctx),
             "--host", "0.0.0.0",
-            "--port", str(OLLAMA_PORT),
+            "--port", str(LLAMA_PORT),
             "-np", "1",
             "--flash-attn", "on",
             "-b", "512",
             "-ub", "256",
-            "--mlock",
         ]
         extra = (os.environ.get("LLAMA_EXTRA_ARGS") or "").strip()
         if extra:
@@ -1185,7 +1185,7 @@ def start_llama_server(gguf_path: str) -> None:
     def _wait(proc, seconds: int) -> bool:
         for i in range(seconds // 2):
             try:
-                urllib.request.urlopen(f"http://127.0.0.1:{OLLAMA_PORT}/health", timeout=3)
+                urllib.request.urlopen(f"http://127.0.0.1:{LLAMA_PORT}/health", timeout=3)
                 return True
             except Exception:
                 if proc.poll() is not None:
@@ -1315,6 +1315,11 @@ def register_model(ollama_bin: str, gguf_path: str) -> None:
 
 # --------------------- GATEWAY + TUNNEL ---------------------
 def gateway_code() -> str:
+    try:
+        with open("/tmp/engine_mode.txt") as fh:
+            backend_port = LLAMA_PORT if fh.read().strip() == "llama" else OLLAMA_PORT
+    except OSError:
+        backend_port = OLLAMA_PORT
     return '''
 import json, time, os, asyncio
 import httpx
@@ -1325,7 +1330,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 API_KEY = "''' + API_KEY + '''"
 MODEL_ALIAS = "''' + MODEL_ALIAS + '''"
 OLLAMA_MODEL = "''' + OLLAMA_MODEL_NAME + '''"
-OLLAMA_URL = "http://127.0.0.1:''' + str(OLLAMA_PORT) + '''"
+OLLAMA_URL = "http://127.0.0.1:''' + str(backend_port) + '''"
 DEFAULT_SYSTEM_PROMPT = """''' + DEFAULT_SYSTEM_PROMPT + '''"""
 START_TIME = time.time()
 BOOT_STATE = json.load(open("/tmp/boot_state.json")) if os.path.exists("/tmp/boot_state.json") else {}
@@ -1821,7 +1826,7 @@ def start_gateway():
 TUNNEL_HOSTNAME = (os.environ.get("BLACKTHORN_TUNNEL_HOSTNAME") or "blacktornagent.ing.ng").strip()
 
 
-RELAY_CLIENT_CODE = '"""Render long-poll relay client for the Blackthorn Kaggle gateway.\n\nA dedicated thread always long-polls for work (so the hub can see the client is alive even\nwhile a response streams); worker threads execute jobs against the local gateway and stream\neach response back. Never exits: every failure is a short backoff.\n"""\nimport base64\nimport json\nimport queue\nimport sys\nimport threading\nimport time\n\nimport requests\n\nBASE = sys.argv[1].rstrip("/")\n# The published URL is the data plane (/gpu-relay/...); the control plane lives on the\n# app origin at /api/kaggle-relay/... — never ask for work through the data plane itself.\nCTRL = BASE[:-len("/gpu-relay")] if BASE.endswith("/gpu-relay") else BASE\nKEY = sys.argv[2]\nTARGET = sys.argv[3].rstrip("/")\nCHANNEL = (sys.argv[4] if len(sys.argv) > 4 else "model").strip() or "model"\nJOBS = queue.Queue()\nWORKERS = 3\n\n\ndef log(msg):\n    try:\n        with open("/tmp/relay_client.log", "a") as fh:\n            fh.write("%.1f %s\\n" % (time.time(), msg))\n    except Exception:\n        pass\n\n\ndef push_fail(job_id, text):\n    try:\n        requests.post(CTRL + "/api/kaggle-relay/push/" + job_id,\n                      headers={"X-Blackthorn-Key": KEY, "X-Relay-Status": "502",\n                               "X-Relay-Content-Type": "application/json"},\n                      data=json.dumps({"error": {"message": text}}), timeout=15)\n    except Exception:\n        pass\n\n\ndef execute(job):\n    body = job.get("body_b64") or ""\n    data = base64.b64decode(body) if body else b""\n    path = (job.get("path") or "").lstrip("/")\n    target = TARGET + "/" + path if path else TARGET + "/"\n    job_id = job["id"]\n    try:\n        upstream = requests.request(job.get("method") or "GET", target,\n                                    headers=job.get("headers") or {}, data=data,\n                                    stream=True, timeout=(10, 600))\n\n        def gen():\n            # read1 semantics: forward each piece the moment it arrives. iter_content(N)\n            # blocks until N bytes accumulate, which starves slow token streams (SSE pings\n            # never reach N) and wedges workers behind abandoned generations.\n            read1 = getattr(upstream.raw, "read1", None)\n            if read1 is not None:\n                while True:\n                    chunk = read1(65536)\n                    if not chunk:\n                        break\n                    yield chunk\n            else:\n                for chunk in upstream.iter_content(chunk_size=1):\n                    if chunk:\n                        yield chunk\n\n        common = {"X-Blackthorn-Key": KEY,\n                  "X-Relay-Status": str(upstream.status_code),\n                  "X-Relay-Content-Type": upstream.headers.get("Content-Type") or "application/octet-stream"}\n        if CHANNEL == "computer":\n            # Render can buffer a streaming POST until the command completes.\n            # A separate empty headers POST unblocks the caller immediately;\n            # bounded per-chunk POSTs deliver the gateway\'s 15s keepalives.\n            head = requests.post(CTRL + "/api/kaggle-relay/headers/" + job_id,\n                                 headers=common, timeout=15)\n            if head.status_code == 200:\n                for chunk in gen():\n                    res = requests.post(CTRL + "/api/kaggle-relay/chunk/" + job_id,\n                                        headers={"X-Blackthorn-Key": KEY}, data=chunk, timeout=(10, 35))\n                    if res.status_code != 200:\n                        break\n                requests.post(CTRL + "/api/kaggle-relay/done/" + job_id,\n                              headers={"X-Blackthorn-Key": KEY}, timeout=15)\n        else:\n            requests.post(CTRL + "/api/kaggle-relay/push/" + job_id,\n                          headers=common, data=gen(), timeout=(10, None))\n        upstream.close()\n    except Exception as exc:\n        log("exec error " + type(exc).__name__)\n        push_fail(job_id, "relay client failed: " + type(exc).__name__)\n\n\ndef worker():\n    while True:\n        job = JOBS.get()\n        try:\n            execute(job)\n        except Exception as exc:\n            log("worker error " + type(exc).__name__)\n\n\ndef pull_loop():\n    while True:\n        try:\n            r = requests.get(CTRL + "/api/kaggle-relay/pull?channel=" + CHANNEL,\n                             headers={"X-Blackthorn-Key": KEY}, timeout=(6, 35))\n        except Exception as exc:\n            log("pull error " + type(exc).__name__)\n            time.sleep(1)\n            continue\n        if r.status_code == 204:\n            continue\n        if r.status_code != 200:\n            log("pull status " + str(r.status_code))\n            time.sleep(1)\n            continue\n        JOBS.put(r.json())\n\n\nlog("relay client started base=" + BASE + " ctrl=" + CTRL + " target=" + TARGET + " channel=" + CHANNEL)\nfor _ in range(WORKERS):\n    threading.Thread(target=worker, daemon=True).start()\npull_loop()\n'
+RELAY_CLIENT_CODE = '"""Render long-poll relay client for the Blackthorn Kaggle gateway.\n\nA dedicated thread always long-polls for work (so the hub can see the client is alive even\nwhile a response streams); worker threads execute jobs against the local gateway and stream\neach response back. Never exits: every failure is a short backoff.\n"""\nimport base64\nimport json\nimport queue\nimport sys\nimport threading\nimport time\n\nimport requests\n\nBASE = sys.argv[1].rstrip("/")\n# The published URL is the data plane (/gpu-relay/...); the control plane lives on the\n# app origin at /api/kaggle-relay/... — never ask for work through the data plane itself.\nCTRL = BASE[:-len("/gpu-relay")] if BASE.endswith("/gpu-relay") else BASE\nKEY = sys.argv[2]\nTARGET = sys.argv[3].rstrip("/")\nCHANNEL = (sys.argv[4] if len(sys.argv) > 4 else "model").strip() or "model"\nJOBS = queue.Queue()\nWORKERS = 3\n\n\ndef log(msg):\n    try:\n        with open("/tmp/relay_client.log", "a") as fh:\n            fh.write("%.1f %s\\n" % (time.time(), msg))\n    except Exception:\n        pass\n\n\ndef push_fail(job_id, text):\n    try:\n        requests.post(CTRL + "/api/kaggle-relay/push/" + job_id,\n                      headers={"X-Blackthorn-Key": KEY, "X-Relay-Status": "502",\n                               "X-Relay-Content-Type": "application/json"},\n                      data=json.dumps({"error": {"message": text}}), timeout=15)\n    except Exception:\n        pass\n\n\ndef execute(job):\n    body = job.get("body_b64") or ""\n    data = base64.b64decode(body) if body else b""\n    path = (job.get("path") or "").lstrip("/")\n    target = TARGET + "/" + path if path else TARGET + "/"\n    job_id = job["id"]\n    try:\n        upstream = requests.request(job.get("method") or "GET", target,\n                                    headers=job.get("headers") or {}, data=data,\n                                    stream=True, timeout=(10, 600))\n\n        def gen():\n            # read1 semantics: forward each piece the moment it arrives. iter_content(N)\n            # blocks until N bytes accumulate, which starves slow token streams (SSE pings\n            # never reach N) and wedges workers behind abandoned generations.\n            read1 = getattr(upstream.raw, "read1", None)\n            if read1 is not None:\n                while True:\n                    chunk = read1(65536)\n                    if not chunk:\n                        break\n                    yield chunk\n            else:\n                for chunk in upstream.iter_content(chunk_size=1):\n                    if chunk:\n                        yield chunk\n\n        common = {"X-Blackthorn-Key": KEY,\n                  "X-Relay-Status": str(upstream.status_code),\n                  "X-Relay-Content-Type": upstream.headers.get("Content-Type") or "application/octet-stream"}\n        if CHANNEL in ("computer", "model"):\n            # Render buffers streaming POST uploads (including model SSE).\n            # Acknowledged headers and bounded chunks keep both channels live.\n            head = requests.post(CTRL + "/api/kaggle-relay/headers/" + job_id,\n                                 headers=common, timeout=15)\n            if head.status_code == 200:\n                for chunk in gen():\n                    res = requests.post(CTRL + "/api/kaggle-relay/chunk/" + job_id,\n                                        headers={"X-Blackthorn-Key": KEY}, data=chunk, timeout=(10, 35))\n                    if res.status_code != 200:\n                        break\n                requests.post(CTRL + "/api/kaggle-relay/done/" + job_id,\n                              headers={"X-Blackthorn-Key": KEY}, timeout=15)\n        else:\n            requests.post(CTRL + "/api/kaggle-relay/push/" + job_id,\n                          headers=common, data=gen(), timeout=(10, None))\n        upstream.close()\n    except Exception as exc:\n        log("exec error " + type(exc).__name__)\n        push_fail(job_id, "relay client failed: " + type(exc).__name__)\n\n\ndef worker():\n    while True:\n        job = JOBS.get()\n        try:\n            execute(job)\n        except Exception as exc:\n            log("worker error " + type(exc).__name__)\n\n\ndef pull_loop():\n    while True:\n        try:\n            r = requests.get(CTRL + "/api/kaggle-relay/pull?channel=" + CHANNEL,\n                             headers={"X-Blackthorn-Key": KEY}, timeout=(6, 35))\n        except Exception as exc:\n            log("pull error " + type(exc).__name__)\n            time.sleep(1)\n            continue\n        if r.status_code == 204:\n            continue\n        if r.status_code != 200:\n            log("pull status " + str(r.status_code))\n            time.sleep(1)\n            continue\n        JOBS.put(r.json())\n\n\nlog("relay client started base=" + BASE + " ctrl=" + CTRL + " target=" + TARGET + " channel=" + CHANNEL)\nfor _ in range(WORKERS):\n    threading.Thread(target=worker, daemon=True).start()\npull_loop()\n'
 
 
 def launch_cloudflared(cloudflared_bin: str):

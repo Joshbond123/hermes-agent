@@ -199,6 +199,20 @@ def test_default_model_registration_prefers_direct_cuda_serving(srv, monkeypatch
     assert srv.posts == [("llama", str(model))]
 
 
+def test_gateway_routes_official_llama_engine_to_separate_port(srv, monkeypatch):
+    import builtins
+    real_open = builtins.open
+    def fake_open(path, *args, **kwargs):
+        if path == '/tmp/engine_mode.txt':
+            import io
+            return io.StringIO('llama')
+        return real_open(path, *args, **kwargs)
+    monkeypatch.setattr(builtins, 'open', fake_open)
+    assert f'OLLAMA_URL = "http://127.0.0.1:{srv.LLAMA_PORT}"' in srv.gateway_code()
+    monkeypatch.setattr(builtins, 'open', real_open)
+    assert srv.LLAMA_PORT != srv.OLLAMA_PORT
+
+
 def test_model_registration_does_not_delete_cached_blobs():
     import ast
     tree = ast.parse(SRC.read_text())
