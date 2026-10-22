@@ -479,7 +479,7 @@ _STEP_MAP: Dict[str, tuple] = {
     "BOOT_FAILED": (0, "Kaggle boot failed — see the reason below", "error"),
     "TUNNEL_ERROR": (100, "Connection Lost — the tunnel could not be created", "error"),
 }
-_TERMINAL_ERROR_STATUSES = ("GPU_UNAVAILABLE", "INTERNET_UNAVAILABLE", "MODEL_CORRUPT", "BOOT_FAILED", "TUNNEL_ERROR")
+_TERMINAL_ERROR_STATUSES = ("GPU_UNAVAILABLE", "INTERNET_UNAVAILABLE", "MODEL_CORRUPT", "BOOT_FAILED")
 
 _ACTIVITY_LOCK = threading.Lock()
 _LAST_ACTIVITY_TS = time.time()
@@ -1351,18 +1351,54 @@ def get_kaggle_gpu_status(force_refresh: bool = False) -> Dict[str, Any]:
                         _notify_tunnel_change("")
 
         if not tunnel_healthy:
+            # Boot stages that legitimately have no public tunnel yet (download can take 10–30+ min).
+            # A page refresh must NEVER mark these as OFF or TUNNEL_ERROR.
+            _BOOT_KEEP = {
+                "BOOTING_KAGGLE_GPU", "CHECKING_ENVIRONMENT", "CHECKING_CACHE", "CACHE_HIT", "CACHE_MISS",
+                "DOWNLOADING_MODEL", "MODEL_DOWNLOADED", "VERIFYING_MODEL", "INSTALLING_DEPS",
+                "INSTALLING_OLLAMA", "STARTING_OLLAMA", "LOADING_MODEL", "STARTING_GATEWAY",
+                "TUNNEL_ONLINE", "WARMING_GPU", "COM11_BOOTING", "COM11_RECONNECTING",
+            }
+            cur = str(state.get("status") or "").upper()
+            worker = str(state.get("worker_status") or "").upper()
+            is_boot_stage = cur in _BOOT_KEEP
+            kernel_alive = worker in ("RUNNING", "QUEUED", "PENDING")
+            # Long grace: 45 minutes from last D1 update while intentionally online/booting.
+            age = time.time() - float(d1_row.get("updated_at") or 0)
             is_recently_started = (
-                state["status"] != "GPU_STOPPED_SAVING_QUOTA"
-                and state["status"] != "OFF"
-                and (time.time() - float(d1_row.get("updated_at") or 0)) < 120
+                cur not in ("GPU_STOPPED_SAVING_QUOTA", "OFF", "")
+                and age < 2700
             )
-            if (state["worker_status"] in ("RUNNING", "QUEUED") or is_recently_started) and state["status"] != "GPU_STOPPED_SAVING_QUOTA":
+            user_stopped = cur in ("GPU_STOPPED_SAVING_QUOTA", "OFF")
+            if user_stopped:
                 state["active"] = False
-                state["booting"] = state["status"] not in _TERMINAL_ERROR_STATUSES
+                state["booting"] = False
+                state["status"] = "OFF" if cur == "OFF" else cur
+                state["tunnel_url"] = ""
+                state["progress_pct"] = 0
+                state["progress_step"] = "Kaggle GPU is OFF — Click 'Turn ON GPU' to launch"
+            elif is_boot_stage or kernel_alive or is_recently_started:
+                # Keep the boot alive across refreshes. TUNNEL_ERROR during an active
+                # kernel is treated as recoverable (relay/inrok may still come up).
+                state["active"] = False
+                if cur == "TUNNEL_ERROR" and (kernel_alive or is_recently_started):
+                    state["status"] = "STARTING_GATEWAY"
+                    state["progress_step"] = "Reconnecting public tunnel (relay)…"
+                    state["booting"] = True
+                    try:
+                        d1_query(
+                            "UPDATE kaggle_gpu_state SET status = ?, updated_at = ? "
+                            "WHERE id = 'primary' AND status = 'TUNNEL_ERROR';",
+                            ["STARTING_GATEWAY", time.time()],
+                        )
+                    except Exception:
+                        pass
+                else:
+                    state["booting"] = cur not in ("GPU_UNAVAILABLE", "INTERNET_UNAVAILABLE", "MODEL_CORRUPT", "BOOT_FAILED")
                 mapped = _STEP_MAP.get(state["status"])
                 if mapped:
                     state["progress_pct"], state["progress_step"] = mapped[0], mapped[1]
-                else:
+                elif not state.get("progress_step"):
                     state["progress_pct"] = 25
                     state["progress_step"] = "Provisioning Kaggle 2× Tesla T4 GPU container…"
             else:

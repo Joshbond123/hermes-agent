@@ -1776,16 +1776,43 @@ RELAY_CLIENT_CODE = '"""Render long-poll relay client for the Blackthorn Kaggle 
 def launch_cloudflared(cloudflared_bin: str):
     """Start the public tunnel and return (proc, public_url).
 
-    Order:
-    1. Inrok (INROK_API_KEY): https://<name>.share.inrok.in, the only production path.
-    2. Legacy, only when no Inrok key is set: Cloudflare named tunnel, Render relay, quick tunnel.
+    Order (reliable first):
+    1. Render long-poll relay when BLACKTHORN_RELAY_URL is set (stable through Kaggle).
+    2. Inrok named share when INROK_API_KEY is set.
+    3. Cloudflare named tunnel / quick tunnel as last resort.
     """
+    relay_base_early = (os.environ.get("BLACKTHORN_RELAY_URL") or "").strip().rstrip("/")
+    if relay_base_early:
+        try:
+            relay_path = "/tmp/relay_client.py"
+            with open(relay_path, "w") as fh:
+                fh.write(RELAY_CLIENT_CODE)
+            channel = "computer" if ROLE == "computer" else "model"
+            proc = subprocess.Popen(
+                [sys.executable, relay_path, relay_base_early, API_KEY, f"http://127.0.0.1:{GATEWAY_PORT}", channel],
+                stdout=open("/tmp/relay_client.out", "w"), stderr=subprocess.STDOUT, text=True,
+            )
+            public = relay_base_early + ("/computer" if channel == "computer" else "")
+            # Wait briefly for the client to register a puller on the hub.
+            deadline = time.time() + 45
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    log("⚠️ relay client exited early — trying other tunnels")
+                    break
+                time.sleep(2)
+                # Relay does not need a public HTTP probe from Kaggle; control plane is Render.
+                if proc.poll() is None:
+                    log(f"Stable relay: {public} (Render long-poll relay, channel={channel})")
+                    return proc, public
+            log("⚠️ relay did not stay up — falling back")
+        except Exception as exc:
+            log("❌ relay launch failed: " + type(exc).__name__ + ": " + str(exc)[:200] + " — falling back")
     if inrok_enabled():
         try:
             proc, url = launch_inrok()
             if proc is not None and url:
                 return proc, url
-            log("⚠️ inrok did not produce a live URL — falling back to Cloudflare/relay")
+            log("⚠️ inrok did not produce a live URL — falling back to Cloudflare")
         except Exception as exc:
             log("❌ inrok launch failed: " + type(exc).__name__ + ": " + str(exc)[:200] + " — falling back")
     cf_log_path = "/tmp/cloudflared.log"
