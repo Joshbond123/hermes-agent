@@ -150,6 +150,7 @@ class ToolContext:
     session_id: str = ""
     run_id: str = ""
     board: Any = None              # the run's TaskBoard (persistent task list); None outside a run
+    user_message: str = ""         # latest real user request for the board's durable goal
 
 
 Handler = Callable[[Dict[str, Any], ToolContext], Awaitable[ToolResult]]

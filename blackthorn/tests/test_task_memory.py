@@ -530,3 +530,99 @@ async def test_todo_persistence_round_trip(file_db):
         assert other.items == [], "task state leaked across sessions"
     finally:
         stack.kill()
+
+async def test_task_origin_survives_long_history_and_restart(file_db):
+    db_path, static_dir = file_db
+    one = FileStack(db_path, static_dir)
+    await one.ready()
+    anchor = 'ORIGINAL-GOAL-6841: keep all three migration conditions and verify the final result'
+    one.backend.queue([todos(('1', 'run checks', 'pending'), ('2', 'publish result', 'pending'),
+                             cid='plan', merge=False), finish('tool_calls')],
+                      [*say('Work in progress.'), finish('stop')])
+    out = await one.stream({'message': anchor})
+    sid = [e for e in out if e['type'] == 'run.start'][0]['session_id']
+    for n in range(28):  # more messages than the 48-message history window
+        one.backend.queue([*say('not yet'), finish('stop')])
+        await one.stream({'session_id': sid, 'message': f'Progress check {n}'})
+    one.kill()
+    two = FileStack(db_path, static_dir)
+    try:
+        await two.ready()
+        board = await TaskBoard.load(two.services.store, sid)
+        assert board.goal == anchor
+        two.backend.queue([*say('Continuing'), finish('stop')])
+        await two.stream({'session_id': sid, 'message': 'continue the original task'})
+        wire = json.dumps(two.backend.requests[-1]['messages'], ensure_ascii=False)
+        assert anchor in wire
+        assert 'ORIGINAL-GOAL-6841' in wire and 'publish result' in wire
+    finally:
+        two.kill()
+
+
+async def test_task_save_failure_does_not_claim_saved(stack, monkeypatch):
+    async def cannot_save(*args):
+        raise OSError('storage write failed')
+    monkeypatch.setattr(stack.services.store, 'save_task_state', cannot_save)
+    stack.backend.queue([todos(('1', 'do durable work', 'pending'), merge=False), finish('tool_calls')],
+                        [*say('Persistence failed; no task saved.'), finish('stop')])
+    out = await stack.stream({'message': 'do durable work'})
+    assert 'NOT saved' in json.dumps(out.of('tool.end')) or any(
+        e.get('status') == 'error' and e.get('name') == 'todo_list' for e in out.of('tool.end'))
+    board = await TaskBoard.load(stack.services.store, out.session_id)
+    assert board.items == [] and board.goal == ''
+
+
+async def test_unavailable_task_storage_blocks_model_not_forgets_tasks(stack, monkeypatch):
+    async def cannot_read(*args):
+        raise OSError('database unavailable')
+    monkeypatch.setattr(stack.services.store, 'load_task_state', cannot_read)
+    response = await stack.stream({'message': 'continue the saved migration'})
+    assert response.status == 503
+    assert response.error_body['detail']['code'] == 'task_storage_unavailable'
+    assert stack.backend.requests == []
+
+
+async def test_legacy_list_only_plan_loads_without_goal(file_db):
+    db_path, static_dir = file_db
+    stack = FileStack(db_path, static_dir)
+    try:
+        await stack.ready()
+        await stack.services.store.set_setting('bt_todo:studio-old',
+            json.dumps([{'id':'1','content':'restore old plan','status':'pending'}]))
+        board = await TaskBoard.load(stack.services.store, 'studio-old')
+        assert board.goal == '' and board.pending()[0]['content'] == 'restore old plan'
+    finally:
+        stack.kill()
+
+async def test_session_search_returns_scoped_actual_messages_not_invented_results(file_db):
+    from blackthorn.tools.memory import session_search
+    from blackthorn.tools.base import ToolContext
+    db_path, static_dir = file_db
+    stack = FileStack(db_path, static_dir)
+    try:
+        await stack.ready()
+        store = stack.services.store
+        sid = (await store.begin_turn(None, 'MIGRATION-SEARCH-914: check tests and publish', model='m'))['session_id']
+        await store.db.query("INSERT INTO sessions (id,source,title) VALUES ('other','foreign','private')")
+        await store.db.query("INSERT INTO messages (session_id,role,content,active) VALUES ('other','user',?,1)",
+                             ['MIGRATION-SEARCH-914: foreign source secret'])
+        rows = await store.search_session_messages('MIGRATION-SEARCH-914')
+        assert len(rows) == 1 and rows[0]['session_id'] == sid
+        ctx = ToolContext(settings=stack.services.settings, store=store, computer=None, http=None, tavily=None)
+        result = await session_search({'query':'MIGRATION-SEARCH-914'}, ctx)
+        assert result.ok and sid in result.content and 'foreign source secret' not in result.content
+        assert (await session_search({'query':'something-that-isnt-here'}, ctx)).content.startswith('No matching')
+    finally:
+        stack.kill()
+
+
+async def test_corrupt_persisted_plan_is_not_silently_reset(file_db):
+    db_path, static_dir = file_db
+    stack = FileStack(db_path, static_dir)
+    try:
+        await stack.ready()
+        await stack.services.store.set_setting('bt_todo:studio-broken', '{not JSON')
+        with pytest.raises(ValueError):
+            await TaskBoard.load(stack.services.store, 'studio-broken')
+    finally:
+        stack.kill()

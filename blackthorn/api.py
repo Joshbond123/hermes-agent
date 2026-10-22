@@ -259,17 +259,27 @@ async def chat_stream(body: StreamRequest, request: Request):
         log.error("could not start turn: %s", exc)
         raise _err(502, "storage_unavailable", "Could not save your message (history storage is unavailable). Nothing was sent; try again.")
 
-    run = s.runs.create(begin["session_id"], begin["assistant_uid"])
-    run.emit("run.start", run_id=run.id, session_id=begin["session_id"], assistant_id=begin["assistant_uid"],
-             user_id=begin.get("user_uid"), model=route.model, session=begin["session"], created=begin["created"])
     # The session's task list is restored before the run starts, so a follow-up ("continue"), a restart
     # or a compacted context all resume the same plan instead of restarting it.
-    board = await TaskBoard.load(s.store, begin["session_id"])
+    try:
+        board = await TaskBoard.load(s.store, begin["session_id"])
+    except Exception:
+        # A missing D1 read must not silently turn an unfinished job into an empty plan.
+        await s.store.update_assistant(begin["assistant_uid"], text="", parts=[], status="interrupted")
+        raise _err(503, "task_storage_unavailable", "Could not restore the saved task list; nothing was sent to the model. Retry later.")
     if board.items and not board.is_open():
         # The previous plan is finished: drop it so a new request is not steered by a stale list.
         # The evidence of what ran is not lost — it lives in each turn's execution ledger.
         board.write([], merge=False)
-        await board.save()
+        board.goal = ""
+        try:
+            await board.save()
+        except Exception:
+            await s.store.update_assistant(begin["assistant_uid"], text="", parts=[], status="interrupted")
+            raise _err(503, "task_storage_unavailable", "Could not clear the completed task list; retry later.")
+    run = s.runs.create(begin["session_id"], begin["assistant_uid"])
+    run.emit("run.start", run_id=run.id, session_id=begin["session_id"], assistant_id=begin["assistant_uid"],
+             user_id=begin.get("user_uid"), model=route.model, session=begin["session"], created=begin["created"])
     resume_hint = ""
     if begin.get("previous_attempt"):
         resume_hint = ("The previous answer to this request was discarded by the user. Steps it had already run are "

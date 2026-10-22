@@ -17,6 +17,8 @@ export function SettingsDialog({
   const [promptOpen, setPromptOpen] = useState(false)
   const [currentPassword, setCurrentPassword] = useState('')
   const [newPassword, setNewPassword] = useState('')
+  const [confirmPassword, setConfirmPassword] = useState('')
+  const [passwordBusy, setPasswordBusy] = useState(false)
   const [passwordMessage, setPasswordMessage] = useState('')
 
   return (
@@ -55,12 +57,23 @@ export function SettingsDialog({
             <h3 className="settings-h">Account</h3>
             <form onSubmit={async (e) => {
               e.preventDefault(); setPasswordMessage('')
-              try { await api.auth.reset(currentPassword, newPassword); setCurrentPassword(''); setNewPassword(''); setPasswordMessage('Password changed. Other sessions have been signed out.') }
-              catch (err) { setPasswordMessage(err instanceof ApiError ? err.message : 'Could not reset password') }
+              if (passwordBusy) return
+              if (newPassword !== confirmPassword) { setPasswordMessage('New passwords do not match.'); return }
+              if (currentPassword === newPassword) { setPasswordMessage('Choose a different new password.'); return }
+              setPasswordBusy(true)
+              try {
+                await api.auth.reset(currentPassword, newPassword)
+                setCurrentPassword(''); setNewPassword(''); setConfirmPassword('')
+                setPasswordMessage('Password changed. Other sessions have been signed out.')
+              } catch (err) {
+                setPasswordMessage(err instanceof ApiError ? err.message : 'Could not change password')
+              } finally { setPasswordBusy(false) }
             }}>
-              <label className="field">Current password <input type="password" autoComplete="current-password" value={currentPassword} onChange={e => setCurrentPassword(e.target.value)} required /></label>
-              <label className="field">New password (16+ characters) <input type="password" autoComplete="new-password" minLength={16} value={newPassword} onChange={e => setNewPassword(e.target.value)} required /></label>
-              <button className="btn" type="submit">Change password</button>
+              <p className="muted small">Change your owner password here. You will stay signed in; other sessions will be signed out.</p>
+              <label className="field">Current password <input type="password" autoComplete="current-password" value={currentPassword} onChange={e => setCurrentPassword(e.target.value)} required disabled={passwordBusy} /></label>
+              <label className="field">New password (16+ characters) <input type="password" autoComplete="new-password" minLength={16} value={newPassword} onChange={e => setNewPassword(e.target.value)} required disabled={passwordBusy} /></label>
+              <label className="field">Confirm new password <input type="password" autoComplete="new-password" minLength={16} value={confirmPassword} onChange={e => setConfirmPassword(e.target.value)} required disabled={passwordBusy} /></label>
+              <button className="btn" type="submit" disabled={passwordBusy}>{passwordBusy ? 'Changing…' : 'Change password'}</button>
               {passwordMessage && <p role="status" className="muted small">{passwordMessage}</p>}
             </form>
             <button type="button" className="btn" onClick={() => void api.auth.logout().then(() => window.location.reload())}>Sign out</button>

@@ -396,19 +396,54 @@ class ChatStore:
         await self.db.query("DELETE FROM state_meta WHERE key = ?", [key])
 
     # ------------------------------------------------------------------ task state (todo / checkpoint)
-    async def load_todos(self, session_id: str) -> List[Dict[str, Any]]:
-        """Persisted task list for a session (Hermes keeps goals in ``state_meta`` too)."""
+    async def load_task_state(self, session_id: str) -> Dict[str, Any]:
+        """Read a session's durable goal and plan; accept legacy list-only rows.
+
+        A malformed nonempty value is a storage error, never an empty task list.
+        """
         raw = await self.get_setting(f"{TODO_KEY}{session_id}")
         if not raw:
-            return []
-        try:
-            data = json.loads(raw)
-        except (TypeError, ValueError):
-            return []
-        return [i for i in data if isinstance(i, dict)] if isinstance(data, list) else []
+            return {"goal": "", "todos": []}
+        data = json.loads(raw)
+        if isinstance(data, list):
+            data = {"goal": "", "todos": data}
+        if not isinstance(data, dict) or not isinstance(data.get("todos"), list):
+            raise ValueError("saved task state is invalid")
+        return {"goal": str(data.get("goal") or "")[:2000],
+                "todos": [i for i in data["todos"] if isinstance(i, dict)][:256]}
+
+    async def save_task_state(self, session_id: str, items: List[Dict[str, Any]], goal: str) -> None:
+        await self.set_setting(f"{TODO_KEY}{session_id}", dumps({"v": 2, "goal": goal[:2000], "todos": items[:256]}))
+
+    async def load_todos(self, session_id: str) -> List[Dict[str, Any]]:
+        return (await self.load_task_state(session_id))["todos"]
 
     async def save_todos(self, session_id: str, items: List[Dict[str, Any]]) -> None:
-        await self.set_setting(f"{TODO_KEY}{session_id}", dumps(items[:256]))
+        previous = await self.load_task_state(session_id)
+        await self.save_task_state(session_id, items, previous["goal"])
+
+    async def search_session_messages(self, query: str, *, session_id: str = "", limit: int = 5) -> List[Dict[str, Any]]:
+        """Search actual Blackthorn messages, never other Hermes profiles or source rows.
+
+        D1 does not provide the upstream SQLite FTS5 index; use a bounded,
+        parameterized literal LIKE query instead of pretending to offer FTS.
+        """
+        term = (query or "").strip()[:120]
+        if len(term) < 2:
+            return []
+        escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        sid_clause = " AND m.session_id = ?" if session_id else ""
+        params: List[Any] = [self.source, f"%{escaped}%"]
+        if session_id:
+            params.append(session_id)
+        params.append(max(1, min(int(limit), 8)))
+        res = await self.db.query(
+            "SELECT m.session_id, m.role, m.content, m.finish_reason, m.id, "
+            "COALESCE(s.title, '') AS title FROM messages m JOIN sessions s ON s.id = m.session_id "
+            "WHERE s.source = ? AND COALESCE(m.active,1) = 1 "
+            "AND m.role IN ('user','assistant') AND m.content LIKE ? ESCAPE '\\'" + sid_clause +
+            " ORDER BY m.id DESC LIMIT ?", params)
+        return [dict(row) for row in res.rows]
 
     async def list_memories(self, limit: int = 8) -> List[str]:
         # ``hermes_memories`` is shared with the rest of the Hermes install. Only this product's rows

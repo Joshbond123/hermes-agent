@@ -233,7 +233,9 @@ class AgentRun:
     def _state_block(self) -> str:
         """Ephemeral machine-generated state layer, injected per API call (Hermes does the same)."""
         todos = self.board.read() if self.board is not None else []
-        return prompts.task_state_block(goal=self.user_message, todos=todos, ledger=self.ledger,
+        return prompts.task_state_block(goal=self.user_message,
+                                        task_goal=self.board.goal if self.board is not None and self.board.is_open() else "",
+                                        todos=todos, ledger=self.ledger,
                                         prior_steps=self._prior_steps(),
                                         previous_attempt=self.previous_attempt, resume_hint=self.resume_hint)
 
@@ -428,7 +430,8 @@ class AgentRun:
         text = (self.user_message or "").strip().lower()
         if step <= 1 and len(text) < 48:
             keys = ("run", "file", "search", "code", "install", "browse", "skill", "computer",
-                    "write", "read", "exec", "git", "http", "scan", "tool", "ls", "mkdir", "pip", "npm")
+                    "write", "read", "exec", "git", "http", "scan", "tool", "ls", "mkdir", "pip", "npm",
+                    "remember", "previous", "history", "earlier", "task", "continue", "recall")
             if not any(k in text for k in keys):
                 return None
         return self._schemas
@@ -678,7 +681,7 @@ class AgentRun:
 
         ctx = ToolContext(settings=s, store=self.deps.store, computer=self.deps.computer, http=self.deps.http,
                           tavily=self.deps.tavily, session_id=self.run.session_id, run_id=self.run.id,
-                          board=self.board)
+                          board=self.board, user_message=self.user_message)
         # Every call the model asked for is executed — none are ever dropped or skipped.
         # max_calls_per_step bounds *concurrency* (protects the GPU computer from a stampede),
         # not how much work a step may do. Each call reports its result the moment it finishes

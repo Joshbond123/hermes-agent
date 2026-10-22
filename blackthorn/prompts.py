@@ -17,7 +17,8 @@ BASE_PROMPT = (
     "remote computer). Greetings, chit-chat and general knowledge never need a tool.\n"
     "The remote computer is a Linux machine (2×T4 GPU) with workspace /kaggle/working/blackthorn_workspace.\n"
     "Be honest: if a tool fails, say what failed; never claim you ran something you did not run, and never repeat "
-    "a tool call that already returned a result. Never state facts about the remote computer (whether a file exists, "
+    "a tool call that already returned a result. Use session_search to check prior conversations when the current "
+    "context lacks an earlier request; an earlier assistant answer is a claim, not proof. Never state facts about the remote computer (whether a file exists, "
     "what a command prints, whether something worked) without checking with a tool first.\n"
     "Reply in Markdown; put code in fenced blocks with a language tag. Keep answers concise."
 )
@@ -461,7 +462,8 @@ def compile_history(turns: Sequence[Dict[str, Any]], budget_tokens: int, chars_p
     return _alternate(messages), len(dropped_turns), summary
 
 
-def task_state_block(*, goal: str = "", todos: Sequence[Dict[str, Any]] = (), ledger: Sequence[Dict[str, Any]] = (),
+def task_state_block(*, goal: str = "", task_goal: str = "", todos: Sequence[Dict[str, Any]] = (),
+                     ledger: Sequence[Dict[str, Any]] = (),
                      prior_steps: Sequence[Dict[str, Any]] = (), previous_attempt: Optional[Dict[str, Any]] = None,
                      resume_hint: str = "") -> str:
     """Ephemeral, machine-generated state layer (Hermes injects these per API call, never persists them).
@@ -471,7 +473,10 @@ def task_state_block(*, goal: str = "", todos: Sequence[Dict[str, Any]] = (), le
     """
     blocks: List[str] = []
     if goal.strip():
-        blocks.append(f"Goal: {one_line(goal, 260)}")
+        blocks.append(f"Current user request: {one_line(goal, 260)}")
+    if task_goal.strip() and task_goal.strip() != goal.strip():
+        blocks.append("Original active task (saved with the plan; newer user instructions take precedence): "
+                      + one_line(task_goal, 1400))
     if todos:
         marks = {"completed": "[x]", "in_progress": "[>]", "pending": "[ ]", "cancelled": "[~]"}
         lines = []

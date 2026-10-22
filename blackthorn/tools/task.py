@@ -70,19 +70,18 @@ def _normalize_item(raw: Any, position: int, *, existing: Sequence[Dict[str, Any
 class TaskBoard:
     """One session's task list: in-memory during a run, persisted after every write."""
 
-    def __init__(self, store: Any = None, session_id: str = "", items: Optional[Sequence[Dict[str, Any]]] = None) -> None:
+    def __init__(self, store: Any = None, session_id: str = "", items: Optional[Sequence[Dict[str, Any]]] = None,
+                 goal: str = "") -> None:
         self.store = store
         self.session_id = session_id or ""
+        self.goal = goal[:2000]
         self.items: List[Dict[str, str]] = _normalize(items or [])
         self._revision = 0
 
     @classmethod
     async def load(cls, store: Any, session_id: str) -> "TaskBoard":
-        try:
-            items = await store.load_todos(session_id)
-        except Exception:  # noqa: BLE001 - a missing task list must never break a turn
-            items = []
-        return cls(store, session_id, items)
+        state = await store.load_task_state(session_id)
+        return cls(store, session_id, state["todos"], state["goal"])
 
     # ------------------------------------------------------------------ reads
     def read(self) -> List[Dict[str, str]]:
@@ -154,10 +153,9 @@ class TaskBoard:
     async def save(self) -> None:
         if self.store is None or not self.session_id:
             return
-        try:
-            await self.store.save_todos(self.session_id, self.read())
-        except Exception:  # noqa: BLE001 - persistence is best-effort; the run must continue
-            pass
+        # A failed write must reach the tool result; claiming "Saved" here would
+        # manufacture a memory the next worker cannot actually recover.
+        await self.store.save_task_state(self.session_id, self.read(), self.goal)
 
 
 async def todo_list(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
@@ -171,8 +169,15 @@ async def todo_list(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
     if not isinstance(todos, list):
         return ToolResult.failure("invalid arguments for todo_list: 'todos' must be a list of objects",
                                   hint='Send [{"id": "1", "content": "...", "status": "completed"}].')
+    prior, prior_goal = board.read(), board.goal
+    if not board.items and todos:
+        board.goal = " ".join(str(getattr(ctx, "user_message", "") or "").split())[:2000]
     items = board.write(todos, merge=bool(args.get("merge", True)))
-    await board.save()
+    try:
+        await board.save()
+    except Exception:
+        board.items, board.goal = prior, prior_goal
+        return ToolResult.failure("Task list was NOT saved. Persistent storage is unavailable; retry later.")
     return ToolResult(ok=True, content=board.format() + "\nSaved. Do the next pending item now.",
                       summary=f"{len(items)} task(s)", data={"todos": items})
 
