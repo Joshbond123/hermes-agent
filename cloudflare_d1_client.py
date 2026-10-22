@@ -618,14 +618,15 @@ def _durable_active_runs() -> Optional[int]:
 
 
 def _auto_off_stop() -> Dict[str, Any]:
-    """Auto-off applies only to model accounts. The computer has an independent lifecycle."""
+    """Stop both fleet roles after verified inactivity and a computer checkpoint."""
     from blackthorn.fleet import accounts_from_env
     leases = _durable_active_runs()
     if leases is None or leases:
         return {"model": {"status": "stop_refused", "error": "active run or activity unavailable"}}
     if accounts_from_env(os.environ):
-        # Model inactivity must NEVER power off the independently hosted computer.
-        return turn_off_fleet(blocking=True, source="auto-off", roles=("model",))
+        # turn_off_fleet independently probes computer activity, checkpoints the
+        # workspace, and refuses BOTH stops if either fact cannot be verified.
+        return turn_off_fleet(blocking=True, source="auto-off", roles=("model", "computer"))
     return turn_off_kaggle_gpu()
 
 
@@ -740,8 +741,12 @@ def auto_off_decision() -> Dict[str, Any]:
         return decided
     comp = dict(_COMPUTER_ACTIVITY)
     decided["computer_jobs"] = int(comp.get("active_jobs") or 0)
-    # Computer jobs and reachability are reported, but do not consume model GPU quota.
-    # The computer role is excluded from model auto-off and has its own explicit shutdown.
+    if not comp.get("known"):
+        decided["reason"] = "computer activity could not be verified; preserving both roles"
+        return decided
+    if decided["computer_jobs"]:
+        decided["reason"] = f"{decided['computer_jobs']} computer job(s) still active"
+        return decided
     remaining = minutes * 60 - snap["idle_seconds"]
     if remaining <= 0:
         decided["should_stop"] = True

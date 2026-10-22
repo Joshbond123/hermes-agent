@@ -216,3 +216,33 @@ async def test_enrolled_computer_never_falls_back_to_model_puller(stack, monkeyp
         response = await c.get(f"{stack.url}/gpu-relay/computer/health")
     assert response.status_code == 502
     assert not stack.services.relay_hubs.get('model')  # never dispatched to model
+
+
+async def test_computer_chunked_long_reply_survives_header_wait(stack, monkeypatch):
+    import time
+    monkeypatch.setattr(relay_mod, "HEADERS_TIMEOUT_S", 0.5)
+    await stack.executor.query(
+        "INSERT OR REPLACE INTO kaggle_gpu_state (id,status,tunnel_url,api_key,model,gpu_info,updated_at) "
+        "VALUES ('computer','HEARTBEAT_ONLINE','', 'test-key','','', ?)", [time.time()])
+    call = asyncio.create_task(_proxy(stack, path="computer/exec", method="GET", body=b""))
+    await asyncio.sleep(0.05)
+    async with httpx.AsyncClient(timeout=10) as c:
+        pull = await c.get(f"{stack.url}/api/kaggle-relay/pull?channel=computer",
+                           headers={"X-Blackthorn-Key": KEY})
+        assert pull.status_code == 200
+        job = pull.json()
+        assert job['path'] == '/computer/exec'
+        headers = {"X-Blackthorn-Key": KEY, "X-Relay-Status": "200",
+                   "X-Relay-Content-Type": "application/json"}
+        head = await c.post(f"{stack.url}/api/kaggle-relay/headers/{job['id']}", headers=headers)
+        assert head.status_code == 200
+        await asyncio.sleep(0.65)  # longer than HEADERS_TIMEOUT_S after header acknowledgement
+        first = await c.post(f"{stack.url}/api/kaggle-relay/chunk/{job['id']}",
+                             headers={"X-Blackthorn-Key": KEY}, content=b" ")
+        second = await c.post(f"{stack.url}/api/kaggle-relay/chunk/{job['id']}",
+                              headers={"X-Blackthorn-Key": KEY}, content=b'{"ok":true}')
+        done = await c.post(f"{stack.url}/api/kaggle-relay/done/{job['id']}",
+                            headers={"X-Blackthorn-Key": KEY})
+        assert first.status_code == second.status_code == done.status_code == 200
+    response = await call
+    assert response.status_code == 200 and response.json() == {"ok": True}

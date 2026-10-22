@@ -254,6 +254,59 @@ async def relay_push(request: Request, job_id: str):
     return JSONResponse({"ok": True})
 
 
+# Render can buffer a chunked HTTP upload until completion. Long computer
+# commands then have no response headers for 45+ seconds even though the local
+# gateway yields keepalives. Use small, separately acknowledged POSTs for the
+# dedicated computer channel; leave model token streaming on the existing path.
+def _find_inflight(request: Request, job_id: str):
+    hubs = getattr(request.app.state.bt, "relay_hubs", {}) or {}
+    for hub in hubs.values():
+        job = hub.inflight.get(job_id)
+        if job is not None:
+            return hub, job
+    return None, None
+
+
+async def relay_headers(request: Request, job_id: str):
+    if not _authed(request, await _row_keys(request)):
+        raise HTTPException(status_code=401, detail={"code": "relay_auth"})
+    hub, job = _find_inflight(request, job_id)
+    if job is None or job.closed or hub is not (getattr(request.app.state.bt, "relay_hubs", {}) or {}).get("computer"):
+        return JSONResponse({"dropped": True}, status_code=410)
+    job.status = int(request.headers.get("x-relay-status") or 200)
+    job.content_type = request.headers.get("x-relay-content-type") or "application/octet-stream"
+    job.pushed = True
+    job.headers_ready.set()
+    hub.last_seen = time.monotonic()
+    return {"ok": True}
+
+
+async def relay_chunk(request: Request, job_id: str):
+    if not _authed(request, await _row_keys(request)):
+        raise HTTPException(status_code=401, detail={"code": "relay_auth"})
+    hub, job = _find_inflight(request, job_id)
+    if job is None or job.closed or not job.pushed or hub is not (getattr(request.app.state.bt, "relay_hubs", {}) or {}).get("computer"):
+        return JSONResponse({"dropped": True}, status_code=410)
+    chunk = await request.body()
+    if len(chunk) > 1_000_000:
+        raise HTTPException(status_code=413, detail={"code": "relay_chunk_too_large"})
+    if chunk and not await _put_chunk(job, chunk, hub):
+        return JSONResponse({"dropped": True}, status_code=410)
+    hub.last_seen = time.monotonic()
+    return {"ok": True}
+
+
+async def relay_done(request: Request, job_id: str):
+    if not _authed(request, await _row_keys(request)):
+        raise HTTPException(status_code=401, detail={"code": "relay_auth"})
+    hub, job = _find_inflight(request, job_id)
+    if job is None or job.closed or hub is not (getattr(request.app.state.bt, "relay_hubs", {}) or {}).get("computer"):
+        return JSONResponse({"dropped": True}, status_code=410)
+    await _put_chunk(job, None, hub)
+    hub.last_seen = time.monotonic()
+    return {"ok": True}
+
+
 # --------------------------------------------------------------------------- data plane (agent side)
 async def relay_proxy(request: Request, path: str = ""):
     """Any method, any path under /gpu-relay/: pipe it to the notebook gateway and stream back.
@@ -367,6 +420,9 @@ async def relay_proxy(request: Request, path: str = ""):
 def register(router: APIRouter) -> None:
     router.add_api_route("/api/kaggle-relay/pull", relay_pull, methods=["GET"])
     router.add_api_route("/api/kaggle-relay/push/{job_id}", relay_push, methods=["POST"])
+    router.add_api_route("/api/kaggle-relay/headers/{job_id}", relay_headers, methods=["POST"])
+    router.add_api_route("/api/kaggle-relay/chunk/{job_id}", relay_chunk, methods=["POST"])
+    router.add_api_route("/api/kaggle-relay/done/{job_id}", relay_done, methods=["POST"])
     router.add_api_route("/gpu-relay/{path:path}", relay_proxy,
                          methods=["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
     router.add_api_route("/gpu-relay", relay_proxy, methods=["GET", "HEAD", "POST"], include_in_schema=False)

@@ -1,4 +1,4 @@
-"""Model auto-off stops model accounts, but NEVER shuts down the computer role."""
+"""Server-side inactivity stops both fleet roles only after the workspace checkpoint."""
 
 import ast
 from pathlib import Path
@@ -37,7 +37,7 @@ def test_auto_off_stops_backup_accounts_when_fleet_configured(monkeypatch):
     import blackthorn.fleet as fleet
     monkeypatch.setattr(fleet, "accounts_from_env", lambda env: ["primary-account", "backup-account"])
     m._auto_off_stop()
-    assert calls == [("fleet", True, ("model",))]
+    assert calls == [("fleet", True, ("model", "computer"))]
 
 
 def test_auto_off_uses_the_single_session_when_no_fleet(monkeypatch):

@@ -121,10 +121,10 @@ def test_model_auto_off_never_stops_busy_computer(monkeypatch):
     monkeypatch.setattr(d1, "_durable_active_runs", lambda: 0)
     monkeypatch.setattr(d1, "turn_off_fleet", lambda blocking, source, roles: stops.append(roles) or {})
     d1._auto_off_stop()
-    assert stops == [("model",)]
+    assert stops == [("model", "computer")]
     monkeypatch.setattr(d1, "_durable_active_runs", lambda: 1)
     result = d1._auto_off_stop()
-    assert result["model"]["status"] == "stop_refused" and stops == [("model",)]
+    assert result["model"]["status"] == "stop_refused" and stops == [("model", "computer")]
 
 
 def test_explicit_shutdown_refuses_active_task_and_unknown_computer(monkeypatch):
