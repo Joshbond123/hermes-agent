@@ -186,6 +186,55 @@ class FleetManager:
                 return {"slug": str(k.get("ref") or k.get("slug") or ""), "title": str(k.get("title") or "")}
         return None
 
+    def purge_running_sessions(self, account: Account, *, keep_slug: str = "") -> int:
+        """Delete every running GPU session on this account (Kaggle hard-caps concurrent at 2).
+
+        Returns how many DeleteKernel calls were accepted. Prefer keeping ``keep_slug`` if it is
+        already the session we intend to reuse; everything else that looks like a Blackthorn
+        kernel (or any kernel still reported RUNNING) is stopped so CreateKernelSession can succeed.
+        """
+        keep_name = keep_slug.split("/", 1)[-1] if keep_slug else ""
+        stopped = 0
+        try:
+            listing = self.rpc(account, "ListKernels", {"pageSize": 100, "user": account.user})
+        except FleetError as exc:
+            log.warning("purge_running_sessions: ListKernels failed for %s: %s", account.user, exc)
+            return 0
+        kernels = listing.get("kernels") or listing.get("results") or []
+        for k in kernels:
+            ref = str(k.get("ref") or k.get("slug") or "")
+            name = ref.split("/", 1)[-1] if ref else ""
+            title = str(k.get("title") or "")
+            if not name:
+                continue
+            if keep_name and name == keep_name:
+                continue
+            # Prefer Blackthorn kernels; also try any kernel that still has a live session.
+            is_ours = title.startswith("Blackthorn ") or "blackthorn" in name.lower()
+            if not is_ours:
+                # Probe session status — only delete if it is actively consuming a GPU slot.
+                try:
+                    sess = self.rpc(account, "GetKernelSessionStatus",
+                                    {"userName": account.user, "kernelSlug": name})
+                    st = str((sess or {}).get("status") or "").upper()
+                    if st not in ("RUNNING", "QUEUED", "PENDING"):
+                        continue
+                except FleetError:
+                    continue
+            try:
+                self.rpc(account, "DeleteKernel", {"userName": account.user, "kernelSlug": name})
+                stopped += 1
+                log.info("purged running session %s/%s (title=%r)", account.user, name, title[:60])
+            except FleetError as exc:
+                low = str(exc).lower()
+                if "not found" in low or "404" in low or "does not exist" in low:
+                    continue
+                log.warning("purge DeleteKernel %s/%s: %s", account.user, name, str(exc)[:120])
+        if stopped:
+            import time as _t
+            _t.sleep(4)  # let Kaggle release the concurrent slots
+        return stopped
+
     def stop_kernel_session(self, account: Account, slug: str) -> bool:
         """Boolean view of :meth:`stop_kernel_result` (True only when a running session was verified stopped)."""
         return self.stop_kernel_result(account, slug)["state"] == "stopped"
@@ -296,6 +345,13 @@ class FleetManager:
             self.stop_kernel_session(account, slug)          # stale sessions ignore pushes
         except Exception:  # noqa: BLE001 - stopping is best effort
             pass
+        # Proactively free concurrent GPU slots (Kaggle hard-cap is 2). Keep our target
+        # slug if it is already the one we will re-use; delete every other Blackthorn
+        # (and any other RUNNING) session so CreateKernelSession cannot hit the limit.
+        try:
+            self.purge_running_sessions(account, keep_slug=slug)
+        except Exception as purge_exc:  # noqa: BLE001
+            log.debug("proactive purge note: %s", purge_exc)
         payload: Dict[str, Any] = {
             "slug": slug, "newTitle": title, "text": notebook_text,
             "language": "python", "kernelType": "notebook", "isPrivate": True,
@@ -342,6 +398,21 @@ class FleetManager:
                 if "ALREADY_EXISTS" in msg or "already running" in msg.lower() or "409" in msg:
                     log.info("CreateKernelSession: session already running for %s", full_slug)
                     running = True
+                elif "Maximum batch" in msg or "session count" in msg.lower() or "concurrent" in msg.lower():
+                    # Kaggle hard-caps concurrent GPU sessions (usually 2). Purge every
+                    # other live session on this account, then retry once.
+                    log.warning("CreateKernelSession hit concurrent limit for %s — purging stale sessions",
+                                full_slug)
+                    self.purge_running_sessions(account, keep_slug=full_slug)
+                    try:
+                        self.rpc(account, "CreateKernelSession", {"slug": full_slug})
+                        running = True
+                    except FleetError as retry_exc:
+                        rmsg = str(retry_exc)
+                        if "ALREADY_EXISTS" in rmsg or "already running" in rmsg.lower():
+                            running = True
+                        else:
+                            log.warning("CreateKernelSession retry after purge failed: %s", rmsg[:200])
                 else:
                     log.warning("CreateKernelSession for %s: %s", full_slug, msg[:200])
             import time as _t
@@ -351,11 +422,22 @@ class FleetManager:
                     running = True
                     break
         if not running:
+            # Last chance: purge everything (including our own prior session) and recreate.
+            self.purge_running_sessions(account, keep_slug="")
             try:
                 self.rpc(account, "CreateKernelSession", {"slug": full_slug})
+                running = True
             except FleetError as exc:
                 if "ALREADY_EXISTS" in str(exc) or "already running" in str(exc).lower():
                     running = True
+                else:
+                    log.warning("CreateKernelSession final attempt: %s", str(exc)[:200])
+            import time as _t
+            for _ in range(6):
+                _t.sleep(2)
+                if _session_running():
+                    running = True
+                    break
         if not running and out.get("error"):
             raise FleetError(
                 f"Kaggle rejected the GPU session for {full_slug}: {out.get('error')}. "
@@ -368,7 +450,8 @@ class FleetManager:
         if not running:
             raise FleetError(
                 f"No RUNNING Kaggle session for {full_slug} after SaveKernel/CreateKernelSession. "
-                f"version={out.get('versionNumber')!r} error={out.get('error')!r}."
+                f"version={out.get('versionNumber')!r} error={out.get('error')!r}. "
+                f"If Kaggle reports max GPU sessions, stop leftover sessions on kaggle.com."
             )
         out["_session_running"] = True
         out["_slug"] = full_slug
