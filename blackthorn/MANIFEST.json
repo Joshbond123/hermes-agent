@@ -10,12 +10,12 @@
   "blackthorn/computer_assets/install_stack.py": "a3613c1e4b5224e5b22b05ec1f760901e4d690ebab3ba972ed91674acd0d9204",
   "blackthorn/computer_assets/skillctl.py": "773df12a1f4fc65256b5b590ead5f929598c633c0bc2c90c4187a81f73c725fb",
   "blackthorn/config.py": "77f18840d1234857ed75bcaa700d75682328f2d06e8f88b8e1e9832912be75e8",
-  "blackthorn/fleet.py": "98ff994ac83b572ed498ebb73503277f35196a1776057ce4eda11c10ebdaeaed",
+  "blackthorn/fleet.py": "b8dadf9766d4b30708c2bed29534425f9065c0db7cb1859e8ca08d538b878137",
   "blackthorn/gpu.py": "24d147ef7f8e65847475906346b13d8ff5b429ea0bea95651d5a68fac0ed8e9a",
   "blackthorn/kaggle_bundle.py": "f05991c9ef0a3ec9c41231e71021378938a34dba504156d3a202f2b809f8bf92",
   "blackthorn/llm.py": "4aa857ec656e4360a1617723377b611cc69a32fd874549503a1c59d1648d75b8",
   "blackthorn/prompts.py": "7e84314f0fbc2f204bb97ef72d31731dac3b04408d9c3f1f415a8b855f85ccf3",
-  "blackthorn/relay.py": "4b7a4dc2b7d497f1ebfec38ed34b6bab349a0f06ca6d54f59303732b6ae4ad48",
+  "blackthorn/relay.py": "7ba1ef6e7577d7d68e7b9d2d860109835395c590e8a8934b26167cb820055fa5",
   "blackthorn/route.py": "d0ead4b982168dafe6a7229f6ec8020003f1bf5dc7440d5148ae88823a6b3d25",
   "blackthorn/runs.py": "ef2d5deb094f9b9c879f80776b104218bb8a1cd4cc0a1ae695bd564c66e650db",
   "blackthorn/skills/authorized-recon-basics/SKILL.md": "093784f63b0e0b3c5716c973a004c2bfe3f0b74588dd479a80d2d8481e15f56a",
@@ -49,8 +49,8 @@
   "blackthorn/tools/web.py": "e98acbf8521a9cd1492aff0eb2a35e89bc97800d0bde5e2215b40df244f084fd",
   "blackthorn/version.py": "5d43f6378622c4ddeeec627755c2e98152f6077be9334b2770c3a8199018bf37",
   "blackthorn_start.py": "d8189febd25f393cc6b41cd17f7cc88d73ecaa44942fa52f51dd310602b108df",
-  "cloudflare_d1_client.py": "e723b592cdd0c460a9f049cda9b8a7c2da194bcc643a42408ba3582b044ac2a4",
-  "kaggle_cyber_ornith/cyber_ornith_server.py": "fb5a8b08941397c0ebe15ba09f13d15ae70d4f4f5b57e9e2823a08b324a9e063"
+  "cloudflare_d1_client.py": "eaf4ba1c27a2a688e0ec92a5404f88b90582f1b5618a5df218f432e010ca657a",
+  "kaggle_cyber_ornith/cyber_ornith_server.py": "f46556a41ba29a21e11cefc59e197caf60e00e2e055135e20862bfdbbec9cb92"
  },
  "version": "5.3.0"
 }

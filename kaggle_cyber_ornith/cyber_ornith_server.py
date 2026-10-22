@@ -1793,18 +1793,22 @@ def launch_cloudflared(cloudflared_bin: str):
                 stdout=open("/tmp/relay_client.out", "w"), stderr=subprocess.STDOUT, text=True,
             )
             public = relay_base_early + ("/computer" if channel == "computer" else "")
-            # Wait briefly for the client to register a puller on the hub.
-            deadline = time.time() + 45
+            # A live process is NOT a registered puller. Probe the actual gateway
+            # through Render; only announce a tunnel once that host answers.
+            deadline = time.time() + 55
             while time.time() < deadline:
                 if proc.poll() is not None:
-                    log("⚠️ relay client exited early — trying other tunnels")
+                    log("⚠️ relay client exited early — trying another transport")
                     break
-                time.sleep(2)
-                # Relay does not need a public HTTP probe from Kaggle; control plane is Render.
-                if proc.poll() is None:
-                    log(f"Stable relay: {public} (Render long-poll relay, channel={channel})")
+                ready = (_computer_gateway_ok(public) if channel == "computer" else
+                         _inrok_gateway_answers(public))
+                if ready:
+                    log(f"Stable relay: {public} (verified gateway, channel={channel})")
                     return proc, public
-            log("⚠️ relay did not stay up — falling back")
+                time.sleep(2)
+            if proc.poll() is None:
+                proc.terminate()
+            log("⚠️ relay did not answer its gateway probe — trying another transport")
         except Exception as exc:
             log("❌ relay launch failed: " + type(exc).__name__ + ": " + str(exc)[:200] + " — falling back")
     if inrok_enabled():
@@ -2584,11 +2588,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    try:
-        start_tunnel_watchdog()
-    except Exception as _tw_exc:
-        print("tunnel watchdog failed to start:", _tw_exc, flush=True)
-
+    # The model and computer loops own their tunnel process and perform bounded
+    # recovery. The older generic watchdog races those loops and references a
+    # nonexistent PORT/start_tunnel; never run two independent tunnel owners.
     try:
         main()
     except Exception as exc:  # never leave the dashboard stuck on "starting"

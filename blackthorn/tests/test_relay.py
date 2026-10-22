@@ -204,3 +204,15 @@ async def test_relay_health_reports_stall_after_repeated_timeouts(stack, monkeyp
         assert (await call).status_code == 502
     hub = stack.services.relay_hubs["model"]
     assert hub.stalled() and hub.health()["stalled"] is True
+
+
+async def test_enrolled_computer_never_falls_back_to_model_puller(stack, monkeypatch):
+    import time
+    monkeypatch.setattr(relay_mod, "HEADERS_TIMEOUT_S", 0.3)
+    await stack.executor.query(
+        "INSERT OR REPLACE INTO kaggle_gpu_state (id,status,tunnel_url,api_key,model,gpu_info,updated_at) "
+        "VALUES ('computer','BOOTING_KAGGLE_GPU','', 'test-key','','', ?)", [time.time()])
+    async with httpx.AsyncClient(timeout=10) as c:
+        response = await c.get(f"{stack.url}/gpu-relay/computer/health")
+    assert response.status_code == 502
+    assert not stack.services.relay_hubs.get('model')  # never dispatched to model

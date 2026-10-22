@@ -1849,6 +1849,20 @@ def turn_on_fleet(blocking: bool = False) -> Dict[str, Any]:
     plan: Dict[str, Any] = {}
     for role in ("model", "computer"):
         reusable = _fleet_role_online(role)
+        if not reusable:
+            try:
+                row_id = "computer" if role == "computer" else "primary"
+                rows = d1_query("SELECT status, updated_at FROM kaggle_gpu_state WHERE id=? LIMIT 1;", [row_id])
+                row = rows[0] if rows else {}
+                age = time.time() - float(row.get("updated_at") or 0)
+                state = str(row.get("status") or "").upper()
+                if age < 180 and state in READY_STATUSES:
+                    reusable = "reconnecting"
+                elif age < 600 and state in ("BOOTING_KAGGLE_GPU", "INSTALLING_DEPS", "LOADING_MODEL",
+                                              "RESTORING_WORKSPACE", "DOWNLOADING_MODEL", "STARTING_TUNNEL"):
+                    reusable = "already_starting"
+            except Exception:
+                pass
         st = fleet.decide(role, force=True) if not reusable else fleet.state[role]
         account = fleet.by_slot.get((role, st.active))
         plan[role] = {"state": st, "account": account, "reusable": reusable}
@@ -1861,7 +1875,8 @@ def turn_on_fleet(blocking: bool = False) -> Dict[str, Any]:
     def boot(role: str) -> Dict[str, Any]:
         st, account = plan[role]["state"], plan[role]["account"]
         if plan[role]["reusable"]:
-            return {"role": role, "status": "already_online", "account": account.user if account else None}
+            return {"role": role, "status": "already_online" if plan[role]["reusable"] is True else plan[role]["reusable"],
+                    "account": account.user if account else None}
         # Computer runs on Kaggle (alagbo primary / teslaarymo backup), same path as model.
         # Com11 GitHub Actions is disabled — account suspended and architecture is Kaggle-only.
         if account is None:
@@ -1894,8 +1909,10 @@ def turn_on_fleet(blocking: bool = False) -> Dict[str, Any]:
         try:
             out = fleet.start_kernel(account, slug=slug, title=f"Blackthorn {role} ({account.user})",
                                      notebook_text=text, datasets=datasets or None)
-            return {"role": role, "account": account.user, "slug": slug,
-                    "slot": st.active, "reason": st.reason, "status": "starting", "push": bool(out),
+            return {"role": role, "account": account.user, "slug": out.get("_slug", slug),
+                    "slot": st.active, "reason": st.reason,
+                    "status": "starting" if out.get("_session_running") is not False else "submitted_unconfirmed",
+                    "session_error": out.get("_session_error", ""), "push": bool(out),
                     "datasets": datasets}
         except Exception as exc:  # noqa: BLE001
             _write_fleet_row(row_id, "BOOT_FAILED", gpu_info=f"FAILED: {exc}")

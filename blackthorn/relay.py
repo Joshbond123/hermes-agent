@@ -286,7 +286,15 @@ async def relay_proxy(request: Request, path: str = ""):
                 comp = hubs.get("computer")
                 if comp is not None and comp.alive():
                     break
-        channel = "computer" if (comp is not None and comp.alive()) else "model"
+        # Never route a configured dedicated computer's request to the model host.
+        # The model's /computer/* endpoints use a DIFFERENT ephemeral filesystem:
+        # a fallback here can pass a health check and then silently lose user files.
+        try:
+            enrolled = bool(await services.store.computer_row())
+        except Exception:
+            raise HTTPException(status_code=503,
+                                detail={"code": "computer_state_unknown", "message": "Computer routing state unavailable."})
+        channel = "computer" if enrolled or (comp is not None and comp.alive()) else "model"
         # The published computer base is /gpu-relay/computer, so gateway paths arrive either
         # doubled (computer/computer/info) or single (computer/exec). The local gateway mounts
         # /computer/* — normalise BOTH forms to exactly one "computer/" prefix.
@@ -303,8 +311,9 @@ async def relay_proxy(request: Request, path: str = ""):
     if path and not path.startswith("/"):
         path = "/" + path
     hub = _hub(request, channel)
-    if not hub.alive():
-        # Notebook may be between long-polls after a deploy; wait briefly for a puller.
+    if not hub.alive() and not (channel == "computer" and enrolled):
+        # Legacy model-only computer may be between long-polls; do not wait on
+        # an explicitly enrolled computer that has no dedicated puller.
         for _ in range(20):
             await asyncio.sleep(0.5)
             if hub.alive():

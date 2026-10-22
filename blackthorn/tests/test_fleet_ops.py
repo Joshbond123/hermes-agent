@@ -128,3 +128,17 @@ def test_resource_exhaustion_is_reported_not_hidden(ops):
     assert out["computer"]["status"] == "start_failed"
     assert "quota exhausted" in out["computer"]["error"]
     assert ("computer", "BOOT_FAILED") in ops["rows"]                 # the UI sees the real failure
+
+
+def test_recent_heartbeat_reuses_model_when_gateway_probe_times_out(ops, monkeypatch):
+    import time
+    monkeypatch.setattr(d1, '_fleet_role_online', lambda role: False)
+    monkeypatch.setattr(d1, 'd1_query', lambda sql, params=None: (
+        [{'status': 'HEARTBEAT_ONLINE', 'updated_at': time.time()}]
+        if 'SELECT status, updated_at FROM kaggle_gpu_state' in sql and params == ['primary'] else
+        [{'status': 'BOOTING_KAGGLE_GPU', 'updated_at': time.time()}]
+        if 'SELECT status, updated_at FROM kaggle_gpu_state' in sql and params == ['computer'] else []))
+    out = d1.turn_on_fleet(blocking=True)
+    assert out['model']['status'] == 'reconnecting'
+    assert out['computer']['status'] == 'already_starting'
+    assert ops['starts'] == []

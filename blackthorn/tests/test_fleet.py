@@ -364,3 +364,54 @@ def test_empty_protobuf_listing_proves_backup_absent():
             return {}  # Kaggle omits empty repeated `kernels` in protobuf JSON.
         raise AssertionError('no deletion when an authenticated listing is empty')
     assert FleetManager([account], fetcher=rpc).stop_kernel_result(account, 'backup/blackthorn-model')['state'] == 'not_running'
+
+
+def test_409_recovery_creates_session_for_saved_slug_and_never_assumes_version(monkeypatch):
+    from blackthorn.fleet import FleetError
+    monkeypatch.setattr('time.sleep', lambda _: None)
+    account = Account('tester', 'private-token', 'computer', 'primary')
+    seen = []
+
+    def rpc(method, body, token):
+        seen.append((method, dict(body or {})))
+        if method == 'ListKernels':
+            return {'kernels': []}
+        if method == 'GetKernelSessionStatus':
+            return {'status': 'STOPPED'}
+        if method == 'SaveKernel':
+            if sum(name == 'SaveKernel' for name, _ in seen) == 1:
+                raise FleetError('HTTP 409 reserved title')
+            return {'versionNumber': 7}
+        if method == 'CreateKernelSession':
+            return {'ok': True}  # accepted submission, not a running session
+        raise AssertionError(method)
+
+    fleet = FleetManager([account], fetcher=rpc)
+    out = fleet.start_kernel(account, slug='tester/blackthorn-computer',
+                             title='Blackthorn computer (tester)', notebook_text='{}')
+    saved = [payload for method, payload in seen if method == 'SaveKernel'][-1]
+    created = [payload for method, payload in seen if method == 'CreateKernelSession']
+    checked = [payload for method, payload in seen[seen.index(('SaveKernel', saved))+1:] if method == 'GetKernelSessionStatus']
+    assert created == [{'slug': saved['slug']}]
+    assert all(payload['kernelSlug'] == saved['slug'].split('/')[-1] for payload in checked)
+    assert out['_session_running'] is False and out['_session_pending'] is True
+    assert out['_slug'] == saved['slug']
+    assert not any(method == 'DeleteKernel' for method, _ in seen)
+
+
+def test_live_kernel_is_reused_without_save_or_delete():
+    account = Account('tester', 'private-token', 'model', 'primary')
+    calls = []
+
+    def rpc(method, body, token):
+        calls.append(method)
+        if method == 'ListKernels':
+            return {'kernels': [{'ref': 'tester/blackthorn-model', 'title': 'Blackthorn model (tester)'}]}
+        if method == 'GetKernelSessionStatus':
+            return {'status': 'RUNNING'}
+        raise AssertionError(f'no destructive {method} on reconnect')
+
+    out = FleetManager([account], fetcher=rpc).start_kernel(
+        account, slug='tester/blackthorn-model', title='Blackthorn model (tester)', notebook_text='{}')
+    assert out['_reused'] and out['_session_running']
+    assert calls == ['ListKernels', 'GetKernelSessionStatus']
