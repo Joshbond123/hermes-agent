@@ -128,6 +128,8 @@ def test_an_accepted_delete_that_cannot_be_read_back_is_unverified_not_failed():
             if calls["status"] == 1:
                 return {"status": "RUNNING"}
             raise FleetError("kernels.get denied")
+        if method == "ListKernels":
+            raise FleetError("kernel listing denied")
         return {}
 
     import pytest as _p
