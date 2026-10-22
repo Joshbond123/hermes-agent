@@ -334,3 +334,19 @@ def test_main_cache_publish_checks_model_size_without_undefined_variable():
     import inspect
     src = inspect.getsource(srv.main)
     assert '_healthy_file(gguf, MODEL_BYTES.get(MODEL_QUANT, 0))' in src
+
+
+def test_model_registration_defaults_to_ollama_without_compiling_cuda(monkeypatch, tmp_path):
+    import types
+    gguf = tmp_path / 'model.gguf'
+    gguf.write_text('test model')
+    monkeypatch.delenv('PREFER_LLAMA', raising=False)
+    monkeypatch.setattr(srv, 'WORK_ROOT', str(tmp_path))
+    monkeypatch.setattr(srv, 'PERSIST_MODELS_DIR', str(tmp_path / 'ollama'))
+    monkeypatch.setattr(srv, 'ollama_model_present', lambda: False)
+    monkeypatch.setattr(srv.shutil, 'disk_usage', lambda path: types.SimpleNamespace(free=30 * 1024**3))
+    monkeypatch.setattr(srv, 'start_llama_server', lambda path: (_ for _ in ()).throw(AssertionError('unexpected CUDA build')))
+    called = []
+    monkeypatch.setattr(srv.subprocess, 'run', lambda cmd, **kwargs: called.append(cmd) or types.SimpleNamespace(returncode=0))
+    srv.register_model('ollama', str(gguf))
+    assert any(cmd[:2] == ['ollama', 'create'] for cmd in called)

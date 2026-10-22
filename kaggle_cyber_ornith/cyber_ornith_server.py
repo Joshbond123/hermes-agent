@@ -30,6 +30,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 # --------------------- CONFIGURATION ---------------------
 import secrets as _secrets
@@ -1194,12 +1195,17 @@ def register_model(ollama_bin: str, gguf_path: str) -> None:
     Ollama create is attempted only when disk allows; failures fall through
     cleanly to llama-server without aborting the boot.
     """
-    # Always prefer llama path for Q4 ~16.8 GB on dual T4 — more reliable
-    prefer_llama = os.environ.get("PREFER_LLAMA", "1") == "1"
+    # Kaggle's CUDA toolkit/compiler changes between images; a fresh llama.cpp
+    # CMake build can fail before any model serves. Reuse the already-running
+    # Ollama engine by default, with an explicit opt-in for custom llama.cpp.
+    prefer_llama = os.environ.get("PREFER_LLAMA", "0") == "1"
     if prefer_llama and gguf_path and os.path.isfile(gguf_path):
-        log("🚀 Preferring CUDA llama-server for dual-T4 stability")
-        start_llama_server(gguf_path)
-        return
+        try:
+            log("Trying CUDA llama-server on dual T4")
+            start_llama_server(gguf_path)
+            return
+        except (OSError, RuntimeError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            log(f"CUDA llama-server unavailable ({type(exc).__name__}); using Ollama")
 
     if ollama_model_present():
         log("✅ Model already registered in the ollama store — skipping create")
@@ -1211,10 +1217,11 @@ def register_model(ollama_bin: str, gguf_path: str) -> None:
         usage = shutil.disk_usage(WORK_ROOT)
         free_gb = usage.free / (1024**3)
         log(f"Disk free on {WORK_ROOT}: {free_gb:.1f} GB")
-        if free_gb < 20:  # need headroom for create
-            log("Insufficient free disk for ollama create — using llama-server")
-            start_llama_server(gguf_path)
-            return
+        if free_gb < 20:  # avoid a guaranteed out-of-space copy
+            if prefer_llama:
+                start_llama_server(gguf_path)
+                return
+            log("Low working-disk space; attempting Ollama import of the cached GGUF")
         # purge any partial blobs
         blobs = os.path.join(PERSIST_MODELS_DIR, "blobs")
         if os.path.isdir(blobs):
