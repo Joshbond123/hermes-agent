@@ -261,7 +261,7 @@ def specs() -> List[ToolSpec]:
                  "Fetch a PUBLIC MalwareAnalyzer report by SHA-256 over verified Proton VPN. "
                  "Report may still be pending or absent; never claim a dynamic verdict without evidence.",
                  {"type": "object", "properties": {"sha256": {"type": "string", "minLength": 64, "maxLength": 64}},
-                  "required": ["sha256"]}, malware_analyzer_report, timeout=100.0, kind="net",
+                  "required": ["sha256"]}, malware_analyzer_report, timeout=140.0, kind="net",
                  describe=lambda a: str(a.get("sha256") or "")[:12]),
         ToolSpec("sample_triage",
                  "Read-only static analysis of an uploaded PE, ELF or script in malware_samples/ on the computer. "

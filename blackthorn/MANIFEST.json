@@ -1,6 +1,6 @@
 {
  "files": {
-  "blackthorn/README.md": "73b9cad93dc6c086aa7be9b3fd5891dbb7df535570039f4ad60955aa3df99c23",
+  "blackthorn/README.md": "6825db04ac546847bffc82557bd0287194b076c854aea6be5919f99243fcf042",
   "blackthorn/__init__.py": "0bff9f17b60d2e4655f341e6ab4843bc0f472c807e811768bc04e6f60128f78e",
   "blackthorn/agent.py": "a627e0f46b48b26a3a359149cbb5ba72c169d594f546ccfc8bed472346550e6f",
   "blackthorn/api.py": "607e127d887420208efc6e93e36472e3b39a695962a6160974877fe2d55ede48",
@@ -15,7 +15,7 @@
   "blackthorn/gpu.py": "24d147ef7f8e65847475906346b13d8ff5b429ea0bea95651d5a68fac0ed8e9a",
   "blackthorn/kaggle_bundle.py": "f05991c9ef0a3ec9c41231e71021378938a34dba504156d3a202f2b809f8bf92",
   "blackthorn/llm.py": "4aa857ec656e4360a1617723377b611cc69a32fd874549503a1c59d1648d75b8",
-  "blackthorn/malware_analyzer.py": "8a1aaae31a92425f785414060a945ac223adcd695b5ca50903d5cefdbc5d9115",
+  "blackthorn/malware_analyzer.py": "83187436a3a5fa9a6537120bc4e8c35213367e7b4245d909b38d04161c7e3fb4",
   "blackthorn/prompts.py": "7e84314f0fbc2f204bb97ef72d31731dac3b04408d9c3f1f415a8b855f85ccf3",
   "blackthorn/relay.py": "41ec4ab182bd49c15c8e7ba8853205f904164ae2187be8113370d8c8ecae5ea3",
   "blackthorn/route.py": "d0ead4b982168dafe6a7229f6ec8020003f1bf5dc7440d5148ae88823a6b3d25",
@@ -46,7 +46,7 @@
   "blackthorn/tools/base.py": "fa100a27fc95ba0ca90ab80bf8948660604b00048feddfb814fb18a4a8225f32",
   "blackthorn/tools/computer.py": "4824804ed4c615917ff6bd4313a48e8eed22acd29773b1608204c84f418d434d",
   "blackthorn/tools/memory.py": "014a048007b0d045c264f33450d56d293e8aca8331eeed1c5e53ea4e759f728f",
-  "blackthorn/tools/security.py": "1dbf2cc99c149d38ca3aef6ed78d8e48fa81fb6a7c4671db20743467c962d645",
+  "blackthorn/tools/security.py": "35833cd5d98862b5f7ad0fb5dde21b7a8ca3d788494a57a0088ce92c92846d29",
   "blackthorn/tools/task.py": "d516e5fe82517e63ede1551b859e885766a4a2d3a144b2d3e7585792eeea9340",
   "blackthorn/tools/web.py": "e98acbf8521a9cd1492aff0eb2a35e89bc97800d0bde5e2215b40df244f084fd",
   "blackthorn/version.py": "5d43f6378622c4ddeeec627755c2e98152f6077be9334b2770c3a8199018bf37",
