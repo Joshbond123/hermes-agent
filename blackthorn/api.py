@@ -113,7 +113,10 @@ async def malware_analyzer_egress() -> Dict[str, Any]:
         return {"ok": True, "vpn_exit_distinct_from_host": True, "provider_status": response.status_code,
                 "remote_sample_execution": "not tested by status check"}
     except (EgressUnavailable, httpx.HTTPError) as exc:
-        raise _err(503, "vpn_unavailable", "VPN egress/provider status not verified; remote analysis is disabled.") from exc
+        reason = str(exc) if isinstance(exc, EgressUnavailable) else f"provider status unavailable ({type(exc).__name__})"
+        # Only a fixed-category diagnostic; never return either IP, key or profile.
+        raise _err(503, "vpn_unavailable", "VPN egress/provider status not verified; remote analysis is disabled.",
+                   reason=reason[:120]) from exc
 
 
 # --------------------------------------------------------------------------- sessions
