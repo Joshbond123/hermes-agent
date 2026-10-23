@@ -39,6 +39,19 @@ describe('streaming reducer', () => {
     expect(s.chat.run).toBeNull()
   })
 
+  it('keeps internal compaction out of the assistant reply while preserving exact response bytes', () => {
+    let s = started()
+    s = run(s, E({ type: 'internal.compaction', stage: 'history', count: 14 }, 2))
+    s = run(s, E({ type: 'internal.compaction', stage: 'mid_task' }, 3))
+    s = run(s, E({ type: 'text.delta', text: '  Earlier turns were compacted.\n' }, 4))
+    s = run(s, E({ type: 'text.delta', text: 'Real reply.  ' }, 5))
+    s = run(s, E({ type: 'run.end', status: 'stop', duration_ms: 100,
+      message_id: 'A1', session_id: 'S1', steps: 1, tool_calls: 0 }, 6))
+    expect(s.chat.messages[1].notices).toBeUndefined()
+    expect(s.chat.messages[1].content).toBe('  Earlier turns were compacted.\nReal reply.  ')
+    expect(s.chat.messages[1].parts).toEqual([{ type: 'text', text: '  Earlier turns were compacted.\nReal reply.  ' }])
+  })
+
   it('never shows reasoning: thinking events only toggle an indicator', () => {
     let s = started()
     s = run(s, E({ type: 'thinking', state: 'start' }, 2))

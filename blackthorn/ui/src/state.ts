@@ -88,13 +88,15 @@ export function applyToMessage(msg: Message, ev: ServerEvent): Message {
       )
       return { ...msg, parts }
     }
+    case 'internal.compaction':
+      return msg // context management is not an assistant reply or user-facing notice
     case 'notice':
       return { ...msg, notices: [...(msg.notices ?? []), { level: ev.level, text: ev.text }] }
     case 'error':
       return { ...msg, error: { code: ev.code, message: ev.message, retryable: ev.retryable } }
     case 'run.end': {
       const parts = msg.parts.map((p) => (p.type === 'tool' && p.status === 'running' ? ({ ...p, status: ev.status === 'cancelled' ? 'cancelled' : 'error' } as ToolPart) : p))
-      const content = parts.filter((p): p is { type: 'text'; text: string } => p.type === 'text').map((p) => p.text.trim()).filter(Boolean).join('\n\n')
+      const content = parts.filter((p): p is { type: 'text'; text: string } => p.type === 'text').map((p) => p.text).filter((p) => p.length > 0).join('\n\n')
       return { ...msg, parts, content, status: ev.status, thinkingSince: null, id: ev.message_id || msg.id,
         meta: { ...(msg.meta ?? {}), duration_ms: ev.duration_ms, first_token_ms: ev.first_token_ms, steps: ev.steps, tool_calls: ev.tool_calls, usage: ev.usage, error: msg.error } }
     }

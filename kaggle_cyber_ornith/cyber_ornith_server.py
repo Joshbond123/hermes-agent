@@ -25,6 +25,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import zipfile
 import sys
 import time
@@ -1399,6 +1400,7 @@ async def health():
         "model": MODEL_ALIAS,
         "backend_model": OLLAMA_MODEL,
         "model_loaded": model_loaded,
+        "fleet_slot": os.environ.get("BLACKTHORN_FLEET_SLOT", ""),
         "gpu": current_boot.get("gpu", ""),
         "gpu_roles": ({"0": "computer", "1": "computer"} if (os.environ.get("ORNITH_ROLE") or "model") == "computer"
                       else {"0": "model", "1": "model"}),
@@ -1612,7 +1614,15 @@ def _tagged_processes() -> list:
 @app.get("/computer/activity")
 async def computer_activity(_=Depends(verify_api_key)):
     procs = _tagged_processes()
-    return {"active_jobs": len(procs), "processes": procs[:50], "ts": time.time()}
+    state = {}
+    try:
+        with open(os.path.join(COMPUTER_WORKSPACE, ".blackthorn", "checkpoint.json")) as stream:
+            marker = json.load(stream)
+        state = {"state_generation": marker.get("generation"), "state_digest": marker.get("digest")}
+    except (OSError, ValueError):
+        pass
+    return {"active_jobs": len(procs), "processes": procs[:50], "ts": time.time(),
+            "fleet_slot": os.environ.get("BLACKTHORN_FLEET_SLOT", ""), **state}
 
 
 @app.post("/computer/checkpoint")
@@ -1985,30 +1995,20 @@ def _restore_mounted_workspace() -> tuple[int, int]:
     for root in candidates:
         if not os.path.isdir(root):
             continue
-        copied = seen = useful = 0
-        for directory, dirs, files in os.walk(root, followlinks=False):
-            dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(directory, d))
-                       and d not in CHECKPOINT_EXCLUDE_DIRS]
-            relative = os.path.relpath(directory, root)
-            for name in files:
-                src = os.path.join(directory, name)
-                if (os.path.islink(src) or name in CHECKPOINT_SECRET_NAMES
-                        or name in ("dataset-metadata.json", "manifest.json", "workspace.zip", "state.zip")
-                        or name.endswith((".pem", ".key", ".p12"))
-                        or os.path.getsize(src) > CHECKPOINT_MAX_FILE_BYTES):
-                    continue
-                seen += 1
-                if name != "environment.json":
-                    useful += 1
-                dst = os.path.join(COMPUTER_WORKSPACE, relative, name)
-                if os.path.exists(dst):
-                    continue
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
-                shutil.copy2(src, dst)
-                copied += 1
-        # A prior bad checkpoint can publish only environment.json. That is
-        # NOT a restored user workspace: search older immutable versions.
-        if seen and useful:
+        archive = os.path.join(root, "workspace.zip")
+        if os.path.isfile(archive):
+            with tempfile.TemporaryDirectory(dir=STATE_DIR if os.path.isdir(STATE_DIR) else None) as stage:
+                with zipfile.ZipFile(archive) as zf:
+                    for entry in zf.infolist():
+                        rel = Path(entry.filename)
+                        if rel.is_absolute() or ".." in rel.parts or (entry.external_attr >> 16) & 0o170000 == 0o120000:
+                            raise ValueError("unsafe mounted snapshot")
+                    zf.extractall(stage)
+                return _restore_snapshot(stage)
+        if os.path.isfile(os.path.join(root, ".blackthorn", "checkpoint.json")):
+            return _restore_snapshot(root)
+        copied, seen = _restore_snapshot(root)
+        if seen:
             return copied, seen
     return 0, 0
 
@@ -2081,7 +2081,10 @@ def restore_workspace() -> bool:
         if seen:
             log(f"✅ Persistence: restored {copied} of {seen} mounted snapshot files into {COMPUTER_WORKSPACE}")
             return True
-    except (OSError, ValueError) as exc:
+    except ValueError as exc:
+        log(f"Persistence: mounted snapshot invalid ({type(exc).__name__}); refusing stale fallback")
+        return False
+    except OSError as exc:
         log(f"Persistence: mounted snapshot unavailable ({type(exc).__name__}) — trying API download")
     os.makedirs(STATE_DIR, exist_ok=True)
     archive_dir = os.path.join(STATE_DIR, "download")
@@ -2136,28 +2139,15 @@ def restore_workspace() -> bool:
             if os.path.isfile(packed):
                 safe_extract(packed, extracted)
                 os.unlink(packed)
-        os.makedirs(COMPUTER_WORKSPACE, exist_ok=True)
-        copied = 0
-        for root, _dirs, files in os.walk(extracted):
-            rel = os.path.relpath(root, extracted)
-            dest = os.path.join(COMPUTER_WORKSPACE, rel) if rel != "." else COMPUTER_WORKSPACE
-            os.makedirs(dest, exist_ok=True)
-            for name in files:
-                if name in ("dataset-metadata.json", "manifest.json") and rel == ".":
-                    continue
-                src_f, dst_f = os.path.join(root, name), os.path.join(dest, name)
-                if not os.path.exists(dst_f):            # never overwrite newer local files
-                    try:
-                        os.link(src_f, dst_f)
-                    except OSError:
-                        shutil.copy2(src_f, dst_f)
-                    copied += 1
+        copied, seen = _restore_snapshot(extracted)
+        if not seen and not os.path.isfile(os.path.join(extracted, ".blackthorn", "checkpoint.json")):
+            raise ValueError("archive has no workspace files")
         gen = "?"
         try:
             gen = json.load(open(os.path.join(extracted, "manifest.json"))).get("generation", "?")
         except Exception:
             pass
-        log(f"✅ Persistence: restored {copied} files (generation {gen}) into {COMPUTER_WORKSPACE}")
+        log(f"✅ Persistence: restored {copied} of {seen} files (generation {gen}) into {COMPUTER_WORKSPACE}")
         return True
     except Exception as exc:
         log(f"Persistence: restore failed ({type(exc).__name__}: {exc})")
@@ -2171,6 +2161,130 @@ CHECKPOINT_EXCLUDE_DIRS = {"__pycache__", ".git", "node_modules", ".cache", "ven
 CHECKPOINT_EXCLUDE_RELPATHS = {"tools/venv", "tools/home/.cache", "tools/home/go/pkg", "tmp"}
 CHECKPOINT_SECRET_NAMES = {".env", ".env.local", "credentials", "id_rsa", "id_ed25519", "kaggle.json", "access_token"}
 CHECKPOINT_MAX_FILE_BYTES = int(os.environ.get("CHECKPOINT_MAX_FILE_BYTES") or str(512 * 1024 * 1024))
+
+
+def _snapshot_entries(root: str) -> dict:
+    """Hash the staged copy, not the live tree: the published bytes have a stable identity."""
+    files = {}
+    for directory, dirs, names in os.walk(root, followlinks=False):
+        dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(directory, d))]
+        for name in names:
+            path = os.path.join(directory, name)
+            rel = os.path.relpath(path, root).replace(os.sep, "/")
+            if rel in ("dataset-metadata.json", ".blackthorn/checkpoint.json"):
+                continue
+            if os.path.islink(path) or len(files) >= 10000:
+                raise ValueError("unsafe or oversized snapshot")
+            sha = hashlib.sha256()
+            with open(path, "rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    sha.update(chunk)
+            files[rel] = {"size": os.path.getsize(path), "sha256": sha.hexdigest()}
+    return files
+
+
+def _snapshot_digest(files: dict) -> str:
+    return hashlib.sha256(json.dumps(files, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _restore_snapshot(root: str) -> tuple[int, int]:
+    """Validate a complete snapshot BEFORE changes, then reconcile tracked paths.
+
+    A previous tracked file absent from the new manifest is deleted. Untagged local
+    files and excluded/private trees are never deleted. The identity marker commits
+    last; a failed copy remains retriable rather than advertising new readiness.
+    """
+    marker = os.path.join(root, ".blackthorn", "checkpoint.json")
+    if not os.path.isfile(marker):
+        # Legacy archives predate the manifest: copy only missing files, never
+        # claim generation-level verification or delete untracked user data.
+        legacy = []
+        for directory, dirs, names in os.walk(root, followlinks=False):
+            dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(directory, d))]
+            for name in names:
+                if name in ("dataset-metadata.json", "manifest.json", "workspace.zip"):
+                    continue
+                src = os.path.join(directory, name)
+                if os.path.islink(src):
+                    continue
+                rel = os.path.relpath(src, root)
+                if name in CHECKPOINT_SECRET_NAMES or name.endswith((".pem", ".key", ".p12")):
+                    continue
+                legacy.append((src, rel))
+        if not any(Path(rel).name != "environment.json" for _src, rel in legacy):
+            return 0, 0  # inventory-only legacy snapshots are not usable state
+        copied = 0
+        for src, rel in legacy:
+            dst = os.path.join(COMPUTER_WORKSPACE, rel)
+            if not os.path.exists(dst):
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(src, dst)
+                copied += 1
+        return copied, len(legacy)
+    with open(marker) as stream:
+        data = json.load(stream)
+    files = data.get("files")
+    if data.get("schema") != 2 or not isinstance(files, dict) or not data.get("generation") or len(files) > 10000:
+        raise ValueError("invalid checkpoint manifest")
+    if data.get("digest") != _snapshot_digest(files):
+        raise ValueError("checkpoint manifest digest mismatch")
+    total = 0
+    for rel, expected in files.items():
+        path = Path(rel)
+        if not rel or path.is_absolute() or ".." in path.parts or str(path) != rel or "\\" in rel:
+            raise ValueError("unsafe checkpoint path")
+        source = os.path.join(root, rel)
+        if os.path.islink(source) or not os.path.isfile(source):
+            raise ValueError("checkpoint file missing")
+        total += int(expected["size"])
+        if total > 25 * 1024**3 or os.path.getsize(source) != expected["size"]:
+            raise ValueError("checkpoint size mismatch")
+        sha = hashlib.sha256()
+        with open(source, "rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                sha.update(chunk)
+        if sha.hexdigest() != expected["sha256"]:
+            raise ValueError("checkpoint hash mismatch")
+    previous_path = os.path.join(COMPUTER_WORKSPACE, ".blackthorn", "checkpoint.json")
+    previous = {}
+    if os.path.isfile(previous_path):
+        with open(previous_path) as stream:
+            old = json.load(stream)
+        if old.get("schema") == 2 and old.get("digest") == _snapshot_digest(old.get("files") or {}):
+            previous = old.get("files") or {}
+    copied = 0
+    for rel, expected in files.items():
+        dest = os.path.join(COMPUTER_WORKSPACE, rel)
+        parent = os.path.dirname(dest)
+        base = Path(COMPUTER_WORKSPACE).resolve()
+        if not Path(parent).resolve().is_relative_to(base) or os.path.islink(dest):
+            raise ValueError("unsafe destination path")
+        # Incremental: a correct existing file is not rewritten.
+        if os.path.isfile(dest) and os.path.getsize(dest) == expected["size"]:
+            sha = hashlib.sha256()
+            with open(dest, "rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    sha.update(chunk)
+            if sha.hexdigest() == expected["sha256"]:
+                continue
+        os.makedirs(parent, exist_ok=True)
+        tmp = dest + ".checkpoint-part"
+        try:
+            shutil.copy2(os.path.join(root, rel), tmp)
+            os.replace(tmp, dest)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        copied += 1
+    for rel in previous.keys() - files.keys():
+        target = os.path.join(COMPUTER_WORKSPACE, rel)
+        if not os.path.islink(target) and os.path.isfile(target):
+            os.unlink(target)
+    os.makedirs(os.path.dirname(previous_path), exist_ok=True)
+    marker_tmp = previous_path + ".tmp"
+    shutil.copy2(marker, marker_tmp)
+    os.replace(marker_tmp, previous_path)
+    return copied, len(files)
 
 
 def _checkpoint_ignore(directory: str, names: list) -> set:
@@ -2257,14 +2371,22 @@ def checkpoint_workspace(label: str = "") -> dict:
     user_files = [os.path.join(root, name) for root, _dirs, names in os.walk(snap)
                   for name in names if name != "environment.json"
                   and os.path.relpath(root, snap).split(os.sep)[0] not in (".blackthorn", "skills")]
-    if not user_files:
-        log("Persistence: refusing inventory-only checkpoint; preserving older dataset versions")
-        return {"ok": False, "error": "inventory-only workspace; refusing to replace the durable snapshot"}
+    if not user_files and not os.path.isfile(os.path.join(COMPUTER_WORKSPACE, ".blackthorn", "checkpoint.json")):
+        log("Persistence: refusing uninitialized empty workspace checkpoint")
+        return {"ok": False, "error": "inventory-only workspace without a previous verified snapshot"}
     os.makedirs(os.path.join(snap, ".blackthorn"), exist_ok=True)
     with open(os.path.join(snap, ".blackthorn", "environment.json"), "w") as fh:
         json.dump(_environment_inventory(), fh)
-    generation = int(time.time())
-    files = sum(len(f) for _r, _d, f in os.walk(snap))
+    generation = time.time_ns()
+    try:
+        entries = _snapshot_entries(snap)
+        digest = _snapshot_digest(entries)
+        marker_data = {"schema": 2, "generation": generation, "files": entries, "digest": digest}
+        with open(os.path.join(snap, ".blackthorn", "checkpoint.json"), "w") as fh:
+            json.dump(marker_data, fh, sort_keys=True)
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "error": f"snapshot manifest failed: {type(exc).__name__}"}
+    files = len(entries)
     json.dump({"generation": generation, "label": label[:80], "files": files, "ts": time.time()},
               open(STATE_MANIFEST, "w"))
     with open(os.path.join(snap, "dataset-metadata.json"), "w") as fh:
@@ -2288,10 +2410,17 @@ def checkpoint_workspace(label: str = "") -> dict:
         proc = _kaggle(["datasets", "create", "-p", snap, "--dir-mode", "zip"])
     ok = proc.returncode == 0
     if ok:
+        # This is the last confirmed generation; a subsequent all-file deletion
+        # can now publish an explicitly empty snapshot without reviving old data.
+        os.makedirs(os.path.join(COMPUTER_WORKSPACE, ".blackthorn"), exist_ok=True)
+        marker = os.path.join(COMPUTER_WORKSPACE, ".blackthorn", "checkpoint.json")
+        shutil.copy2(os.path.join(snap, ".blackthorn", "checkpoint.json"), marker + ".tmp")
+        os.replace(marker + ".tmp", marker)
         log(f"💾 Persistence: checkpoint generation {generation} ({files} files) published")
     else:
         log(f"Persistence: checkpoint failed: {(proc.stderr or proc.stdout or '')[-200:]}")
-    return {"ok": ok, "generation": generation, "files": files, "error": "" if ok else (proc.stderr or "")[-200:]}
+    return {"ok": ok, "generation": generation, "digest": digest, "files": files,
+            "error": "" if ok else (proc.stderr or "")[-200:]}
 
 
 def _answer_checkpoint_request() -> None:
@@ -2382,9 +2511,15 @@ def main_computer(started: float) -> None:
 
     try:
         restored = restore_workspace()
+        if not restored and os.environ.get("BLACKTHORN_REQUIRE_STATE_SNAPSHOT") == "1":
+            fail("BOOT_FAILED", "verified computer workspace snapshot could not be restored")
+            return
         if restored:
             env_result = restore_environment()
             if not env_result.get("ok"):
+                if os.environ.get("BLACKTHORN_REQUIRE_STATE_SNAPSHOT") == "1":
+                    fail("BOOT_FAILED", "computer dependency restoration failed")
+                    return
                 log(f"Environment recovery incomplete: {env_result.get('error')}")
     except Exception as exc:
         log(f"Persistence restore note: {type(exc).__name__}")

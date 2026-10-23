@@ -49,6 +49,10 @@ class ComputerClient:
             # it has a different ephemeral filesystem. A fallback can report success
             # while writing files to the wrong machine and destroy task continuity.
             if row:
+                if status in {"OFF", "OFFLINE", "GPU_STOPPED_SAVING_QUOTA", "STOPPED", "STOPPING_KAGGLE_GPU"}:
+                    raise RouteError("computer_off", "The computer is intentionally off; turn it on before using computer tools.")
+                if status in {"BOOT_FAILED", "GPU_UNAVAILABLE"}:
+                    raise RouteError("computer_failed", "The computer boot failed; check GPU status before retrying.")
                 if url and key and status not in offline:
                     return url, key
                 raise RouteError("computer_offline", "The dedicated computer is offline or recovering; "
@@ -82,6 +86,10 @@ class ComputerClient:
             try:
                 base_url, api_key = await self._endpoint()
             except RouteError as exc:
+                if exc.code in ("computer_off", "computer_failed"):
+                    # A deliberate stop or a terminal boot error cannot heal through
+                    # 195 seconds of retry sleeps. Return actionable feedback now.
+                    raise ToolError("offline", exc.message) from exc
                 last_err = ToolError("offline", "The remote computer is offline or recovering.", hint=exc.message)
                 if attempt >= attempts or time.monotonic() >= deadline:
                     raise last_err from exc

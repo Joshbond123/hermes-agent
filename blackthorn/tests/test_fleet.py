@@ -181,26 +181,40 @@ def test_mirror_uses_bearer_and_relabels_archive_for_backup(tmp_path):
     from pathlib import Path
     from blackthorn.fleet import mirror_state_dataset
     calls = []
+    backup = {}
+    inner = io.BytesIO()
+    with zipfile.ZipFile(inner, 'w') as z:
+        z.writestr('uploads/file.txt', 'saved')
+        z.writestr('.blackthorn/environment.json', '{}')
+
     def runner(cmd, env):
-        calls.append((cmd[:3], 'KAGGLE_API_TOKEN' in env and 'KAGGLE_KEY' not in env))
-        assert 'KAGGLE_KEY' not in env
-        assert env['KAGGLE_API_TOKEN'] == ('primary-token' if cmd[2] == 'download' else 'backup-token')
+        calls.append((cmd[2], env['KAGGLE_USERNAME']))
+        assert 'KAGGLE_KEY' not in env and 'KAGGLE_API_TOKEN' in env
+        assert env['KAGGLE_API_TOKEN'] == ('primary-token' if env['KAGGLE_USERNAME'] == 'primary' else 'backup-token')
         dest = Path(cmd[cmd.index('-p') + 1])
         if cmd[2] == 'download':
-            with zipfile.ZipFile(dest / 'blackthorn-computer-state.zip', 'w') as z:
-                z.writestr('workspace.zip', b'workspace bytes')
+            if env['KAGGLE_USERNAME'] == 'backup' and 'archive' not in backup:
+                return 1
+            with zipfile.ZipFile(dest / 'dataset.zip', 'w') as z:
+                z.writestr('workspace.zip', backup.get('archive', inner.getvalue()))
         else:
             metadata = json.loads((dest / 'dataset-metadata.json').read_text())
             assert metadata['id'] == 'backup/blackthorn-computer-state'
             assert metadata['isPrivate'] is True
-            assert (dest / 'workspace.zip').read_bytes() == b'workspace bytes'
-            assert not any(p.name == 'blackthorn-computer-state.zip' for p in dest.iterdir())
+            with zipfile.ZipFile(dest / 'workspace.zip') as z:
+                assert z.read('uploads/file.txt') == b'saved'
+                assert json.loads(z.read('.blackthorn/checkpoint.json'))['schema'] == 2
+            backup['archive'] = (dest / 'workspace.zip').read_bytes()
         return 0
     result = mirror_state_dataset(Account('primary', 'primary-token', 'computer', 'primary'),
                                   Account('backup', 'backup-token', 'computer', 'backup'), runner=runner)
-    assert result['ok'] is True
-    assert all(bearer for _cmd, bearer in calls)
-    assert [cmd[2] for cmd, _ in calls] == ['download', 'create']
+    assert result['ok'] and result['digest'] and result['generation']
+    assert ('download', 'primary') in calls and ('download', 'backup') in calls
+    assert ('create', 'backup') in calls
+    again = mirror_state_dataset(Account('primary', 'primary-token', 'computer', 'primary'),
+                                 Account('backup', 'backup-token', 'computer', 'backup'), runner=runner)
+    assert again['ok'] and again['unchanged']
+    assert [action for action, _ in calls].count('create') == 1
 
 
 def test_backup_computer_restores_its_own_mirrored_dataset():
@@ -211,24 +225,30 @@ def test_backup_computer_restores_its_own_mirrored_dataset():
 
 
 def test_mirror_preserves_flat_workspace_archive(tmp_path):
-    import json
     import zipfile
     from pathlib import Path
     from blackthorn.fleet import mirror_state_dataset
+    uploaded = {}
     def runner(cmd, env):
         folder = Path(cmd[cmd.index('-p') + 1])
         if cmd[2] == 'download':
+            if env['KAGGLE_USERNAME'] == 'backup' and 'workspace' not in uploaded:
+                return 1
             with zipfile.ZipFile(folder / 'state.zip', 'w') as z:
-                z.writestr('uploads/old-file.txt', 'preserved')
-                z.writestr('.blackthorn/environment.json', '{}')
+                if env['KAGGLE_USERNAME'] == 'backup':
+                    z.writestr('workspace.zip', uploaded['workspace'])
+                else:
+                    z.writestr('uploads/old-file.txt', 'preserved')
+                    z.writestr('.blackthorn/environment.json', '{}')
         else:
-            assert (folder / 'uploads/old-file.txt').read_text() == 'preserved'
-            assert (folder / '.blackthorn/environment.json').read_text() == '{}'
-            assert json.loads((folder / 'dataset-metadata.json').read_text())['id'] == 'backup/blackthorn-computer-state'
+            with zipfile.ZipFile(folder / 'workspace.zip') as z:
+                assert z.read('uploads/old-file.txt') == b'preserved'
+                assert z.read('.blackthorn/environment.json') == b'{}'
+            uploaded['workspace'] = (folder / 'workspace.zip').read_bytes()
         return 0
     result = mirror_state_dataset(Account('primary','token1','computer','primary'),
                                   Account('backup','token2','computer','backup'), runner=runner)
-    assert result['ok'] is True
+    assert result['ok'] and not result['unchanged']
 
 
 def test_delete_verified_by_listing_when_deleted_session_returns_403(monkeypatch):
@@ -335,17 +355,21 @@ def test_mirror_retries_transient_dataset_download_404(monkeypatch):
     from blackthorn.fleet import mirror_state_dataset
     monkeypatch.setattr('time.sleep', lambda seconds: None)
     count = {'download': 0}
+    uploaded = {}
     def runner(cmd, env):
         if cmd[2] == 'download':
             count['download'] += 1
-            if count['download'] == 1:
+            if count['download'] == 1 or (env['KAGGLE_USERNAME'] == 'backup' and not uploaded):
                 return 1
             folder = Path(cmd[cmd.index('-p') + 1])
             with zipfile.ZipFile(folder / 'state.zip', 'w') as z:
-                z.writestr('uploads/file.txt', 'saved')
+                if env['KAGGLE_USERNAME'] == 'backup':
+                    z.writestr('workspace.zip', uploaded['data'])
+                else:
+                    z.writestr('uploads/file.txt', 'saved')
+        else:
+            uploaded['data'] = (Path(cmd[cmd.index('-p') + 1]) / 'workspace.zip').read_bytes()
         return 0
-    # An injectable runner has no stderr. For a deterministic transient failure,
-    # invoke the production retry condition through a CLI-shaped fake subprocess.
     def fake_subprocess(cmd, **kwargs):
         import types
         rc = runner(cmd, kwargs['env'])
@@ -353,8 +377,7 @@ def test_mirror_retries_transient_dataset_download_404(monkeypatch):
     monkeypatch.setattr('subprocess.run', fake_subprocess)
     result = mirror_state_dataset(Account('primary', 'token1', 'computer', 'primary'),
                                   Account('backup', 'token2', 'computer', 'backup'))
-    assert result['ok'] is True
-    assert count['download'] == 2
+    assert result['ok'] and count['download'] >= 3
 
 
 def test_empty_protobuf_listing_proves_backup_absent():
@@ -420,3 +443,38 @@ def test_live_kernel_is_reused_without_save_or_delete():
         account, slug='tester/blackthorn-model', title='Blackthorn model (tester)', notebook_text='{}')
     assert out['_reused'] and out['_session_running']
     assert calls == ['ListKernels', 'GetKernelSessionStatus']
+
+
+def test_running_session_reserved_time_is_projected_without_double_counting():
+    """Kaggle freezes timeUsed until session exit; reservation is NOT actual use."""
+    clock = FakeClock(10000)
+    account = Account('model_primary', 'token', 'model', 'primary')
+    observed = {'used': 100000}
+    def rpc(_method, _body, _token):
+        return {'gpuQuota': {'timeUsed': f"{observed['used']}s",
+                             'timeReserved': '32400s', 'totalTimeAllowed': '108000s'}}
+    fleet = FleetManager([account], fetcher=rpc, clock=clock,
+                         usage_baselines={account.user: (10000, 100000)})
+    assert fleet.quota(account)['remaining_seconds'] == 8000
+    clock.advance(6200)
+    assert fleet.quota(account, force=True)['remaining_seconds'] == 1800
+    observed['used'] = 102000  # provider began charging 2000 of those elapsed seconds
+    assert fleet.quota(account, force=True)['remaining_seconds'] == 1800
+    clock.advance(1)
+    assert fleet.quota(account, force=True)['remaining_seconds'] == 1799
+
+
+def test_mirror_does_not_advertise_unverified_backup_on_readback_mismatch(monkeypatch):
+    import zipfile
+    from pathlib import Path
+    from blackthorn.fleet import mirror_state_dataset
+    monkeypatch.setattr('time.sleep', lambda _: None)
+    def runner(cmd, env):
+        path = Path(cmd[cmd.index('-p') + 1])
+        if cmd[2] == 'download':
+            with zipfile.ZipFile(path / 'state.zip', 'w') as z:
+                z.writestr('saved.txt', 'current' if env['KAGGLE_USERNAME'] == 'primary' else 'outdated')
+        return 0  # even an apparently successful upload is NOT enough
+    out = mirror_state_dataset(Account('primary','t1','computer','primary'),
+                               Account('backup','t2','computer','backup'), runner=runner)
+    assert not out['ok'] and 'identity did not match' in out['error']

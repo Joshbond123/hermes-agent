@@ -61,10 +61,10 @@ describe('Markdown', () => {
     expect(container.querySelector('img')).toBeNull()
   })
 
-  it('batches token updates and reveals complete lines without changing final text', async () => {
+  it('renders every received token immediately and reveals complete lines without changing final text', async () => {
     const { container, rerender } = render(<Markdown text="First" streaming />)
     rerender(<Markdown text={'First\nSecond'} streaming />)
-    expect(container.textContent).toBe('First') // not a per-token DOM update
+    expect(container.textContent).toBe('First\nSecond') // no artificial delay
     await waitFor(() => expect(container.textContent).toBe('First\nSecond'))
     expect(container.querySelectorAll('.stream-line').length).toBeGreaterThanOrEqual(2)
     rerender(<Markdown text={'First\nSecond\nFinal'} />)

@@ -402,3 +402,32 @@ def test_late_notebook_heartbeat_cannot_resurrect_verified_off(srv, monkeypatch)
     assert "WHERE kaggle_gpu_state.status NOT IN" in sql
     assert "'GPU_STOPPED_SAVING_QUOTA'" in sql
     assert params[1] == 'HEARTBEAT_ONLINE'
+
+
+def test_checkpoint_publishes_verified_empty_state_after_last_user_file_deleted(srv, monkeypatch, tmp_path):
+    ws = tmp_path / 'workspace'
+    ws.mkdir()
+    (ws / 'last.txt').write_text('safe test data')
+    monkeypatch.setattr(srv, 'COMPUTER_WORKSPACE', str(ws))
+    monkeypatch.setattr(srv, 'STATE_DIR', str(tmp_path / 'state'))
+    monkeypatch.setattr(srv, 'STATE_MANIFEST', str(tmp_path / 'state' / 'manifest.json'))
+    monkeypatch.setattr(srv, 'STATE_DATASET', 'safe/test-snapshot')
+    monkeypatch.setattr(srv, '_environment_inventory', lambda: {'schema': 1, 'pip': {}, 'apt': []})
+    monkeypatch.setattr(srv, '_kaggle_cli_env', lambda: {'KAGGLE_API_TOKEN': 'test-only'})
+    class Success:
+        returncode = 0
+        stderr = ''
+        stdout = ''
+    def publish(cmd, **kwargs):
+        marker = tmp_path / 'state' / 'workspace' / '.blackthorn' / 'checkpoint.json'
+        assert marker.is_file() and cmd[1:3] == ['datasets', 'version']
+        return Success()
+    monkeypatch.setattr(srv.subprocess, 'run', publish)
+    first = srv.checkpoint_workspace('before-delete')
+    assert first['ok'] and first['files'] >= 1
+    (ws / 'last.txt').unlink()
+    empty = srv.checkpoint_workspace('after-delete')
+    assert empty['ok'] and empty['files'] == 1  # environment inventory only
+    marker = json.loads((ws / '.blackthorn' / 'checkpoint.json').read_text())
+    assert 'last.txt' not in marker['files']
+    assert marker['generation'] == empty['generation']

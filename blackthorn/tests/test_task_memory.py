@@ -283,8 +283,8 @@ async def test_server_context_overflow_compacts_instead_of_wiping(stack):
     second = await stack.stream({"session_id": first.session_id, "message": "SECOND-ANCHOR: keep going"})
     assert second.end["status"] == "stop"
     assert "Continuing after compaction." in second.text
-    notices = [n["text"] for n in second.of("notice")]
-    assert any("trimmed" in n for n in notices), notices
+    assert any(n["stage"] == "overflow_retry" for n in second.of("internal.compaction"))
+    assert not any("compact" in n.get("text", "").lower() for n in second.of("notice"))
     check_wire_protocol(last_request(stack.backend)["messages"])
     assert "SECOND-ANCHOR" in prompt_text(stack.backend), "the current request must survive an overflow"
 

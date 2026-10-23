@@ -97,7 +97,9 @@ class FleetManager:
     def __init__(self, accounts: List[Account], *,
                  fetcher: Optional[Callable[[str, Dict[str, Any], str], Dict[str, Any]]] = None,
                  clock: Callable[[], float] = time.time,
-                 store: Any = None):
+                 store: Any = None,
+                 usage_baselines: Optional[Dict[str, Tuple[float, float]]] = None):
+        self.usage_baselines = usage_baselines or {}  # account -> (session start epoch, used at start)
         self.accounts = {a.user: a for a in accounts}
         self.by_slot: Dict[Tuple[str, str], Account] = {(a.role, a.slot): a for a in accounts}
         self._fetch = fetcher or self._rpc
@@ -153,6 +155,17 @@ class FleetManager:
             "total_seconds": self._seconds(gpu.get("totalTimeAllowed")),
             "refresh_time": str(raw.get("quotaRefreshTime") or ""),
         }
+        baseline = self.usage_baselines.get(account.user)
+        if baseline:
+            started, used_at_start = baseline
+            elapsed = max(0.0, now - started)
+            # Kaggle charges active sessions to timeReserved and may leave
+            # timeUsed frozen until the session ends. Count unreported elapsed
+            # ONCE; if timeUsed advances meanwhile, subtract that advance.
+            if 0 < elapsed < 12 * 3600:
+                already_charged = max(0.0, out["used_seconds"] - used_at_start)
+                out["observed_used_seconds"] = out["used_seconds"]
+                out["used_seconds"] += max(0.0, elapsed - already_charged)
         out["remaining_seconds"] = max(0.0, out["total_seconds"] - out["used_seconds"])
         self._quota_cache[account.user] = (now, out)
         return out
@@ -595,6 +608,7 @@ def notebook_env_for(account: Account, base_env: Dict[str, str]) -> Dict[str, st
     env = dict(base_env)
     env["KAGGLE_USERNAME"] = account.user
     env["KAGGLE_API_TOKEN"] = account.token
+    env["BLACKTHORN_FLEET_SLOT"] = account.slot
     # Shared model cache across primary+backup so neither redownloads after first publish.
     primary_model = None
     primary_computer = None
@@ -612,108 +626,205 @@ def notebook_env_for(account: Account, base_env: Dict[str, str]) -> Dict[str, st
         # Primary owns the state dataset; backup restores from the mirrored copy under its own slug.
         env["COMPUTER_STATE_DATASET"] = f"{account.user}/blackthorn-computer-state"
         env.setdefault("COMPUTER_CHECKPOINT_S", "120")
+        if account.slot == "backup":
+            env["BLACKTHORN_REQUIRE_STATE_SNAPSHOT"] = "1"
     return env
+
+
+_COMPUTER_MIRROR_LOCK = threading.Lock()
 
 
 def mirror_state_dataset(from_account: Account, to_account: Account, *,
                          dataset_slug: str = "blackthorn-computer-state",
                          runner: Optional[Callable[[List[str], Dict[str, str]], int]] = None) -> Dict[str, Any]:
-    """Copy the computer state dataset from one account to its pair partner.
+    """Serialize periodic and threshold mirrors so an older transfer cannot win."""
+    with _COMPUTER_MIRROR_LOCK:
+        return _mirror_state_dataset_unlocked(from_account, to_account,
+                                               dataset_slug=dataset_slug, runner=runner)
 
-    The primary is the source of truth. This runs in the controller (it holds all four
-    credentials) right after checkpoints and before failovers, so the backup always has
-    the newest published generation to boot from.
+
+def _mirror_state_dataset_unlocked(from_account: Account, to_account: Account, *,
+                         dataset_slug: str = "blackthorn-computer-state",
+                         runner: Optional[Callable[[List[str], Dict[str, str]], int]] = None) -> Dict[str, Any]:
+    """Mirror an immutable, SHA-256-identified workspace snapshot to the backup.
+
+    Unchanged generations are not re-uploaded. Kaggle's versioned dataset API
+    stores a whole ZIP when files change; it has no verified file-level delta or
+    atomic live filesystem replication. Do not claim the upload is ready until
+    the backup account can download and verify the same snapshot digest.
     """
+    import hashlib
     import os
-    import json
     import shutil
     import subprocess
     import tempfile
     import zipfile
     from pathlib import Path
 
-    last_cli_error = ""
+    last_error = ""
     def _run(cmd: List[str], env: Dict[str, str]) -> int:
-        nonlocal last_cli_error
+        nonlocal last_error
         if runner is not None:
             return runner(cmd, env)
         proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=1800)
         if proc.returncode:
-            import re
-            # Owner-facing diagnostics must never echo credentials or bearer headers.
-            last_cli_error = (proc.stderr or proc.stdout or "CLI failed")[-350:]
+            # No CLI transcript or bearer token goes to the caller.
+            text = (proc.stderr or proc.stdout or "CLI failed")[-350:]
             for secret in (from_account.token, to_account.token):
                 if secret:
-                    last_cli_error = last_cli_error.replace(secret, "[redacted]")
-            last_cli_error = re.sub(r"KGAT_[A-Za-z0-9_-]+", "[redacted]", last_cli_error)
-            last_cli_error = last_cli_error.replace("\n", " ")[:180]
+                    text = text.replace(secret, "[redacted]")
+            import re
+            last_error = re.sub(r"KGAT_[A-Za-z0-9_-]+", "[redacted]", text).replace("\n", " ")[:180]
         return proc.returncode
 
-    src_slug = f"{from_account.user}/{dataset_slug}"
-    dst_slug = f"{to_account.user}/{dataset_slug}"
-    with tempfile.TemporaryDirectory() as tmp:
-        download = Path(tmp) / "download"
-        upload = Path(tmp) / "upload"
-        download.mkdir()
-        upload.mkdir()
-        # KGAT tokens require Bearer auth. KAGGLE_KEY is a legacy Basic credential.
-        base_env = dict(os.environ)
-        env_down = {**base_env, "KAGGLE_USERNAME": from_account.user,
-                    "KAGGLE_API_TOKEN": from_account.token}
-        env_down.pop("KAGGLE_KEY", None)
-        # A freshly published Kaggle dataset version can briefly return 404 on
-        # the download endpoint even while datasets/view reports the new version.
-        # Retry only transient 404/429/5xx responses, never authentication errors.
-        import time as _t
-        for attempt in range(5):
-            rc = _run(["kaggle", "datasets", "download", "-p", str(download), src_slug], env_down)
-            if rc == 0:
-                break
-            transient = any(code in last_cli_error for code in ("404", "429", "500", "502", "503", "504"))
-            if not transient or attempt == 4:
-                return {"ok": False, "error": f"download rc={rc}: {last_cli_error}"}
-            _t.sleep((4, 8, 12, 20)[attempt])
-        archives = list(download.glob("*.zip"))
+    def _unpack(folder: Path, target: Path) -> None:
+        archives = list(folder.glob("*.zip"))
         if len(archives) != 1:
-            return {"ok": False, "error": "expected one downloaded state archive"}
-        try:
-            with zipfile.ZipFile(archives[0]) as zf:
-                # Kaggle may return a flat workspace archive OR an archive with
-                # workspace.zip (older CLI). Both are valid snapshots.
-                copied = 0
-                total = 0
+            raise ValueError("expected exactly one state archive")
+        target.mkdir(parents=True, exist_ok=True)
+        def extract(archive: Path, into: Path) -> None:
+            total = 0
+            with zipfile.ZipFile(archive) as zf:
                 for info in zf.infolist():
-                    if info.is_dir() or info.filename == "dataset-metadata.json":
+                    if info.is_dir():
                         continue
-                    path = Path(info.filename)
+                    rel = Path(info.filename)
                     mode = (info.external_attr >> 16) & 0o170000
-                    if path.is_absolute() or ".." in path.parts or mode == 0o120000:
-                        return {"ok": False, "error": "unsafe path in state archive"}
+                    if rel.is_absolute() or ".." in rel.parts or mode == 0o120000:
+                        raise ValueError("unsafe path in state archive")
                     total += info.file_size
-                    if total > 25 * 1024**3 or copied >= 10000:
-                        return {"ok": False, "error": "state archive exceeds mirror limits"}
-                    dest = upload / path
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    with zf.open(info) as src, dest.open("wb") as dst:
+                    if total > 25 * 1024**3:
+                        raise ValueError("state archive exceeds mirror limits")
+                    destination = into / rel
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    with zf.open(info) as src, destination.open("wb") as dst:
                         shutil.copyfileobj(src, dst, 8 * 1024 * 1024)
-                    copied += 1
-                if copied == 0:
-                    return {"ok": False, "error": "state archive has no workspace snapshot"}
-        except (OSError, KeyError, zipfile.BadZipFile):
-            return {"ok": False, "error": "state archive is corrupt"}
-        (upload / "dataset-metadata.json").write_text(json.dumps({
-            "title": "Blackthorn Computer State", "id": dst_slug, "isPrivate": True,
-            "licenses": [{"name": "other"}]
-        }))
-        env_up = {**base_env, "KAGGLE_USERNAME": to_account.user,
-                  "KAGGLE_API_TOKEN": to_account.token}
-        env_up.pop("KAGGLE_KEY", None)
-        rc = _run(["kaggle", "datasets", "create", "-p", str(upload), "--dir-mode", "skip"], env_up)
-        if rc != 0:
-            rc = _run(["kaggle", "datasets", "version", "-p", str(upload),
-                       "-m", "mirror", "--dir-mode", "skip"], env_up)
-        return {"ok": rc == 0, "from": src_slug, "to": dst_slug,
-                "error": "" if rc == 0 else f"upload rc={rc}: {last_cli_error}"}
+        extract(archives[0], target)
+        inner = target / "workspace.zip"
+        if inner.is_file():
+            with tempfile.TemporaryDirectory() as stage:
+                stage_path = Path(stage)
+                extract(inner, stage_path)
+                inner.unlink()
+                for child in stage_path.iterdir():
+                    dest = target / child.name
+                    if dest.exists():
+                        raise ValueError("conflicting snapshot entry")
+                    shutil.move(str(child), str(dest))
+        (target / "dataset-metadata.json").unlink(missing_ok=True)
+
+    def _identity(root: Path, *, create_legacy: bool = False) -> Dict[str, Any]:
+        files: Dict[str, Any] = {}
+        marker = root / ".blackthorn" / "checkpoint.json"
+        for f in root.rglob("*"):
+            if f.is_symlink():
+                raise ValueError("unsafe snapshot symlink")
+            if not f.is_file() or f == marker or f.name == "dataset-metadata.json" :
+                continue
+            rel = f.relative_to(root).as_posix()
+            if len(files) >= 10000:
+                raise ValueError("snapshot exceeds file limit")
+            sha = hashlib.sha256()
+            with f.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    sha.update(chunk)
+            files[rel] = {"size": f.stat().st_size, "sha256": sha.hexdigest()}
+        digest = hashlib.sha256(json.dumps(files, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        if marker.is_file():
+            data = json.loads(marker.read_text())
+            if data.get("schema") != 2 or data.get("files") != files or data.get("digest") != digest:
+                raise ValueError("checkpoint manifest does not match snapshot")
+            return {"generation": data["generation"], "digest": digest, "files": len(files)}
+        if not create_legacy or not files:
+            raise ValueError("backup dataset has no verified snapshot")
+        # Migrate a readable pre-manifest snapshot when the primary is already
+        # offline. This cannot recover changes not in its last published dataset.
+        generation = int(__import__("time").time_ns())
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({"schema": 2, "generation": generation,
+                                      "files": files, "digest": digest}, sort_keys=True))
+        return {"generation": generation, "digest": digest, "files": len(files)}
+
+    source = f"{from_account.user}/{dataset_slug}"
+    target = f"{to_account.user}/{dataset_slug}"
+    base = dict(os.environ)
+    def account_env(a: Account) -> Dict[str, str]:
+        env = {**base, "KAGGLE_USERNAME": a.user, "KAGGLE_API_TOKEN": a.token}
+        env.pop("KAGGLE_KEY", None)
+        return env
+    import time as _t
+    def download(folder: Path, slug: str, account: Account) -> bool:
+        folder.mkdir(parents=True, exist_ok=True)
+        for attempt in range(5):
+            rc = _run(["kaggle", "datasets", "download", "-p", str(folder), slug], account_env(account))
+            if rc == 0:
+                return True
+            if not any(code in last_error for code in ("404", "429", "500", "502", "503", "504")) or attempt == 4:
+                return False
+            _t.sleep((4, 8, 12, 20)[attempt])
+        return False
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            if not download(root / "src_download", source, from_account):
+                return {"ok": False, "error": f"source download failed: {last_error}"}
+            src = root / "source"
+            _unpack(root / "src_download", src)
+            identity = _identity(src, create_legacy=True)
+            # A versioned dataset is immutable: compare content identities before
+            # upload and skip unchanged generations, even if the timestamp differs.
+            previous = root / "old_download"
+            destination_exists = download(previous, target, to_account)
+            if destination_exists:
+                try:
+                    old = root / "old"
+                    _unpack(previous, old)
+                    prior_identity = _identity(old)
+                    if prior_identity["digest"] == identity["digest"]:
+                        return {"ok": True, "unchanged": True, "from": source, "to": target,
+                                "source_generation": identity["generation"], **prior_identity}
+                except (OSError, ValueError, KeyError, zipfile.BadZipFile):
+                    pass  # corrupt/stale destination must be replaced, not reused
+            upload = root / "upload"
+            upload.mkdir()
+            with zipfile.ZipFile(upload / "workspace.zip", "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for item in src.rglob("*"):
+                    if item.is_file() and item.name != "dataset-metadata.json":
+                        zf.write(item, item.relative_to(src).as_posix())
+            (upload / "dataset-metadata.json").write_text(json.dumps({
+                "title": "Blackthorn Computer State", "id": target, "isPrivate": True,
+                "licenses": [{"name": "other"}]}))
+            env = account_env(to_account)
+            # kaggle datasets create may return exit 0 even for an existing slug.
+            # Choose version when authenticated download proved it already exists.
+            if destination_exists:
+                rc = _run(["kaggle", "datasets", "version", "-p", str(upload),
+                           "-m", "mirror", "--dir-mode", "skip"], env)
+            else:
+                rc = _run(["kaggle", "datasets", "create", "-p", str(upload), "--dir-mode", "skip"], env)
+                if rc:
+                    rc = _run(["kaggle", "datasets", "version", "-p", str(upload),
+                               "-m", "mirror", "--dir-mode", "skip"], env)
+            if rc:
+                return {"ok": False, "error": f"upload failed: {last_error}"}
+            # Read back using backup credentials. Propagation can lag; retry the
+            # same identity check, never trust the version/create HTTP response.
+            for attempt in range(5):
+                check = root / f"verified_{attempt}"
+                if download(check, target, to_account):
+                    try:
+                        dst = root / f"dst_{attempt}"
+                        _unpack(check, dst)
+                        actual = _identity(dst)
+                        if actual["digest"] == identity["digest"] and actual["generation"] == identity["generation"]:
+                            return {"ok": True, "unchanged": False, "from": source, "to": target, **identity}
+                    except (OSError, ValueError, KeyError, zipfile.BadZipFile):
+                        pass
+                if attempt < 4:
+                    _t.sleep((4, 8, 12, 20)[attempt])
+            return {"ok": False, "error": "backup dataset readback identity did not match source"}
+    except (OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "error": f"snapshot mirror failed: {type(exc).__name__}"}
 
 
 def accounts_from_env(env: Dict[str, str]) -> List[Account]:

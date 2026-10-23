@@ -191,7 +191,7 @@ class AgentRun:
 
     # ------------------------------------------------------------------ helpers
     def text(self) -> str:
-        return "\n\n".join(p["text"].strip() for p in self.parts if p["type"] == "text" and p["text"].strip())
+        return "\n\n".join(p["text"] for p in self.parts if p["type"] == "text" and p["text"])
 
     def _elapsed_ms(self) -> int:
         return int((time.monotonic() - self._t0) * 1000)
@@ -478,8 +478,7 @@ class AgentRun:
         messages += history
         self._history_len = len(history)
         if dropped:
-            self.run.emit("notice", level="info",
-                          text=f"Earlier turns were summarised to fit the model window ({dropped} compacted).")
+            self.run.emit("internal.compaction", count=dropped, stage="history")
         messages.append({"role": "user", "content": self.user_message})
         self._messages = messages
 
@@ -553,8 +552,7 @@ class AgentRun:
                     True,
                 )
             if len(messages) < before:
-                self.run.emit("notice", level="info",
-                              text="Earlier turns were compacted so this conversation can continue in the model window.")
+                self.run.emit("internal.compaction", stage="mid_task")
                 # Mid-task resume after compaction (Hermes-style): the model must not answer from a hole.
                 if messages[-1].get("role") == "tool":
                     messages.append({"role": "user", "content": RESUME_NOTE})
@@ -583,8 +581,7 @@ class AgentRun:
                         if m.get("role") == "tool" and len(m["content"]) > 400:
                             m["content"] = m["content"][:400] + "\n[… clipped to fit the context window …]"
                 self._force_compact()
-                self.run.emit("notice", level="info",
-                              text="The conversation was too long for the model window; trimmed and compacted it, then retried.")
+                self.run.emit("internal.compaction", stage="overflow_retry")
                 if messages[-1].get("role") == "tool":
                     messages.append({"role": "user", "content": RESUME_NOTE})
                 continue
@@ -629,7 +626,6 @@ class AgentRun:
         acc: Dict[int, Dict[str, str]] = {}
         text_chunks: List[str] = []
         finish: Optional[str] = None
-        lead_trim = True
 
         def start_thinking() -> None:
             nonlocal thinking_since
@@ -647,12 +643,6 @@ class AgentRun:
                 thinking_since = None
 
         def visible(text: str) -> None:
-            nonlocal lead_trim
-            if lead_trim:
-                text = text.lstrip()
-                if not text:
-                    return
-                lead_trim = False
             end_thinking()
             text_chunks.append(text)
             self._emit_text(text)

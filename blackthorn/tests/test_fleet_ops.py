@@ -101,17 +101,23 @@ def test_failover_syncs_state_before_booting_the_backup(ops):
     try:
         import unittest.mock as mock
         with mock.patch.object(_d, "_role_intended_online", lambda role: True), \
+             mock.patch.object(_d, "_fleet_role_online", lambda role: True), \
+             mock.patch.object(_d, "checkpoint_computer", lambda timeout=220: {"ok": True}), \
+             mock.patch.object(_d, "_durable_active_runs", lambda: 0), \
              mock.patch.object(_d, "_role_boot_in_progress", lambda role: False), \
              mock.patch.object(FleetManager, "start_kernel", fake_start), \
+             mock.patch.object(FleetManager, "stop_kernel_result",
+                               lambda self, account, slug: order.append(f"stop:{account.user}") or {"state": "stopped"}), \
              mock.patch.object(FleetManager, "rpc",
-                               lambda self, account, method, body=None: order.append(f"{method}:{account.user}") or {"ok": True}):
+                               lambda self, account, method, body=None: order.append(f"{method}:{account.user}") or {"status": "RUNNING"}):
             out = _d.failover_fleet_role("computer", "primary", "backup")
     finally:
         fm.mirror_state_dataset = orig_mirror
     assert out["account"] == "alagbo"
     assert order.index("sync") < order.index("boot:alagbo")           # state first, then switch
-    assert "GetKernelSessionStatus:josh787" in order                  # old primary retire attempted after
-    assert order.index("boot:alagbo") < order.index("GetKernelSessionStatus:josh787")
+    assert out['ok'] and out['status'] == 'ready'
+    assert "stop:josh787" in order
+    assert order.index("boot:alagbo") < order.index("stop:josh787")
 
 
 def test_resource_exhaustion_is_reported_not_hidden(ops):
@@ -142,3 +148,111 @@ def test_recent_heartbeat_reuses_model_when_gateway_probe_times_out(ops, monkeyp
     assert out['model']['status'] == 'reconnecting'
     assert out['computer']['status'] == 'already_starting'
     assert ops['starts'] == []
+
+
+def test_computer_failover_refuses_failed_checkpoint_and_keeps_old(ops, monkeypatch):
+    monkeypatch.setattr(d1, '_role_intended_online', lambda role: True)
+    monkeypatch.setattr(d1, '_role_boot_in_progress', lambda role: False)
+    monkeypatch.setattr(d1, '_fleet_role_online', lambda role: True)
+    monkeypatch.setattr(d1, 'checkpoint_computer', lambda timeout=220: {'ok': False})
+    monkeypatch.setattr(d1, '_fleet_manager_with_usage', lambda accounts: FleetManager(accounts))
+    out = d1.failover_fleet_role('computer', 'primary', 'backup')
+    assert out['status'] == 'checkpoint_failed' and not out['ok']
+    assert not ops['starts']
+    assert not any(method == 'DeleteKernel' for method, _account in ops['rpcs'])
+
+
+def test_computer_failover_refuses_failed_dataset_mirror(ops, monkeypatch):
+    monkeypatch.setattr(d1, '_role_intended_online', lambda role: True)
+    monkeypatch.setattr(d1, '_role_boot_in_progress', lambda role: False)
+    monkeypatch.setattr(d1, '_fleet_role_online', lambda role: False)
+    monkeypatch.setattr(d1, '_fleet_manager_with_usage', lambda accounts: FleetManager(accounts))
+    monkeypatch.setattr('blackthorn.fleet.mirror_state_dataset',
+                        lambda *args: {'ok': False, 'error': 'unavailable'})
+    out = d1.failover_fleet_role('computer', 'primary', 'backup')
+    assert out['status'] == 'sync_failed' and not out['ok']
+    assert not ops['starts']
+
+
+def test_model_backup_waits_for_live_owner_and_does_not_stop_primary_early(ops, monkeypatch):
+    monkeypatch.setattr(d1, '_role_intended_online', lambda role: True)
+    monkeypatch.setattr(d1, '_role_boot_in_progress', lambda role: False)
+    monkeypatch.setattr(d1, '_fleet_role_online', lambda role: True)
+    monkeypatch.setattr(d1, '_durable_active_runs', lambda: 0)
+    monkeypatch.setattr(d1, '_fleet_manager_with_usage', lambda accounts: FleetManager(accounts))
+    events = []
+    import blackthorn.fleet as fm
+    def rpc(self, account, method, body=None):
+        if method == 'GetKernelSessionStatus':
+            events.append('owner')
+            return {'status': 'RUNNING' if len(events) >= 2 else 'QUEUED'}
+        return {'ok': True}
+    monkeypatch.setattr(fm.FleetManager, 'rpc', rpc)
+    monkeypatch.setattr(fm.FleetManager, 'stop_kernel_result',
+                        lambda self, account, slug: events.append('old_stopped') or {'state': 'stopped'})
+    monkeypatch.setattr(d1.time, 'sleep', lambda seconds: None)
+    out = d1.failover_fleet_role('model', 'primary', 'backup')
+    assert out['ok'] and out['status'] == 'ready'
+    assert events == ['owner', 'owner', 'old_stopped']
+
+
+def test_computer_recovery_syncs_backup_to_primary_before_automatic_return(ops, monkeypatch):
+    """After backup has accepted writes, returning to primary cannot revive old files."""
+    events = []
+    monkeypatch.setattr(d1, '_computer_authoritative_slot', lambda: 'backup')
+    monkeypatch.setattr(d1, '_fleet_role_online', lambda role: False)
+    monkeypatch.setattr('blackthorn.fleet.mirror_state_dataset',
+                        lambda old, new: events.append(('sync', old.slot, new.slot)) or {'ok': True, 'digest': 'fresh'})
+    def fake_start(self, account, **kwargs):
+        events.append(('boot', account.slot))
+        return {'_slug': f'{account.user}/blackthorn-computer', '_session_running': True}
+    monkeypatch.setattr(FleetManager, 'start_kernel', fake_start)
+    d1.turn_on_fleet(blocking=True)
+    assert events.index(('sync', 'backup', 'primary')) < events.index(('boot', 'primary'))
+
+
+def test_watchdog_transition_retries_failed_model_and_computer_switches(ops, monkeypatch):
+    accounts = list(ACCOUNTS)
+    fleet = FleetManager(accounts)
+    monkeypatch.setattr(d1, '_fleet_manager_with_usage', lambda a: FleetManager(a))
+    checks = {'model': 0, 'computer': 0}
+    def fake_switch(role, old, new):
+        checks[role] += 1
+        return {'ok': checks[role] > 1, 'status': 'ready' if checks[role] > 1 else 'sync_failed'}
+    monkeypatch.setattr(d1, 'failover_fleet_role', fake_switch)
+    for role in ('model', 'computer'):
+        token = 'tp' if role == 'model' else 'cp'
+        ops['quota'][token] = 29 * 60
+        first = fleet.decide(role, force=True)
+        assert first.active == 'backup'
+        failed = d1._execute_fleet_transition(fleet, role, 'primary', 'backup', accounts)
+        assert not failed['ok'] and fleet.state[role].active == 'primary'
+        assert fleet.decide(role, force=True).active == 'backup'
+        ready = d1._execute_fleet_transition(fleet, role, 'primary', 'backup', accounts)
+        assert ready['ok'] and fleet.state[role].active == 'backup'
+        assert checks[role] == 2
+
+
+def test_old_model_is_deferred_during_an_agent_task_then_retired_safely(ops, monkeypatch):
+    monkeypatch.setattr(d1, '_role_intended_online', lambda role: True)
+    monkeypatch.setattr(d1, '_role_boot_in_progress', lambda role: False)
+    monkeypatch.setattr(d1, '_fleet_role_online', lambda role: True)
+    monkeypatch.setattr(d1, '_fleet_manager_with_usage', lambda accounts: FleetManager(accounts))
+    monkeypatch.setattr(d1, '_durable_active_runs', lambda: 1)
+    monkeypatch.setattr(d1, '_set_meta', lambda key, value: ops.setdefault('meta', []).append((key, value)))
+    monkeypatch.setattr(FleetManager, 'rpc',
+                        lambda self, account, method, body=None: {'status': 'RUNNING'} if method == 'GetKernelSessionStatus' else {'ok': True})
+    out = d1.failover_fleet_role('model', 'primary', 'backup')
+    assert out['ok'] and out['old_stopped']['state'] == 'deferred'
+    assert not any(method == 'DeleteKernel' for method, _ in ops['rpcs'])
+    assert ('bt_fleet_retire:model', 'primary') in ops['meta']
+    fleet = FleetManager(list(ACCOUNTS))
+    fleet.state['model'].active = 'backup'
+    monkeypatch.setattr(d1, '_durable_active_runs', lambda: 0)
+    monkeypatch.setattr(d1, 'd1_query', lambda sql, *a: [{'key':'bt_fleet_retire:model', 'value':'primary'}])
+    stops = []
+    monkeypatch.setattr(FleetManager, 'stop_kernel_result',
+                        lambda self, account, slug: stops.append(account.slot) or {'state': 'stopped'})
+    d1._retire_verified_old_slots(fleet)
+    assert stops == ['primary']
+    assert ('bt_fleet_retire:model', '') in ops['meta']

@@ -124,5 +124,6 @@ export type ServerEvent =
   | (Base & { type: 'tool.start'; id: string; name: string; summary: string; step?: number })
   | (Base & { type: 'tool.end'; id: string; name: string; status: 'ok' | 'error'; summary: string; duration_ms: number; error?: string | null; output?: string | null; sources?: Source[] | null; answer?: string | null; exit_code?: number | null; truncated?: boolean })
   | (Base & { type: 'notice'; level: 'info' | 'warn' | 'error'; text: string })
+  | (Base & { type: 'internal.compaction'; stage: string; count?: number })
   | (Base & ({ type: 'error' } & RunError))
   | (Base & { type: 'run.end'; status: Status; finish_reason?: string | null; duration_ms: number; first_token_ms?: number | null; message_id: string; session_id: string; steps: number; tool_calls: number; usage?: { prompt: number; completion: number }; saved?: boolean })

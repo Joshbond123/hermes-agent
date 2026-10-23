@@ -1691,7 +1691,10 @@ def _fleet_role_online(role: str) -> bool:
         url = str(row["tunnel_url"]).rstrip("/")
         req = urllib.request.Request(url + "/health", headers={"skip_zrok_interstitial": "true"})
         with urllib.request.urlopen(req, timeout=8) as resp:
-            return resp.status == 200 and resp.headers.get("Content-Type", "").startswith("application/json")
+            if resp.status != 200 or not resp.headers.get("Content-Type", "").startswith("application/json"):
+                return False
+            health = json.load(resp)
+            return bool(health.get("model_loaded")) and health.get("status") == "online"
     except (urllib.error.URLError, OSError, RuntimeError, ValueError, TypeError, KeyError):
         return False
 
@@ -1809,6 +1812,55 @@ def com11_stop() -> Dict[str, Any]:
     return {"ok": True, "status": "cancelled", "run_id": state.get("run_id")}
 
 
+def _fleet_manager_with_usage(accounts):
+    """Restore per-session quota accounting across watchdog/Render restarts."""
+    from blackthorn.fleet import FleetManager
+    usage = {}
+    try:
+        rows = d1_query("SELECT key, value FROM state_meta WHERE key LIKE 'bt_fleet_%';")
+    except (OSError, ValueError, RuntimeError, urllib.error.URLError):
+        rows = []
+    for account in accounts:
+        try:
+            key = f"bt_fleet_usage:{account.role}:{account.slot}"
+            row = next((item for item in rows if item.get("key") == key), None)
+            data = json.loads(row["value"]) if row else {}
+            started = float(data.get("started") or 0)
+            if 0 < time.time() - started < 12 * 3600:
+                usage[account.user] = (started, float(data["used_at_start"]))
+        except (OSError, ValueError, KeyError, TypeError, IndexError):
+            pass
+    fleet = FleetManager(accounts, usage_baselines=usage)
+    for role in ("model", "computer"):
+        row = next((item for item in rows if item.get("key") == f"bt_fleet_active:{role}"), None)
+        if row and row.get("value") in ("primary", "backup"):
+            fleet.state[role].active = row["value"]
+            fleet.state[role].reason = "restored_active_slot"
+    return fleet
+
+
+def _computer_authoritative_slot() -> str:
+    try:
+        rows = d1_query("SELECT value FROM state_meta WHERE key='bt_fleet_authoritative:computer' LIMIT 1;")
+        slot = str(rows[0].get("value") or "") if rows else ""
+        return slot if slot in ("primary", "backup") else "primary"
+    except (OSError, ValueError, RuntimeError, urllib.error.URLError):
+        return "primary"
+
+
+def _record_fleet_session(fleet, account, push):
+    """Record a successfully accepted new session, never a reused session."""
+    if push.get("_reused"):
+        return
+    try:
+        raw = fleet.rpc(account, "GetAcceleratorQuotaStatistics", {})
+        used = fleet._seconds((raw.get("gpuQuota") or {}).get("timeUsed"))
+        key = f"bt_fleet_usage:{account.role}:{account.slot}"
+        _set_meta(key, json.dumps({"started": time.time(), "used_at_start": used}))
+    except Exception as exc:
+        logger.warning("fleet session quota baseline unavailable: %s", type(exc).__name__)
+
+
 def turn_on_fleet(blocking: bool = False) -> Dict[str, Any]:
     """Start the model GPU and the computer GPU TOGETHER on their fleet-active accounts.
 
@@ -1829,7 +1881,7 @@ def turn_on_fleet(blocking: bool = False) -> Dict[str, Any]:
     if not accounts:
         # legacy single-account behaviour
         return turn_on_kaggle_gpu()
-    fleet = FleetManager(accounts)
+    fleet = _fleet_manager_with_usage(accounts)
     plan: Dict[str, Any] = {}
     for role in ("model", "computer"):
         reusable = _fleet_role_online(role)
@@ -1874,6 +1926,24 @@ def turn_on_fleet(blocking: bool = False) -> Dict[str, Any]:
             _write_fleet_row(row_id, "BOOT_FAILED", gpu_info=f"FAILED: {exc}")
             return {"role": role, "account": account.user, "status": "build_failed", "error": str(exc)[:200]}
         slug = kernel_slug_for(account)
+        # A cold backup must restore a checked primary snapshot, never an old
+        # account-local dataset that happened to be mounted on the last boot.
+        if role == "computer":
+            source_slot = _computer_authoritative_slot()
+            source = fleet.by_slot.get(("computer", source_slot))
+            if source is not None and source.user != account.user:
+                from blackthorn.fleet import mirror_state_dataset
+                if _fleet_role_online("computer"):
+                    ckpt = checkpoint_computer(timeout=220)
+                    if not ckpt.get("ok"):
+                        _write_fleet_row(row_id, "BOOT_FAILED", gpu_info="Computer checkpoint could not be verified")
+                        return {"role": role, "account": account.user, "status": "sync_failed",
+                                "error": "live computer checkpoint was not verified"}
+                sync = mirror_state_dataset(source, account)
+                if not sync.get("ok"):
+                    _write_fleet_row(row_id, "BOOT_FAILED", gpu_info="Computer dataset mirror could not be verified")
+                    return {"role": role, "account": account.user, "status": "sync_failed",
+                            "error": str(sync.get("error") or "dataset mirror not verified")[:180]}
         _write_fleet_row(row_id, "BOOTING_KAGGLE_GPU", gpu_info=f"Allocating on {account.user}...")
         # Attach persistent datasets when available so boots restore instead of redownload.
         datasets = []
@@ -1893,6 +1963,10 @@ def turn_on_fleet(blocking: bool = False) -> Dict[str, Any]:
         try:
             out = fleet.start_kernel(account, slug=slug, title=f"Blackthorn {role} ({account.user})",
                                      notebook_text=text, datasets=datasets or None)
+            _record_fleet_session(fleet, account, out)
+            _set_meta(f"bt_fleet_active:{role}", st.active)
+            if role == "computer":
+                _set_meta("bt_fleet_authoritative:computer", st.active)
             return {"role": role, "account": account.user, "slug": out.get("_slug", slug),
                     "slot": st.active, "reason": st.reason,
                     "status": "starting" if out.get("_session_running") is not False else "submitted_unconfirmed",
@@ -1966,31 +2040,60 @@ def failover_fleet_role(role: str, from_slot: str, to_slot: str) -> Dict[str, An
     if _role_boot_in_progress(role):
         return {"ok": False, "status": "already_booting", "role": role}
     accounts = accounts_from_env(os.environ)
-    fleet = FleetManager(accounts)
+    fleet = _fleet_manager_with_usage(accounts)
     old = fleet.by_slot.get((role, from_slot))
     new = fleet.by_slot.get((role, to_slot))
     if new is None:
         return {"ok": False, "error": "no account for the new active slot"}
     out: Dict[str, Any] = {"role": role, "from": from_slot, "to": to_slot, "account": new.user}
-    # A Render restart forgets its in-memory active slot. If the desired backup
-    # already hosts the public healthy role, do NOT re-push it (that would stop
-    # an active agent task just because the primary account's key is invalid).
-    try:
-        existing = fleet.find_role_kernel(new)
-        if existing and _fleet_role_online(role):
-            slug = str(existing.get("slug") or "").split("/")[-1]
-            session = fleet.rpc(new, "GetKernelSessionStatus", {"userName": new.user, "kernelSlug": slug})
-            if str(session.get("status") or "").upper() == "RUNNING":
-                return {**out, "ok": True, "status": "already_online", "slug": existing["slug"]}
-    except Exception as exc:
-        logger.info("failover reuse probe unavailable: %s", type(exc).__name__)
+    old_computer_jobs = None
+    if role == "computer" and _fleet_role_online(role):
+        try:
+            source_activity = _computer_request("/computer/activity", None, 8)
+            if source_activity.get("fleet_slot") == from_slot:
+                old_computer_jobs = source_activity.get("active_jobs")
+        except (OSError, ValueError, RuntimeError, urllib.error.URLError):
+            pass
+    # On a controller restart the backup may already be the verified active
+    # computer. Never mirror an OLDER primary snapshot onto this live backup.
+    # Reuse only when the durable active/source slot agrees AND the backup's
+    # own kernel plus restored snapshot identity are observable.
+    if fleet.state[role].active == to_slot and (role != "computer" or _computer_authoritative_slot() == to_slot):
+        try:
+            existing = fleet.find_role_kernel(new)
+            if existing and _fleet_role_online(role):
+                session = fleet.rpc(new, "GetKernelSessionStatus", {
+                    "userName": new.user, "kernelSlug": existing["slug"].split("/")[-1]})
+                verified = str(session.get("status") or "").upper() == "RUNNING"
+                if role == "computer":
+                    activity = _computer_request("/computer/activity", None, 8)
+                    verified = verified and (activity.get("fleet_slot") == to_slot and
+                                              bool(activity.get("state_digest") and activity.get("state_generation")))
+                else:
+                    rows = d1_query("SELECT tunnel_url FROM kaggle_gpu_state WHERE id='primary' LIMIT 1;")
+                    url = str(rows[0].get("tunnel_url") or "").rstrip("/") if rows else ""
+                    req = urllib.request.Request(url + "/health", headers={"skip_zrok_interstitial": "true"})
+                    with urllib.request.urlopen(req, timeout=8) as resp:
+                        verified = verified and json.load(resp).get("fleet_slot") == to_slot
+                if verified:
+                    return {**out, "ok": True, "status": "already_online", "slug": existing["slug"]}
+        except (OSError, ValueError, KeyError, RuntimeError, urllib.error.URLError) as exc:
+            logger.info("verified backup reuse unavailable: %s", type(exc).__name__)
 
     # 1) bring the pair as close as possible before switching (computer state only)
-    if role == "computer" and old is not None and from_slot == "primary":
+    if role == "computer" and old is not None and old.user != new.user:
+        # The dataset is published every 120s, but work since the last snapshot
+        # must also survive a planned quota handover. Do not boot stale data.
+        if _fleet_role_online("computer"):
+            out["checkpoint"] = checkpoint_computer(timeout=220)
+            if not out["checkpoint"].get("ok"):
+                return {**out, "ok": False, "status": "checkpoint_failed"}
         try:
             out["sync"] = mirror_state_dataset(old, new)
         except Exception as exc:  # noqa: BLE001
-            out["sync"] = {"ok": False, "error": str(exc)[:160]}
+            out["sync"] = {"ok": False, "error": type(exc).__name__}
+        if not out["sync"].get("ok"):
+            return {**out, "ok": False, "status": "sync_failed"}
 
     # The user may have shut this role down while the dataset mirror was running.
     # Re-check immediately before any chargeable Kaggle kernel push.
@@ -2015,21 +2118,108 @@ def failover_fleet_role(role: str, from_slot: str, to_slot: str) -> Dict[str, An
                 pass
         else:
             datasets.append(f"{new.user}/blackthorn-computer-state")
-        fleet.start_kernel(new, slug=slug, title=f"Blackthorn {role} ({new.user})",
-                           notebook_text=text, datasets=datasets or None)
+        push = fleet.start_kernel(new, slug=slug, title=f"Blackthorn {role} ({new.user})",
+                                  notebook_text=text, datasets=datasets or None)
+        _record_fleet_session(fleet, new, push)
+        slug = str(push.get("_slug") or slug)
         out.update(status="starting", slug=slug)
     except Exception as exc:  # noqa: BLE001
         _write_fleet_row(row_id, "BOOT_FAILED", gpu_info=f"FAILED: {exc}")
         out.update(status="start_failed", error=str(exc)[:200])
         return out
 
-    # 3) stop the old active's kernel only after the new one is on its way
+    # An accepted notebook version is not readiness. Verify the backup's OWN
+    # session and its live role endpoint before stopping the primary.
+    deadline = time.monotonic() + 900
+    while time.monotonic() < deadline:
+        if not _role_intended_online(role):
+            return {**out, "ok": False, "status": "skipped_off"}
+        if _fleet_role_online(role):
+            try:
+                if role == "computer" and out.get("sync", {}).get("digest"):
+                    activity = _computer_request("/computer/activity", None, 8)
+                    if (activity.get("fleet_slot") != to_slot or
+                            activity.get("state_digest") != out["sync"]["digest"] or
+                            activity.get("state_generation") != out["sync"]["generation"]):
+                        time.sleep(10)
+                        continue  # live tunnel but the expected workspace is NOT restored
+                session = fleet.rpc(new, "GetKernelSessionStatus",
+                                    {"userName": new.user, "kernelSlug": slug.split("/")[-1]})
+                if str(session.get("status") or "").upper() == "RUNNING":
+                    out.update(ok=True, status="ready")
+                    _set_meta(f"bt_fleet_active:{role}", to_slot)
+                    if role == "computer":
+                        _set_meta("bt_fleet_authoritative:computer", to_slot)
+                    break
+            except Exception as exc:  # noqa: BLE001
+                logger.info("backup owner readiness probe: %s", type(exc).__name__)
+        time.sleep(10)
+    if not out.get("ok"):
+        return {**out, "ok": False, "status": "readiness_unverified"}
     if old is not None:
-        try:
-            out["old_stopped"] = fleet.stop_kernel_session(old, kernel_slug_for(old))
-        except Exception:  # noqa: BLE001
-            out["old_stopped"] = False
+        leases = _durable_active_runs()
+        if leases != 0 or (role == "computer" and old_computer_jobs not in (0, None)):
+            # Do not terminate a notebook that still owns running work. A live
+            # process cannot be migrated as a file; report the deferred stop.
+            out["old_stopped"] = {"state": "deferred", "reason": "active or unverified work on old slot"}
+            if role == "model" or old_computer_jobs == 0:
+                _set_meta(f"bt_fleet_retire:{role}", from_slot)
+        else:
+            try:
+                out["old_stopped"] = fleet.stop_kernel_result(old, kernel_slug_for(old))
+            except Exception as exc:  # noqa: BLE001
+                out["old_stopped"] = {"state": "failed", "error": type(exc).__name__}
     return out
+
+
+
+def _execute_fleet_transition(fleet, role: str, previous: str, target: str, accounts) -> Dict[str, Any]:
+    """A failed handover never commits an active slot; the next watchdog tick retries."""
+    try:
+        outcome = failover_fleet_role(role, previous, target)
+        if outcome.get("ok"):
+            fleet.usage_baselines.update(_fleet_manager_with_usage(accounts).usage_baselines)
+            return outcome
+        logger.warning("fleet failover unverified for %s: %s", role, outcome.get("status"))
+    except Exception as exc:
+        logger.warning("fleet failover failed for %s: %s", role, type(exc).__name__)
+        outcome = {"ok": False, "status": "error", "error": type(exc).__name__}
+    fleet.state[role].active = previous
+    fleet.state[role].last_switch = 0.0
+    fleet.state[role].event(f"unverified {previous} -> {target}; will retry")
+    return outcome
+
+
+
+def _retire_verified_old_slots(fleet) -> None:
+    """Reap a deferred old kernel only after durable tasks are proven finished."""
+    if _durable_active_runs() != 0:
+        return
+    from blackthorn.fleet import kernel_slug_for
+    try:
+        rows = d1_query("SELECT key, value FROM state_meta WHERE key LIKE 'bt_fleet_retire:%';")
+    except (OSError, ValueError, RuntimeError, urllib.error.URLError):
+        return
+    for row in rows:
+        role = str(row.get("key") or "").removeprefix("bt_fleet_retire:")
+        slot = str(row.get("value") or "")
+        if role not in ("model", "computer") or slot not in ("primary", "backup"):
+            continue
+        if fleet.state[role].active == slot or not _role_intended_online(role):
+            continue
+        if role == "computer":
+            activity = refresh_computer_activity(force=True)
+            if not activity.get("known") or activity.get("active_jobs") != 0:
+                continue
+        account = fleet.by_slot.get((role, slot))
+        if account is None:
+            continue
+        try:
+            outcome = fleet.stop_kernel_result(account, kernel_slug_for(account))
+            if outcome["state"] in ("stopped", "not_running"):
+                _set_meta(f"bt_fleet_retire:{role}", "")
+        except Exception as exc:
+            logger.warning("old slot retirement not verified: %s", type(exc).__name__)
 
 
 def turn_off_fleet(blocking: bool = True, source: str = "", roles: tuple = ("model", "computer"),
@@ -2261,6 +2451,8 @@ def start_permanent_gpu_daemon() -> None:
         stale_boot_heals = 0
         last_mirror_at = 0.0
         mirror_thread = None
+        retire_thread = None
+        failovers_in_flight: Dict[str, threading.Thread] = {}
         daemon_fleet = None
         while True:
             try:
@@ -2416,8 +2608,10 @@ def start_permanent_gpu_daemon() -> None:
                     # Preserve active-slot hysteresis across ticks; rebuilding resets the
                     # failover decision to primary and can re-push an already-live backup.
                     if daemon_fleet is None:
-                        daemon_fleet = FleetManager(accounts)
+                        daemon_fleet = _fleet_manager_with_usage(accounts)
                     fleet = daemon_fleet
+                    if any(a.user not in fleet.usage_baselines for a in accounts):
+                        fleet.usage_baselines.update(_fleet_manager_with_usage(accounts).usage_baselines)
                     for role in ("model", "computer"):
                         if not _role_intended_online(role):
                             continue
@@ -2428,19 +2622,21 @@ def start_permanent_gpu_daemon() -> None:
                                 "Fleet failover: %s %s -> %s (%s)",
                                 role, before, st.active, st.reason,
                             )
-                            try:
-                                failover_fleet_role(role, before, st.active)
-                            except Exception as fexc:
-                                logger.warning("fleet failover failed for %s: %s", role, fexc)
-                        # Keep computer backups in sync while the primary is live.
-                        if role == "computer" and st.active == "primary":
-                            primary = fleet.by_slot.get(("computer", "primary"))
-                            backup = fleet.by_slot.get(("computer", "backup"))
-                            if primary and backup and now - last_mirror_at >= 300 and \
+                            if role not in failovers_in_flight or not failovers_in_flight[role].is_alive():
+                                def _switch(r=role, previous=before, target=st.active):
+                                    _execute_fleet_transition(fleet, r, previous, target, accounts)
+                                failovers_in_flight[role] = threading.Thread(target=_switch, daemon=True,
+                                    name=f"blackthorn-{role}-failover")
+                                failovers_in_flight[role].start()
+                        # The active computer is authoritative, in EITHER direction.
+                        if role == "computer":
+                            active = fleet.by_slot.get(("computer", st.active))
+                            peer = fleet.by_slot.get(("computer", "backup" if st.active == "primary" else "primary"))
+                            if active and peer and now - last_mirror_at >= 300 and \
                                     (mirror_thread is None or not mirror_thread.is_alive()):
                                 from blackthorn.fleet import mirror_state_dataset
                                 last_mirror_at = now
-                                def _mirror_background(p=primary, b=backup):
+                                def _mirror_background(p=active, b=peer):
                                     try:
                                         outcome = mirror_state_dataset(p, b)
                                         if not outcome.get("ok"):
@@ -2451,6 +2647,11 @@ def start_permanent_gpu_daemon() -> None:
                                 mirror_thread = threading.Thread(target=_mirror_background, daemon=True,
                                                                   name="blackthorn-computer-mirror")
                                 mirror_thread.start()
+                    if retire_thread is None or not retire_thread.is_alive():
+                        retire_thread = threading.Thread(target=_retire_verified_old_slots,
+                                                         args=(fleet,), daemon=True,
+                                                         name="blackthorn-fleet-retire")
+                        retire_thread.start()
             except Exception as fexc:
                 logger.debug("fleet failover tick note: %s", fexc)
 

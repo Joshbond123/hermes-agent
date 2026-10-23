@@ -57,7 +57,7 @@ async def test_no_duplicate_or_lost_tokens_and_persisted_text_matches_stream(sta
     assert seqs == list(range(1, len(seqs) + 1))
     data = await session_messages(stack, out.session_id)
     assistant = data["messages"][-1]
-    assert assistant["content"] == text.strip() and assistant["status"] == "stop"   # persisted text is whitespace-normalised
+    assert assistant["content"] == text and assistant["status"] == "stop"   # stream and persistence are lossless
     assert [m["role"] for m in data["messages"]] == ["user", "assistant"]
 
 
@@ -361,7 +361,8 @@ async def test_context_overflow_is_recovered_by_trimming(stack):
                         [*say("OK after trimming."), finish("stop")])
     b = await stack.stream({"message": "q2", "session_id": a.session_id})
     assert b.text == "OK after trimming."
-    assert any("trimmed" in n["text"] for n in b.of("notice"))
+    assert any(n["stage"] == "overflow_retry" for n in b.of("internal.compaction"))
+    assert not any("compact" in n.get("text", "").lower() for n in b.of("notice"))
     retried = stack.backend.requests[-1]["messages"]
     assert [m["role"] for m in retried] == ["system", "user"]
 
@@ -457,7 +458,7 @@ async def test_disconnect_does_not_kill_the_run_and_resume_has_no_loss_or_duplic
     assert text.strip() == expected
     assert merged[-1]["type"] == "run.end" and merged[-1]["status"] == "stop"
     data = await session_messages(stack, seen[0]["session_id"])
-    assert data["messages"][-1]["content"] == expected and data["live_run"] is None
+    assert data["messages"][-1]["content"] == text and data["live_run"] is None
 
 
 async def test_resume_of_an_expired_run_is_a_clean_404(stack):

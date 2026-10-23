@@ -182,7 +182,13 @@ class GpuService:
             from .fleet import accounts_from_env, FleetManager
             accounts = accounts_from_env(os.environ)
             if accounts:
-                fleet = FleetManager(accounts)
+                # The quota RPC may freeze timeUsed while a session is running;
+                # the controller persists its start/baseline for effective remaining time.
+                try:
+                    from cloudflare_d1_client import _fleet_manager_with_usage
+                    fleet = _fleet_manager_with_usage(accounts)
+                except (ImportError, OSError, ValueError):
+                    fleet = FleetManager(accounts)
                 quotas = {}
                 fleet_slots = {}
                 for role in ("model", "computer"):
@@ -191,7 +197,8 @@ class GpuService:
                         continue
                     primary = next((a for a in role_accounts if a.slot == "primary"), role_accounts[0])
                     backup = next((a for a in role_accounts if a.slot == "backup"), None)
-                    role_view = {"primary": None, "backup": None, "active": "primary"}
+                    role_view = {"primary": None, "backup": None,
+                                 "active": fleet.state[role].active}
                     for slot_name, acc in (("primary", primary), ("backup", backup)):
                         if acc is None:
                             continue

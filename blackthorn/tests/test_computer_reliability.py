@@ -176,6 +176,7 @@ def test_model_turn_on_reuses_live_computer_instead_of_restarting_it(monkeypatch
 
     monkeypatch.setattr(fm, "accounts_from_env", lambda env: accounts)
     monkeypatch.setattr(fm, "FleetManager", FakeFleet)
+    monkeypatch.setattr(d1, "_fleet_manager_with_usage", lambda accounts: FakeFleet(accounts))
     monkeypatch.setattr(d1, "_fleet_role_online", lambda role: role == "computer")
     monkeypatch.setattr(d1, "ensure_d1_schema", lambda: None)
     monkeypatch.setattr(d1, "_record_stop_event", lambda *args: None)
@@ -252,6 +253,13 @@ def test_watchdog_reuses_live_backup_instead_of_interrupting_computer(monkeypatc
     monkeypatch.setattr(d1, "_role_intended_online", lambda role: True)
     monkeypatch.setattr(d1, "_role_boot_in_progress", lambda role: False)
     monkeypatch.setattr(d1, "_fleet_role_online", lambda role: True)
+    monkeypatch.setattr(d1, "_computer_authoritative_slot", lambda: "backup")
+    monkeypatch.setattr(d1, "_computer_request", lambda *args: {"state_digest": "checked", "state_generation": 1, "fleet_slot": "backup"})
+    def restored(accounts):
+        fleet = fm.FleetManager(accounts)
+        fleet.state["computer"].active = "backup"
+        return fleet
+    monkeypatch.setattr(d1, "_fleet_manager_with_usage", restored)
     out = d1.failover_fleet_role("computer", "primary", "backup")
     assert out["status"] == "already_online" and out["account"] == "b"
 
@@ -350,3 +358,19 @@ def test_model_registration_can_opt_out_of_cuda_to_ollama(monkeypatch, tmp_path)
     monkeypatch.setattr(srv.subprocess, 'run', lambda cmd, **kwargs: called.append(cmd) or types.SimpleNamespace(returncode=0))
     srv.register_model('ollama', str(gguf))
     assert any(cmd[:2] == ['ollama', 'create'] for cmd in called)
+
+
+@pytest.mark.asyncio
+async def test_intentionally_off_computer_fails_immediately_without_retry_sleeps():
+    from blackthorn.tools.base import ToolError
+    class Store:
+        async def computer_row(self):
+            return {'status': 'GPU_STOPPED_SAVING_QUOTA', 'tunnel_url': '', 'api_key': ''}
+    class Resolver:
+        def invalidate(self):
+            raise AssertionError('off role must not be contacted')
+    client = ComputerClient(Resolver(), None, Store())
+    started = time.monotonic()
+    with pytest.raises(ToolError, match='intentionally off'):
+        await client.call('/computer/info', method='GET')
+    assert time.monotonic() - started < 0.5

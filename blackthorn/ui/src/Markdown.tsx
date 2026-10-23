@@ -1,5 +1,5 @@
 import { Lexer, type Token, type Tokens } from 'marked'
-import { memo, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react'
+import { memo, useMemo, useState, type CSSProperties, type ReactNode } from 'react'
 import { highlightCode, languageLabel } from './highlight'
 import { copyText, decodeEntities, safeHref } from './util'
 
@@ -151,26 +151,9 @@ const Block = memo(
 )
 
 export const Markdown = memo(function Markdown({ text, streaming = false }: { text: string; streaming?: boolean }) {
-  // The SSE reader receives individual tokens. Paint at most once per 55 ms (16 ms
-  // for a line break), but always flush the exact final answer when the run ends.
-  const [shown, setShown] = useState(text)
-  const latest = useRef(text)
-  const pending = useRef<ReturnType<typeof setTimeout> | null>(null)
-  latest.current = text
-  useEffect(() => {
-    if (!streaming) {
-      if (pending.current !== null) clearTimeout(pending.current)
-      pending.current = null
-      setShown(text)
-    } else if (pending.current === null) {
-      pending.current = setTimeout(() => {
-        pending.current = null
-        setShown(latest.current)
-      }, text.includes('\n') ? 16 : 55)
-    }
-  }, [text, streaming])
-  useEffect(() => () => { if (pending.current !== null) clearTimeout(pending.current) }, [])
-  const tokens = useMemo(() => Lexer.lex(shown, { gfm: true, breaks: false }), [shown])
+  // Render every received delta immediately; React batches state updates naturally.
+  // No timer or artificial per-word delay may conceal a completed model response.
+  const tokens = useMemo(() => Lexer.lex(text, { gfm: true, breaks: false }), [text])
   return (
     <div className={`md${streaming ? ' is-streaming' : ''}`} data-testid="markdown">
       {tokens.map((t, i) => <Block key={i} token={t} index={i} reveal={streaming} />)}
