@@ -11,7 +11,7 @@
   "blackthorn/computer_assets/sample_triage.py": "fccb4097b40f7bd0a31adf089c24171482e57df468456f107771dc15a6c30a8b",
   "blackthorn/computer_assets/skillctl.py": "773df12a1f4fc65256b5b590ead5f929598c633c0bc2c90c4187a81f73c725fb",
   "blackthorn/config.py": "77f18840d1234857ed75bcaa700d75682328f2d06e8f88b8e1e9832912be75e8",
-  "blackthorn/fleet.py": "21f3e98fbc7c8273c40cfaaa9a607adac04641433be68544183ef7e1601a7678",
+  "blackthorn/fleet.py": "8a4f1ef27bdc30fb6520b3cee7849ef805b7e787a7c4dba5caef75b6dcc4c38e",
   "blackthorn/gpu.py": "944acdf3944fc33619019e0f92c81ce03e7de9b260859122b42785ed06defad6",
   "blackthorn/kaggle_bundle.py": "28034aa1180aaef47d74754f95288f3512a6c76aa5ba8cb91130bd7891fd77a3",
   "blackthorn/llm.py": "4aa857ec656e4360a1617723377b611cc69a32fd874549503a1c59d1648d75b8",
@@ -51,7 +51,7 @@
   "blackthorn/tools/web.py": "e98acbf8521a9cd1492aff0eb2a35e89bc97800d0bde5e2215b40df244f084fd",
   "blackthorn/version.py": "5d43f6378622c4ddeeec627755c2e98152f6077be9334b2770c3a8199018bf37",
   "blackthorn_start.py": "d8189febd25f393cc6b41cd17f7cc88d73ecaa44942fa52f51dd310602b108df",
-  "cloudflare_d1_client.py": "bfc3d9ad8ac633422c034d457fe2866981baaa030610dc1f0b9563a4b7c38c0b",
+  "cloudflare_d1_client.py": "34005a58ae86fe6701fe1034e728f216adf0b8390721003e71bca6cba3bdc3f2",
   "kaggle_cyber_ornith/cyber_ornith_server.py": "4801d548c8688e5f7679657fc1eae336055be6a82c286c99e7c7248df52aea21"
  },
  "version": "5.3.0"

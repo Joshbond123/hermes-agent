@@ -636,16 +636,22 @@ _COMPUTER_MIRROR_LOCK = threading.Lock()
 
 def mirror_state_dataset(from_account: Account, to_account: Account, *,
                          dataset_slug: str = "blackthorn-computer-state",
-                         runner: Optional[Callable[[List[str], Dict[str, str]], int]] = None) -> Dict[str, Any]:
+                         runner: Optional[Callable[[List[str], Dict[str, str]], int]] = None,
+                         expected_generation: Optional[int] = None,
+                         expected_digest: Optional[str] = None) -> Dict[str, Any]:
     """Serialize periodic and threshold mirrors so an older transfer cannot win."""
     with _COMPUTER_MIRROR_LOCK:
         return _mirror_state_dataset_unlocked(from_account, to_account,
-                                               dataset_slug=dataset_slug, runner=runner)
+                                               dataset_slug=dataset_slug, runner=runner,
+                                               expected_generation=expected_generation,
+                                               expected_digest=expected_digest)
 
 
 def _mirror_state_dataset_unlocked(from_account: Account, to_account: Account, *,
                          dataset_slug: str = "blackthorn-computer-state",
-                         runner: Optional[Callable[[List[str], Dict[str, str]], int]] = None) -> Dict[str, Any]:
+                         runner: Optional[Callable[[List[str], Dict[str, str]], int]] = None,
+                         expected_generation: Optional[int] = None,
+                         expected_digest: Optional[str] = None) -> Dict[str, Any]:
     """Mirror an immutable, SHA-256-identified workspace snapshot to the backup.
 
     Unchanged generations are not re-uploaded. Kaggle's versioned dataset API
@@ -766,11 +772,25 @@ def _mirror_state_dataset_unlocked(from_account: Account, to_account: Account, *
     try:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            if not download(root / "src_download", source, from_account):
-                return {"ok": False, "error": f"source download failed: {last_error}"}
-            src = root / "source"
-            _unpack(root / "src_download", src)
-            identity = _identity(src, create_legacy=True)
+            # Kaggle acknowledges a version before the downloadable archive has
+            # necessarily advanced. Never mirror an older snapshot after a live
+            # checkpoint: wait for the exact generation AND digest to be readable.
+            if (expected_generation is None) != (expected_digest is None):
+                return {"ok": False, "error": "incomplete expected checkpoint identity"}
+            identity = None
+            for attempt in range(5):
+                source_download = root / f"src_download_{attempt}"
+                if not download(source_download, source, from_account):
+                    return {"ok": False, "error": f"source download failed: {last_error}"}
+                src = root / f"source_{attempt}"
+                _unpack(source_download, src)
+                identity = _identity(src, create_legacy=expected_generation is None)
+                if expected_generation is None or (identity["generation"] == expected_generation and
+                                                   identity["digest"] == expected_digest):
+                    break
+                if attempt == 4:
+                    return {"ok": False, "error": "source dataset has not published the expected live checkpoint"}
+                _t.sleep((4, 8, 12, 20)[attempt])
             # A versioned dataset is immutable: compare content identities before
             # upload and skip unchanged generations, even if the timestamp differs.
             previous = root / "old_download"

@@ -102,7 +102,7 @@ def test_failover_syncs_state_before_booting_the_backup(ops):
         import unittest.mock as mock
         with mock.patch.object(_d, "_role_intended_online", lambda role: True), \
              mock.patch.object(_d, "_fleet_role_online", lambda role: True), \
-             mock.patch.object(_d, "checkpoint_computer", lambda timeout=220: {"ok": True}), \
+             mock.patch.object(_d, "checkpoint_computer", lambda timeout=220: {"ok": True, "generation": 42, "digest": "verified"}), \
              mock.patch.object(_d, "_durable_active_runs", lambda: 0), \
              mock.patch.object(_d, "_role_boot_in_progress", lambda role: False), \
              mock.patch.object(FleetManager, "start_kernel", fake_start), \
@@ -168,7 +168,7 @@ def test_computer_failover_refuses_failed_dataset_mirror(ops, monkeypatch):
     monkeypatch.setattr(d1, '_fleet_role_online', lambda role: False)
     monkeypatch.setattr(d1, '_fleet_manager_with_usage', lambda accounts: FleetManager(accounts))
     monkeypatch.setattr('blackthorn.fleet.mirror_state_dataset',
-                        lambda *args: {'ok': False, 'error': 'unavailable'})
+                        lambda *args, **kwargs: {'ok': False, 'error': 'unavailable'})
     out = d1.failover_fleet_role('computer', 'primary', 'backup')
     assert out['status'] == 'sync_failed' and not out['ok']
     assert not ops['starts']
@@ -202,7 +202,7 @@ def test_computer_recovery_syncs_backup_to_primary_before_automatic_return(ops, 
     monkeypatch.setattr(d1, '_computer_authoritative_slot', lambda: 'backup')
     monkeypatch.setattr(d1, '_fleet_role_online', lambda role: False)
     monkeypatch.setattr('blackthorn.fleet.mirror_state_dataset',
-                        lambda old, new: events.append(('sync', old.slot, new.slot)) or {'ok': True, 'digest': 'fresh'})
+                        lambda old, new, **kwargs: events.append(('sync', old.slot, new.slot)) or {'ok': True, 'digest': 'fresh'})
     def fake_start(self, account, **kwargs):
         events.append(('boot', account.slot))
         return {'_slug': f'{account.user}/blackthorn-computer', '_session_running': True}
@@ -256,3 +256,19 @@ def test_old_model_is_deferred_during_an_agent_task_then_retired_safely(ops, mon
     d1._retire_verified_old_slots(fleet)
     assert stops == ['primary']
     assert ('bt_fleet_retire:model', '') in ops['meta']
+
+
+def test_explicit_checkpoint_is_not_success_until_source_dataset_reads_back(ops, monkeypatch):
+    monkeypatch.setattr(d1, '_computer_link', lambda: ('https://test.invalid', 'test-only', 'ONLINE'))
+    monkeypatch.setattr(d1, '_computer_request', lambda *args: {
+        'ok': True, 'generation': 42, 'digest': 'live-digest', 'files': 2})
+    monkeypatch.setattr(d1, '_computer_authoritative_slot', lambda: 'primary')
+    checked = []
+    monkeypatch.setattr('blackthorn.fleet.mirror_state_dataset',
+                        lambda old, new, **kw: checked.append((old.slot, new.slot, kw)) or {
+                            'ok': False, 'error': 'source dataset has not published the expected live checkpoint'})
+    result = d1.checkpoint_computer()
+    assert not result['ok'] and result['generation'] == 42
+    assert checked and checked[0][0:2] == ('primary', 'primary')
+    assert checked[0][2]['expected_generation'] == 42
+    assert checked[0][2]['expected_digest'] == 'live-digest'

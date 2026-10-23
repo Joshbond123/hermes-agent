@@ -478,3 +478,31 @@ def test_mirror_does_not_advertise_unverified_backup_on_readback_mismatch(monkey
     out = mirror_state_dataset(Account('primary','t1','computer','primary'),
                                Account('backup','t2','computer','backup'), runner=runner)
     assert not out['ok'] and 'identity did not match' in out['error']
+
+
+def test_mirror_refuses_stale_download_after_live_checkpoint(monkeypatch):
+    import hashlib
+    import json
+    import zipfile
+    from pathlib import Path
+    from blackthorn.fleet import mirror_state_dataset
+    monkeypatch.setattr('time.sleep', lambda seconds: None)
+    files = {'probe.txt': {'size': 5, 'sha256': hashlib.sha256(b'fresh').hexdigest()}}
+    digest = hashlib.sha256(json.dumps(files, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    downloads = []
+    def runner(cmd, env):
+        if cmd[2] != 'download':
+            raise AssertionError('must never upload an older source snapshot')
+        downloads.append(cmd)
+        folder = Path(cmd[cmd.index('-p') + 1])
+        marker = {'schema': 2, 'files': files, 'digest': digest, 'generation': 41}
+        with zipfile.ZipFile(folder / 'state.zip', 'w') as z:
+            z.writestr('probe.txt', 'fresh')
+            z.writestr('.blackthorn/checkpoint.json', json.dumps(marker))
+        return 0
+    primary = Account('primary', 'fake-token', 'computer', 'primary')
+    backup = Account('backup', 'fake-token-2', 'computer', 'backup')
+    result = mirror_state_dataset(primary, backup, runner=runner,
+                                  expected_generation=42, expected_digest=digest)
+    assert not result['ok'] and 'expected live checkpoint' in result['error']
+    assert len(downloads) == 5

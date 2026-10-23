@@ -694,18 +694,31 @@ def refresh_computer_activity(timeout: float = 8.0, force: bool = False) -> Dict
     return dict(_COMPUTER_ACTIVITY)
 
 
-def checkpoint_computer(timeout: float = 120.0) -> Dict[str, Any]:
-    """Publish the computer workspace before a stop, so nothing since the last periodic checkpoint is lost.
+def checkpoint_computer(timeout: float = 220.0) -> Dict[str, Any]:
+    """Publish the computer workspace and verify this generation is downloadable.
 
-    Best effort and bounded: a failure is reported, but it never blocks the stop itself.
+    A failed read-back refuses automatic stop/failover; explicit user force-OFF
+    still permits shutdown but reports the missing durable checkpoint.
     """
     try:
         url, _key, _status = _computer_link()
         if not url:
             return {"ok": False, "skipped": "computer offline"}
         body = _computer_request("/computer/checkpoint", {}, timeout)
-        return {"ok": bool(body.get("ok")), "generation": body.get("generation"), "files": body.get("files"),
-                "error": str(body.get("error") or "")[:160]}
+        result = {"ok": bool(body.get("ok")), "generation": body.get("generation"),
+                  "digest": body.get("digest"), "files": body.get("files"),
+                  "error": str(body.get("error") or "")[:160]}
+        if result["ok"]:
+            from blackthorn.fleet import accounts_from_env, mirror_state_dataset
+            account = next((a for a in accounts_from_env(os.environ)
+                            if a.role == "computer" and a.slot == _computer_authoritative_slot()), None)
+            if not account or not result["generation"] or not result["digest"]:
+                return {**result, "ok": False, "error": "checkpoint owner or identity unavailable"}
+            readback = mirror_state_dataset(account, account,
+                        expected_generation=result["generation"], expected_digest=result["digest"])
+            if not readback.get("ok"):
+                return {**result, "ok": False, "error": str(readback.get("error") or "source readback failed")[:160]}
+        return result
     except urllib.error.HTTPError as exc:
         return {"ok": False, "error": f"HTTP {exc.code}"}
     except (urllib.error.URLError, OSError, ValueError, RuntimeError) as exc:
@@ -1933,13 +1946,16 @@ def turn_on_fleet(blocking: bool = False) -> Dict[str, Any]:
             source = fleet.by_slot.get(("computer", source_slot))
             if source is not None and source.user != account.user:
                 from blackthorn.fleet import mirror_state_dataset
+                ckpt = None
                 if _fleet_role_online("computer"):
                     ckpt = checkpoint_computer(timeout=220)
                     if not ckpt.get("ok"):
                         _write_fleet_row(row_id, "BOOT_FAILED", gpu_info="Computer checkpoint could not be verified")
                         return {"role": role, "account": account.user, "status": "sync_failed",
                                 "error": "live computer checkpoint was not verified"}
-                sync = mirror_state_dataset(source, account)
+                sync = mirror_state_dataset(source, account,
+                    expected_generation=ckpt["generation"] if ckpt else None,
+                    expected_digest=ckpt["digest"] if ckpt else None)
                 if not sync.get("ok"):
                     _write_fleet_row(row_id, "BOOT_FAILED", gpu_info="Computer dataset mirror could not be verified")
                     return {"role": role, "account": account.user, "status": "sync_failed",
@@ -2089,7 +2105,9 @@ def failover_fleet_role(role: str, from_slot: str, to_slot: str) -> Dict[str, An
             if not out["checkpoint"].get("ok"):
                 return {**out, "ok": False, "status": "checkpoint_failed"}
         try:
-            out["sync"] = mirror_state_dataset(old, new)
+            out["sync"] = mirror_state_dataset(old, new,
+                expected_generation=out.get("checkpoint", {}).get("generation"),
+                expected_digest=out.get("checkpoint", {}).get("digest"))
         except Exception as exc:  # noqa: BLE001
             out["sync"] = {"ok": False, "error": type(exc).__name__}
         if not out["sync"].get("ok"):
@@ -2638,7 +2656,18 @@ def start_permanent_gpu_daemon() -> None:
                                 last_mirror_at = now
                                 def _mirror_background(p=active, b=peer):
                                     try:
-                                        outcome = mirror_state_dataset(p, b)
+                                        # Do not propagate an old downloaded dataset
+                                        # while the running computer has newer files.
+                                        if not _fleet_role_online("computer"):
+                                            return
+                                        activity = _computer_request("/computer/activity", None, 8)
+                                        if (activity.get("fleet_slot") != p.slot or
+                                                not activity.get("state_generation") or not activity.get("state_digest")):
+                                            logger.warning("computer mirror skipped: live snapshot identity unavailable")
+                                            return
+                                        outcome = mirror_state_dataset(p, b,
+                                            expected_generation=activity["state_generation"],
+                                            expected_digest=activity["state_digest"])
                                         if not outcome.get("ok"):
                                             logger.warning("computer mirror failed: %s", outcome.get("error", "unknown"))
                                     except Exception as mexc:
