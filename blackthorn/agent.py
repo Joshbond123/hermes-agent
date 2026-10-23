@@ -151,6 +151,7 @@ class AgentRun:
         self.usage = {"prompt": 0, "completion": 0}
         self.finish_reason: Optional[str] = None
         self.first_token_ms: Optional[int] = None
+        self.timings_ms = {"lease": 0, "route": 0, "model": 0, "tools": 0, "final_save": 0}
         self._t0 = time.monotonic()
         self._flush_interval = flush_interval
         self._last_flush = 0.0
@@ -162,7 +163,17 @@ class AgentRun:
         s = deps.settings
         self._budget = prompts.prompt_budget(s.context_tokens, s.completion_reserve_tokens)
         self._schemas = deps.registry.schemas()
-        self._schema_cost = prompts.schema_tokens(self._schemas)
+        # Remote malware tools are optional, not 2 extra schemas on every normal
+        # conversation. Keeping them off unrelated turns saves prefill and prevents
+        # history compaction from evicting the user's original task instruction.
+        import re
+        context = self.user_message + " " + (board.goal if board is not None and board.is_open() else "")
+        if self.user_message.strip().lower() in ("continue", "yes", "go on", "do it"):
+            context += " " + " ".join(str(t.get("content") or "")[:500] for t in self.turns[-4:] if t.get("role") == "user")
+        self._remote_analysis = bool(re.search(r"malware|ransomware|sample|detonat|sandbox|virus|malicious", context, re.I))
+        self._active_schemas = self._schemas if self._remote_analysis else [
+            schema for schema in self._schemas if not schema["function"]["name"].startswith("malware_analyzer_")]
+        self._schema_cost = prompts.schema_tokens(self._active_schemas)
 
     # ------------------------------------------------------------------ helpers
     def text(self) -> str:
@@ -193,7 +204,7 @@ class AgentRun:
     def _meta(self, status: str, error: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         meta: Dict[str, Any] = {"model": self.model, "duration_ms": self._elapsed_ms(), "first_token_ms": self.first_token_ms,
                                 "steps": self.steps, "tool_calls": self.tool_calls_total, "finish_reason": self.finish_reason,
-                                "usage": dict(self.usage), "status": status}
+                                "usage": dict(self.usage), "status": status, "timings_ms": dict(self.timings_ms)}
         if error:
             meta["error"] = error
         return meta
@@ -363,8 +374,10 @@ class AgentRun:
         try:
             import json
             # Before any tool executes, D1 must hold a cross-worker shutdown lease.
+            lease_started = time.monotonic()
             await self.deps.store.set_setting("bt_run:" + self.run.id, json.dumps({
                 "session_id": self.run.session_id, "expires": time.time() + 120}))
+            self.timings_ms["lease"] += int((time.monotonic() - lease_started) * 1000)
             await self._loop()
             status = "length" if self.finish_reason == "length" else "stop"
         except asyncio.CancelledError:
@@ -401,6 +414,7 @@ class AgentRun:
             # Honest close-out: an unfinished plan is reported as unfinished, not as success.
             self._emit_unfinished(status)
             saved = True
+            final_started = time.monotonic()
             try:
                 if self._flush_task and not self._flush_task.done():
                     await asyncio.shield(self._flush_task)
@@ -410,10 +424,12 @@ class AgentRun:
                 saved = False
                 log.error("final save failed: %s", exc)
                 self.run.emit("notice", level="error", text="This response could not be saved to history: " + str(exc)[:160])
+            self.timings_ms["final_save"] += int((time.monotonic() - final_started) * 1000)
             self._activity("run_finished")
             self.run.emit("run.end", status=status, finish_reason=self.finish_reason, duration_ms=self._elapsed_ms(),
                           first_token_ms=self.first_token_ms, message_id=self.run.assistant_uid, session_id=self.run.session_id,
-                          steps=self.steps, tool_calls=self.tool_calls_total, usage=dict(self.usage), saved=saved)
+                          steps=self.steps, tool_calls=self.tool_calls_total, usage=dict(self.usage), saved=saved,
+                          timings_ms=dict(self.timings_ms))
             self.run.finish(status)
 
     # ------------------------------------------------------------------ the loop
@@ -423,10 +439,10 @@ class AgentRun:
         Only the very first turn of a brand-new conversation can lose its tools: on a follow-up such as
         "continue", "yes" or "do it" the model must still be able to act on the work in progress.
         """
-        if not self._schemas:
+        if not self._active_schemas:
             return None
         if self._history_len or (self.board is not None and self.board.is_open()):
-            return self._schemas
+            return self._active_schemas
         text = (self.user_message or "").strip().lower()
         if step <= 1 and len(text) < 48:
             keys = ("run", "file", "search", "code", "install", "browse", "skill", "computer",
@@ -434,7 +450,7 @@ class AgentRun:
                     "remember", "previous", "history", "earlier", "task", "continue", "recall")
             if not any(k in text for k in keys):
                 return None
-        return self._schemas
+        return self._active_schemas
 
     async def _loop(self) -> None:
         s = self.deps.settings
@@ -528,7 +544,9 @@ class AgentRun:
                 # Mid-task resume after compaction (Hermes-style): the model must not answer from a hole.
                 if messages[-1].get("role") == "tool":
                     messages.append({"role": "user", "content": RESUME_NOTE})
+            route_started = time.monotonic()
             route = await self.deps.resolver.get()
+            self.timings_ms["route"] += int((time.monotonic() - route_started) * 1000)
             self.model = route.model
             self._produced = False
 
@@ -536,6 +554,7 @@ class AgentRun:
                 return sum(len(part["text"]) for part in self.parts if part["type"] == "text")
 
             before = _text_len()
+            model_started = time.monotonic()
             try:
                 return await self._consume(route, messages, tools)
             except ContextOverflow:
@@ -586,6 +605,8 @@ class AgentRun:
                                   text=f"Reconnecting to the GPU — retrying (attempt {attempt + 1} of {limit})…")
                 await asyncio.sleep(min(6.0, 0.6 * (2 ** (attempt - 1))))
                 continue
+            finally:
+                self.timings_ms["model"] += int((time.monotonic() - model_started) * 1000)
 
     async def _consume(self, route: Any, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]]) -> StepResult:
         s = self.deps.settings
@@ -800,7 +821,11 @@ class AgentRun:
             finished[index] = (part, result, max(1, int((time.monotonic() - started) * 1000)))
             _publish(index)
 
-        await asyncio.gather(*(_run_one(i, c, p, t) for i, (c, p, t) in enumerate(pending)))
+        tool_started = time.monotonic()
+        try:
+            await asyncio.gather(*(_run_one(i, c, p, t) for i, (c, p, t) in enumerate(pending)))
+        finally:
+            self.timings_ms["tools"] += int((time.monotonic() - tool_started) * 1000)
         # tool messages are appended in the model's call order
         for call, _part, _t in pending:
             messages.append({"role": "tool", "tool_call_id": call["id"],

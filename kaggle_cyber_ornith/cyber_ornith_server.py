@@ -1404,7 +1404,7 @@ async def health():
                       else {"0": "model", "1": "model"}),
         "uptime_seconds": round(time.time() - START_TIME, 1),
         "boot": {k: current_boot.get(k) for k in ("cache_source", "boot_seconds", "download_skipped", "warmup_ok")},
-        "endpoints": ["/v1/models", "/v1/chat/completions", "/chat", "/logs", "/health", "/computer/info", "/computer/exec", "/computer/list_files", "/computer/read_file", "/computer/write_file", "/computer/fetch_url"],
+        "endpoints": ["/v1/models", "/v1/chat/completions", "/chat", "/logs", "/health", "/computer/info", "/computer/exec", "/computer/list_files", "/computer/read_file", "/computer/read_sample", "/computer/write_file", "/computer/fetch_url"],
         "auth_required": True,
     }
 
@@ -1717,6 +1717,46 @@ async def computer_list(request: Request, _=Depends(verify_api_key)):
             size = ""
         rows.append(("DIR " if entry.is_dir() else "FILE") + " " + entry.name + size)
     return {"ok": True, "path": str(target), "listing": "\\n".join(rows) or "(empty)", "host": "kaggle-computer"}
+
+@app.post("/computer/read_sample")
+async def computer_read_sample(request: Request, _=Depends(verify_api_key)):
+    """Transfer a deliberately selected quarantine file to Render for PUBLIC remote submission.
+
+    No sample is executed here. Never expose an arbitrary computer path or follow a symlink.
+    The authenticated request uses only a basename and the reply contains no host metadata.
+    """
+    import base64, hashlib, os, re, stat
+    body = await request.json()
+    name = str(body.get("sample_id") or "")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}", name, re.ASCII) or name in (".", ".."):
+        return {"ok": False, "error": "invalid sample name"}
+    root = _pathlib.Path(COMPUTER_ROOT) / "malware_samples"
+    if root.is_symlink() or _pathlib.Path(COMPUTER_ROOT).is_symlink():
+        return {"ok": False, "error": "unsafe quarantine directory"}
+    try:
+        fd = os.open(root / name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        try:
+            meta = os.fstat(fd)
+            if not stat.S_ISREG(meta.st_mode) or not 0 < meta.st_size <= 32 * 1024 * 1024:
+                return {"ok": False, "error": "sample must be a regular file of 1-32 MiB"}
+            parts = []
+            total = 0
+            while total <= 32 * 1024 * 1024:
+                chunk = os.read(fd, min(1024 * 1024, 32 * 1024 * 1024 + 1 - total))
+                if not chunk:
+                    break
+                total += len(chunk)
+                parts.append(chunk)
+            if total != meta.st_size or total > 32 * 1024 * 1024 or os.fstat(fd).st_size != meta.st_size:
+                return {"ok": False, "error": "sample changed or exceeded 32 MiB"}
+        finally:
+            os.close(fd)
+        raw = b"".join(parts)
+        return {"ok": True, "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
+                "fileBase64": base64.b64encode(raw).decode("ascii")}
+    except OSError:
+        return {"ok": False, "error": "sample inaccessible or unsafe"}
+
 
 @app.post("/computer/read_file")
 async def computer_read(request: Request, _=Depends(verify_api_key)):

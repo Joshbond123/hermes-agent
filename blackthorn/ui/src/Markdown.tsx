@@ -1,26 +1,32 @@
 import { Lexer, type Token, type Tokens } from 'marked'
-import { memo, useMemo, useState, type CSSProperties, type ReactNode } from 'react'
+import { memo, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import { highlightCode, languageLabel } from './highlight'
 import { copyText, decodeEntities, safeHref } from './util'
 
 // ---------------------------------------------------------------------------------------------------- inline
-function inline(tokens: Token[] | undefined, key: string): ReactNode[] {
+function inline(tokens: Token[] | undefined, key: string, reveal = false): ReactNode[] {
   if (!tokens) return []
   return tokens.map((t, i) => {
     const k = `${key}.${i}`
     switch (t.type) {
       case 'text': {
         const tt = t as Tokens.Text
-        return tt.tokens?.length ? <span key={k}>{inline(tt.tokens, k)}</span> : decodeEntities(tt.text)
+        if (tt.tokens?.length) return <span key={k}>{inline(tt.tokens, k, reveal)}</span>
+        // A line appears once when it arrives; later token updates preserve earlier DOM
+        // nodes and do not restart their fade. Non-streaming Markdown stays unchanged.
+        if (reveal) return tt.text.split('\n').map((line, n) => (
+          <span className="stream-line" key={`${k}.line${n}`}>{n ? '\n' : ''}{decodeEntities(line)}</span>
+        ))
+        return decodeEntities(tt.text)
       }
       case 'escape':
         return (t as Tokens.Escape).text
       case 'strong':
-        return <strong key={k}>{inline((t as Tokens.Strong).tokens, k)}</strong>
+        return <strong key={k}>{inline((t as Tokens.Strong).tokens, k, reveal)}</strong>
       case 'em':
-        return <em key={k}>{inline((t as Tokens.Em).tokens, k)}</em>
+        return <em key={k}>{inline((t as Tokens.Em).tokens, k, reveal)}</em>
       case 'del':
-        return <del key={k}>{inline((t as Tokens.Del).tokens, k)}</del>
+        return <del key={k}>{inline((t as Tokens.Del).tokens, k, reveal)}</del>
       case 'codespan':
         return <code key={k} className="inline-code">{decodeEntities((t as Tokens.Codespan).text)}</code>
       case 'br':
@@ -28,7 +34,7 @@ function inline(tokens: Token[] | undefined, key: string): ReactNode[] {
       case 'link': {
         const lt = t as Tokens.Link
         const href = safeHref(lt.href)
-        const body = inline(lt.tokens, k)
+        const body = inline(lt.tokens, k, reveal)
         return href ? <a key={k} href={href} target="_blank" rel="noopener noreferrer">{body}</a> : <span key={k}>{body}</span>
       }
       case 'image': {
@@ -71,7 +77,7 @@ export function CodeBlock({ code, lang }: { code: string; lang?: string | null }
 }
 
 // ---------------------------------------------------------------------------------------------------- blocks
-function blocks(tokens: Token[] | undefined, key: string): ReactNode[] {
+function blocks(tokens: Token[] | undefined, key: string, reveal = false): ReactNode[] {
   if (!tokens) return []
   const out: ReactNode[] = []
   tokens.forEach((t, i) => {
@@ -80,15 +86,15 @@ function blocks(tokens: Token[] | undefined, key: string): ReactNode[] {
       case 'space':
         break
       case 'paragraph':
-        out.push(<p key={k}>{inline((t as Tokens.Paragraph).tokens, k)}</p>)
+        out.push(<p key={k}>{inline((t as Tokens.Paragraph).tokens, k, reveal)}</p>)
         break
       case 'text': // tight list item content
-        out.push(<span key={k} className="tight">{inline((t as Tokens.Text).tokens ?? [t], k)}</span>)
+        out.push(<span key={k} className="tight">{inline((t as Tokens.Text).tokens ?? [t], k, reveal)}</span>)
         break
       case 'heading': {
         const ht = t as Tokens.Heading
         const Tag = `h${Math.min(6, ht.depth)}` as 'h1'
-        out.push(<Tag key={k}>{inline(ht.tokens, k)}</Tag>)
+        out.push(<Tag key={k}>{inline(ht.tokens, k, reveal)}</Tag>)
         break
       }
       case 'code': {
@@ -97,7 +103,7 @@ function blocks(tokens: Token[] | undefined, key: string): ReactNode[] {
         break
       }
       case 'blockquote':
-        out.push(<blockquote key={k}>{blocks((t as Tokens.Blockquote).tokens, k)}</blockquote>)
+        out.push(<blockquote key={k}>{blocks((t as Tokens.Blockquote).tokens, k, reveal)}</blockquote>)
         break
       case 'hr':
         out.push(<hr key={k} />)
@@ -107,7 +113,7 @@ function blocks(tokens: Token[] | undefined, key: string): ReactNode[] {
         const items = lt.items.map((item, j) => (
           <li key={`${k}.${j}`} className={item.task ? 'task' : undefined}>
             {item.task ? <input type="checkbox" checked={!!item.checked} readOnly disabled aria-label={item.checked ? 'done' : 'not done'} /> : null}
-            {blocks(item.tokens, `${k}.${j}`)}
+            {blocks(item.tokens, `${k}.${j}`, reveal)}
           </li>
         ))
         const start = typeof lt.start === 'number' && lt.start !== 1 ? lt.start : undefined
@@ -138,17 +144,36 @@ function blocks(tokens: Token[] | undefined, key: string): ReactNode[] {
 }
 
 const Block = memo(
-  function Block({ token, index }: { token: Token; index: number }) {
-    return <>{blocks([token], `b${index}`)}</>
+  function Block({ token, index, reveal }: { token: Token; index: number; reveal?: boolean }) {
+    return <>{blocks([token], `b${index}`, reveal)}</>
   },
-  (a, b) => a.token.raw === b.token.raw && a.index === b.index,
+  (a, b) => a.token.raw === b.token.raw && a.index === b.index && a.reveal === b.reveal,
 )
 
 export const Markdown = memo(function Markdown({ text, streaming = false }: { text: string; streaming?: boolean }) {
-  const tokens = useMemo(() => Lexer.lex(text, { gfm: true, breaks: false }), [text])
+  // The SSE reader receives individual tokens. Paint at most once per 55 ms (16 ms
+  // for a line break), but always flush the exact final answer when the run ends.
+  const [shown, setShown] = useState(text)
+  const latest = useRef(text)
+  const pending = useRef<ReturnType<typeof setTimeout> | null>(null)
+  latest.current = text
+  useEffect(() => {
+    if (!streaming) {
+      if (pending.current !== null) clearTimeout(pending.current)
+      pending.current = null
+      setShown(text)
+    } else if (pending.current === null) {
+      pending.current = setTimeout(() => {
+        pending.current = null
+        setShown(latest.current)
+      }, text.includes('\n') ? 16 : 55)
+    }
+  }, [text, streaming])
+  useEffect(() => () => { if (pending.current !== null) clearTimeout(pending.current) }, [])
+  const tokens = useMemo(() => Lexer.lex(shown, { gfm: true, breaks: false }), [shown])
   return (
     <div className={`md${streaming ? ' is-streaming' : ''}`} data-testid="markdown">
-      {tokens.map((t, i) => <Block key={i} token={t} index={i} />)}
+      {tokens.map((t, i) => <Block key={i} token={t} index={i} reveal={streaming} />)}
     </div>
   )
 })

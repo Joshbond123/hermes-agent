@@ -97,6 +97,25 @@ async def version(request: Request) -> Dict[str, Any]:
     return build_info(svc(request).static_dir)
 
 
+# --------------------------------------------------------------------------- remote analysis egress (authenticated by AuthMiddleware)
+@router.get("/api/malware-analyzer/egress")
+async def malware_analyzer_egress() -> Dict[str, Any]:
+    """Prove the server can reach the public API via verified Proton exit; expose no IP."""
+    from .malware_analyzer import API, EGRESS, EgressUnavailable
+    try:
+        client = await EGRESS.client()
+        try:
+            response = await client.get(API + "/v1/status")
+            if response.is_redirect or response.status_code != 200:
+                raise EgressUnavailable("provider status was not HTTP 200")
+        finally:
+            await client.aclose()
+        return {"ok": True, "vpn_exit_distinct_from_host": True, "provider_status": response.status_code,
+                "remote_sample_execution": "not tested by status check"}
+    except (EgressUnavailable, httpx.HTTPError) as exc:
+        raise _err(503, "vpn_unavailable", "VPN egress/provider status not verified; remote analysis is disabled.") from exc
+
+
 # --------------------------------------------------------------------------- sessions
 class SessionPatch(BaseModel):
     title: Optional[str] = Field(default=None, max_length=200)

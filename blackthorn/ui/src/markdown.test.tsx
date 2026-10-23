@@ -61,6 +61,17 @@ describe('Markdown', () => {
     expect(container.querySelector('img')).toBeNull()
   })
 
+  it('batches token updates and reveals complete lines without changing final text', async () => {
+    const { container, rerender } = render(<Markdown text="First" streaming />)
+    rerender(<Markdown text={'First\nSecond'} streaming />)
+    expect(container.textContent).toBe('First') // not a per-token DOM update
+    await waitFor(() => expect(container.textContent).toBe('First\nSecond'))
+    expect(container.querySelectorAll('.stream-line').length).toBeGreaterThanOrEqual(2)
+    rerender(<Markdown text={'First\nSecond\nFinal'} />)
+    await waitFor(() => expect(container.textContent).toBe('First\nSecond\nFinal'))
+    expect(container.querySelector('.stream-line')).toBeNull()
+  })
+
   it('half-written markdown never throws while streaming', () => {
     for (const partial of ['**bol', '| a | b', '```', '- [', '> ', '1. ', '`', '[x](', '~~~']) {
       expect(() => render(<Markdown text={partial} streaming />)).not.toThrow()

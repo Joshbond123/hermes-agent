@@ -50,6 +50,12 @@ every shipped file is re-hashed and compared with `blackthorn/MANIFEST.json`. An
 tree appears as `integrity.drift`, is logged at startup, and is shown in the sidebar footer. The sidebar footer and the GPU
 panel also show `v<version> · <commit>`.
 
+## Public remote sample analysis (Proton WireGuard)
+
+The agent has `malware_analyzer_submit` (one selected file in the computer's `malware_samples/` directory) and `malware_analyzer_report` (SHA-256 lookup). Submissions go to MalwareAnalyzer's public unauthenticated REST API, **not** to an on-Kaggle malware VM. All submitted bytes and results may be public; only submit files approved for public release. A successful submit does not establish that the provider detonated the file; inspect the report's `dynamicDegraded` and behavior fields. Local `sample_triage` remains read-only static triage.
+
+Configure `BLACKTHORN_MA_WG_CONFIG_B64` **only in Render's secret environment**, containing a base64-encoded Proton WireGuard profile (do not commit it or place it in D1). The userspace WireGuard client is a SHA-256-pinned `wireproxy` release, downloaded on first use to `/tmp` and bound to loopback. A dedicated HTTP CONNECT client uses `trust_env=False`, no redirects, an IP-literal VPN endpoint and DNS inside the tunnel. It compares direct and proxied public IP echoes before use and refuses uploads/lookup if unconfigured or the exit cannot be verified. There is **no direct connection fallback** to MalwareAnalyzer. The authenticated `GET /api/malware-analyzer/egress` checks the Render-side tunnel and provider without revealing either IP or sending a sample. Provisioning or reconnecting can add seconds to the first remote tool call. The service provider, VPN operator, public sample content, and timing may still identify a submitter; this is not an untraceability guarantee. The browser and general-purpose tools are not forced through this VPN.
+
 ## Streaming protocol
 
 `POST /api/chat/stream` → `text/event-stream`; each event is `id: <seq>` + `data: {json}` (heartbeat comments every 12 s):

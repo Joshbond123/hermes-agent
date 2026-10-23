@@ -190,8 +190,79 @@ async def sample_triage(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
                       data={"sha256": result["sha256"], "format": result["format"], "dynamic_execution_allowed": False})
 
 
+async def malware_analyzer_submit(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
+    """Explicit, PUBLIC remote submission; only the chosen quarantine basename is read."""
+    from .. import malware_analyzer as remote
+    sample_id = str(args.get("sample_id") or "")
+    if not SAMPLE_ID.fullmatch(sample_id) or sample_id in (".", ".."):
+        return _fail("sample_id must be a single file in malware_samples/")
+    # Fail before requesting *any* sample data if the VPN has not been established.
+    try:
+        preflight = await remote.EGRESS.client()
+        await preflight.aclose()
+    except remote.EgressUnavailable as exc:
+        return _fail(str(exc), {"kind": "vpn_unavailable"})
+    try:
+        data = await ctx.computer.call("/computer/read_sample", {"sample_id": sample_id}, timeout=120, idempotent=True)
+        if not data.get("ok"):
+            return _fail(str(data.get("error") or "quarantined sample not readable"))
+        raw = base64.b64decode(data["fileBase64"], validate=True)
+        import hashlib
+        if len(raw) != data.get("bytes") or hashlib.sha256(raw).hexdigest() != data.get("sha256"):
+            return _fail("sample changed during transfer; no remote upload was sent")
+        result = await remote.submit_public(raw)
+    except (remote.EgressUnavailable, ValueError, KeyError) as exc:
+        return _fail(f"Remote public submission not confirmed ({type(exc).__name__})", {"kind": "remote_unavailable"})
+    # The remote service, not this computer, decides whether to detonate or deduplicate.
+    body, cut = clip(json.dumps(result, sort_keys=True, ensure_ascii=True), ctx.settings.tool_result_chars, "head")
+    return ToolResult(ok=True, content=f"PUBLIC MalwareAnalyzer submission accepted; local sample was never executed.\n{body}",
+                      summary=f"public remote submission {result['sha256'][:12]}",
+                      data={"sha256": result["sha256"], "public": True}, truncated=cut)
+
+
+async def malware_analyzer_report(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
+    """Public report lookup by SHA-256 via verified VPN; no local file access."""
+    from .. import malware_analyzer as remote
+    sha256 = str(args.get("sha256") or "")
+    if not remote.HASH.fullmatch(sha256):
+        return _fail("sha256 must be a 64-character hex digest")
+    try:
+        result = await remote.request_report(sha256)
+    except remote.EgressUnavailable as exc:
+        return _fail(str(exc), {"kind": "remote_unavailable"})
+    attributes = result.get("data", {}).get("attributes", {}) if isinstance(result.get("data"), dict) else {}
+    if not isinstance(attributes, dict):
+        attributes = {}
+    # Lead with the verdict and degraded status; a huge behavior/strings array must not
+    # clip the only information needed to judge whether actual detonation happened.
+    view = {key: attributes.get(key) for key in (
+        "visibility", "analyzedAt", "verdict", "dynamicDegraded", "dynamicDegradedReason",
+        "staticDegraded", "fileType", "sizeBytes", "engineStats", "attack") if key in attributes}
+    for key in ("behavior", "iocs"):
+        if key in attributes:
+            view[key] = json.dumps(attributes[key], ensure_ascii=True)[:650]
+    body, cut = clip(json.dumps(view or result, sort_keys=False, ensure_ascii=True), ctx.settings.tool_result_chars, "head")
+    note = "Dynamic analysis was degraded; do not claim verified detonation. " if attributes.get("dynamicDegraded") else ""
+    return ToolResult(ok=True, content=f"MalwareAnalyzer public report for {sha256}. {note}\n{body}",
+                      summary=f"public report {sha256[:12]}", data={"sha256": sha256}, truncated=cut)
+
+
 def specs() -> List[ToolSpec]:
     return [
+        ToolSpec("malware_analyzer_submit",
+                 "Submit one selected file in malware_samples/ to MalwareAnalyzer for PUBLIC remote analysis. "
+                 "Only call for files authorised for public release. Never runs a sample locally. "
+                 "Requires a verified Proton WireGuard exit; fails closed if unavailable. "
+                 "A successful submission is not proof of dynamic detonation; fetch the report by hash.",
+                 {"type": "object", "properties": {"sample_id": {"type": "string", "minLength": 1, "maxLength": 80}},
+                  "required": ["sample_id"]}, malware_analyzer_submit, timeout=190.0, kind="net",
+                 describe=lambda a: str(a.get("sample_id") or "")),
+        ToolSpec("malware_analyzer_report",
+                 "Fetch a PUBLIC MalwareAnalyzer report by SHA-256 over verified Proton VPN. "
+                 "Report may still be pending or absent; never claim a dynamic verdict without evidence.",
+                 {"type": "object", "properties": {"sha256": {"type": "string", "minLength": 64, "maxLength": 64}},
+                  "required": ["sha256"]}, malware_analyzer_report, timeout=100.0, kind="net",
+                 describe=lambda a: str(a.get("sha256") or "")[:12]),
         ToolSpec("sample_triage",
                  "Read-only static analysis of an uploaded PE, ELF or script in malware_samples/ on the computer. "
                  "Returns bounded metadata and SHA-256. Never executes samples; there is no VM on the production computer.",
