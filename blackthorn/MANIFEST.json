@@ -1,6 +1,6 @@
 {
  "files": {
-  "blackthorn/README.md": "bb65c3335e43209bfadc14dd033db3388044621731d02c44649ca629e8f81288",
+  "blackthorn/README.md": "73b9cad93dc6c086aa7be9b3fd5891dbb7df535570039f4ad60955aa3df99c23",
   "blackthorn/__init__.py": "0bff9f17b60d2e4655f341e6ab4843bc0f472c807e811768bc04e6f60128f78e",
   "blackthorn/agent.py": "a627e0f46b48b26a3a359149cbb5ba72c169d594f546ccfc8bed472346550e6f",
   "blackthorn/api.py": "607e127d887420208efc6e93e36472e3b39a695962a6160974877fe2d55ede48",
@@ -15,7 +15,7 @@
   "blackthorn/gpu.py": "24d147ef7f8e65847475906346b13d8ff5b429ea0bea95651d5a68fac0ed8e9a",
   "blackthorn/kaggle_bundle.py": "f05991c9ef0a3ec9c41231e71021378938a34dba504156d3a202f2b809f8bf92",
   "blackthorn/llm.py": "4aa857ec656e4360a1617723377b611cc69a32fd874549503a1c59d1648d75b8",
-  "blackthorn/malware_analyzer.py": "1715674b952fe0744c349c650e33579813b02a6a8ae4ab6584259ded8341e495",
+  "blackthorn/malware_analyzer.py": "8a1aaae31a92425f785414060a945ac223adcd695b5ca50903d5cefdbc5d9115",
   "blackthorn/prompts.py": "7e84314f0fbc2f204bb97ef72d31731dac3b04408d9c3f1f415a8b855f85ccf3",
   "blackthorn/relay.py": "41ec4ab182bd49c15c8e7ba8853205f904164ae2187be8113370d8c8ecae5ea3",
   "blackthorn/route.py": "d0ead4b982168dafe6a7229f6ec8020003f1bf5dc7440d5148ae88823a6b3d25",
