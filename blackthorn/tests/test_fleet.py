@@ -528,3 +528,41 @@ def test_checkpoint_readback_accepts_newer_generation_only_with_identical_conten
     result = mirror_state_dataset(account, account, runner=runner,
                                   expected_generation=42, expected_digest=digest)
     assert result['ok'] and result['unchanged'] and result['source_generation'] == 43
+
+
+def test_private_dataset_archive_404_falls_back_to_verified_individual_files(monkeypatch):
+    """A private Kaggle dataset can list/get files while its combined ZIP returns HTTP 404."""
+    import hashlib
+    import json
+    import subprocess
+    from pathlib import Path
+    from blackthorn.fleet import mirror_state_dataset
+    payload = {'safe.txt': b'safe', 'nested/other.txt': b'other'}
+    files = {n: {'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+             for n, data in payload.items()}
+    digest = hashlib.sha256(json.dumps(files, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    marker = json.dumps({'schema': 2, 'generation': 81, 'files': files, 'digest': digest}).encode()
+    source = {**payload, '.blackthorn/checkpoint.json': marker}
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(tuple(cmd))
+        assert cmd[:3] == ['kaggle', 'datasets', 'download']  # self-readback never uploads
+        folder = Path(cmd[cmd.index('-p') + 1])
+        if '-f' not in cmd:
+            return subprocess.CompletedProcess(cmd, 1, stdout='', stderr='HTTP 404 (combined archive)')
+        name = cmd[cmd.index('-f') + 1]
+        dest = folder / name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(source[name])
+        return subprocess.CompletedProcess(cmd, 0, stdout='', stderr='')
+
+    monkeypatch.setattr(subprocess, 'run', fake_run)
+    account = Account('self', 'token', 'computer', 'primary')
+    result = mirror_state_dataset(account, account, expected_generation=81, expected_digest=digest)
+    assert result['ok'] and result['unchanged'] and result['files'] == 2
+    assert sum('-f' not in cmd for cmd in calls) == 2
+    assert any('-f' in cmd for cmd in calls)
+    source['safe.txt'] = b'bad!'
+    invalid = mirror_state_dataset(account, account, expected_generation=81, expected_digest=digest)
+    assert not invalid['ok'], 'individual downloads must still pass the manifest hash check'

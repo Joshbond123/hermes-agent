@@ -685,6 +685,25 @@ def _mirror_state_dataset_unlocked(from_account: Account, to_account: Account, *
 
     def _unpack(folder: Path, target: Path) -> None:
         archives = list(folder.glob("*.zip"))
+        if not archives and (folder / ".blackthorn" / "checkpoint.json").is_file():
+            # Kaggle occasionally lists/downloads every private dataset file but returns
+            # HTTP 404 for the combined archive. A file-wise read is safe only with the
+            # signed-in owner's complete checkpoint manifest; _identity verifies all
+            # hashes and the aggregate digest before any mirror is accepted.
+            total = 0
+            for item in folder.rglob("*"):
+                if item.is_symlink():
+                    raise ValueError("unsafe snapshot symlink")
+                if not item.is_file():
+                    continue
+                rel = item.relative_to(folder)
+                total += item.stat().st_size
+                if total > 25 * 1024**3:
+                    raise ValueError("state snapshot exceeds mirror limit")
+                dest = target / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(item, dest)
+            return
         if len(archives) != 1:
             raise ValueError("expected exactly one state archive")
         target.mkdir(parents=True, exist_ok=True)
@@ -759,11 +778,40 @@ def _mirror_state_dataset_unlocked(from_account: Account, to_account: Account, *
         env.pop("KAGGLE_KEY", None)
         return env
     import time as _t
+    def download_files(folder: Path, slug: str, account: Account) -> bool:
+        """Fallback for Kaggle's private combined-archive 404; verify at _identity."""
+        marker_name = ".blackthorn/checkpoint.json"
+        env = account_env(account)
+        command = ["kaggle", "datasets", "download", "-p", str(folder)]
+        if _run([*command, "-f", marker_name, slug], env):
+            return False
+        marker = folder / marker_name
+        try:
+            data = json.loads(marker.read_text())
+            files = data.get("files")
+            if data.get("schema") != 2 or not isinstance(files, dict) or len(files) > 10000:
+                return False
+            total = sum(int(f.get("size", -1)) for f in files.values())
+            if total < 0 or total > 25 * 1024**3:
+                return False
+            for name in files:
+                path = Path(name)
+                if (not name or path.is_absolute() or ".." in path.parts or "\\" in name or
+                        name == marker_name):
+                    return False
+                if _run([*command, "-f", name, slug], env) or not (folder / path).is_file():
+                    return False
+            return True
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            return False
+
     def download(folder: Path, slug: str, account: Account) -> bool:
         folder.mkdir(parents=True, exist_ok=True)
         for attempt in range(5):
             rc = _run(["kaggle", "datasets", "download", "-p", str(folder), slug], account_env(account))
             if rc == 0:
+                return True
+            if "404" in last_error and download_files(folder, slug, account):
                 return True
             if not any(code in last_error for code in ("404", "429", "500", "502", "503", "504")) or attempt == 4:
                 return False
