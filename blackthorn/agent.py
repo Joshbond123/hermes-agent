@@ -171,8 +171,22 @@ class AgentRun:
         if self.user_message.strip().lower() in ("continue", "yes", "go on", "do it"):
             context += " " + " ".join(str(t.get("content") or "")[:500] for t in self.turns[-4:] if t.get("role") == "user")
         self._remote_analysis = bool(re.search(r"malware|ransomware|sample|detonat|sandbox|virus|malicious", context, re.I))
-        self._active_schemas = self._schemas if self._remote_analysis else [
-            schema for schema in self._schemas if not schema["function"]["name"].startswith("malware_analyzer_")]
+        # An explicitly requested public upload/report has a known short workflow:
+        # omit unrelated catalog, browser and shell schemas for this turn. That
+        # saves ~1k prefill tokens on the slow partially-offloaded 27B GPU, while
+        # keeping the general research/computer toolbox on broader tasks.
+        specific_remote = self._remote_analysis and bool(re.search(
+            r"(submit|upload|report|lookup|public remote analysis).{0,120}(malware|analyzer)|"
+            r"(malware|analyzer).{0,120}(submit|upload|report|lookup)", context, re.I))
+        if specific_remote:
+            allowed = {"malware_analyzer_submit", "malware_analyzer_report", "sample_triage",
+                       "list_files", "read_file", "write_file", "web_search", "todo_list"}
+            self._active_schemas = [schema for schema in self._schemas if schema["function"]["name"] in allowed]
+        elif self._remote_analysis:
+            self._active_schemas = self._schemas
+        else:
+            self._active_schemas = [schema for schema in self._schemas
+                                    if not schema["function"]["name"].startswith("malware_analyzer_")]
         self._schema_cost = prompts.schema_tokens(self._active_schemas)
 
     # ------------------------------------------------------------------ helpers
