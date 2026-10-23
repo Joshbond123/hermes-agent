@@ -54,11 +54,17 @@ def test_fit_history_clips_a_single_oversized_recent_turn():
 
 
 def test_shrink_tool_messages_stubs_old_outputs_first():
+    def pair(cid, text):
+        return [{"role": "assistant", "content": "", "tool_calls": [
+                    {"id": cid, "type": "function", "function": {"name": "run_command", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": cid, "content": text}]
     msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "q"},
-            {"role": "tool", "tool_call_id": "1", "content": "A" * 3000}, {"role": "tool", "tool_call_id": "2", "content": "B" * 3000}]
+            *pair("1", "A" * 3000), *pair("2", "B" * 3000)]
     assert prompts.shrink_tool_messages(msgs, budget_tokens=1200)
-    assert msgs[2]["content"] == prompts.STUB and msgs[3]["content"].startswith("B")
-    assert prompts.shrink_tool_messages(msgs, budget_tokens=300) and len(msgs[3]["content"]) < 700
+    assert msgs[3]["content"] == prompts.STUB and msgs[5]["content"].startswith("B")
+    assert prompts.shrink_tool_messages(msgs, budget_tokens=300)
+    assert prompts.estimate_messages(msgs) <= 300
+    assert any(m.get("role") == "user" and m["content"] == "q" for m in msgs)
 
 
 def test_system_prompt_composition_is_small_and_contains_context():

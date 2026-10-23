@@ -185,8 +185,31 @@ class AgentRun:
         elif self._remote_analysis:
             self._active_schemas = self._schemas
         else:
+            # Qwen's template expands every function description into the prompt on EVERY
+            # model step. Keep the nine core research/computer/task tools available, and load
+            # specialised schemas only when the current task (or its recent context) needs them.
+            # Full schemas remain in the registry: no tool or capability is uninstalled.
+            core = {"web_search", "job_status", "run_command", "list_files", "read_file", "write_file",
+                    "fetch_url", "computer_info", "todo_list", "optional_tool"}
+            context_lower = (context + " " + " ".join(str(t.get("content") or "")[:300]
+                            for t in self.turns[-4:] if t.get("role") == "user")).lower()
+            def mentions(*words: str) -> bool:
+                return any(word in context_lower for word in words)
+            if mentions("remember", "memory", "recall", "previous", "earlier", "history", "session", "past chat"):
+                core.update(("remember", "session_search"))
+            if mentions("skill", "playbook", "workflow", "training"):
+                core.update(("skill_search", "skill_load", "skill_read"))
+            if mentions("catalog", "security tool", "pentest", "nmap", "install", "scan", "tool search"):
+                core.add("tool_search")
+            if mentions("browse", "browser", "web page", "website", "javascript", "screenshot", "login", "web app"):
+                core.add("browse")
+            if mentions("triage", "suspicious file", "sample"):
+                core.add("sample_triage")
+            # A continued task can still call any specialised tool that actually ran earlier.
+            core.update(entry.get("n") for turn in self.turns[-8:]
+                        for entry in (turn.get("ledger") or []) if isinstance(entry, dict))
             self._active_schemas = [schema for schema in self._schemas
-                                    if not schema["function"]["name"].startswith("malware_analyzer_")]
+                                    if schema["function"]["name"] in core]
         self._schema_cost = prompts.schema_tokens(self._active_schemas)
 
     # ------------------------------------------------------------------ helpers
@@ -299,6 +322,13 @@ class AgentRun:
     def _protected_indices(self) -> List[int]:
         """Indices compaction must never drop: the system prompt and the user's real request(s)."""
         out = {0}
+        # Preserve the session-opening request, not just the newest turn. Hermes keeps a
+        # protected head; otherwise a long-running follow-up can forget the original goal.
+        opening = next((prompts.one_line(t.get("content") or "", 500)
+                        for t in self.turns if t.get("role") == "user" and str(t.get("content") or "").strip()), "")
+        if opening:
+            out.update(i for i, msg in enumerate(self._messages[1:], 1)
+                       if msg.get("role") == "user" and msg.get("content") == opening)
         for i in range(len(self._messages) - 1, 0, -1):
             msg = self._messages[i]
             if msg.get("role") != "user":
@@ -554,7 +584,10 @@ class AgentRun:
             if len(messages) < before:
                 self.run.emit("internal.compaction", stage="mid_task")
                 # Mid-task resume after compaction (Hermes-style): the model must not answer from a hole.
-                if messages[-1].get("role") == "tool":
+                if messages[-1].get("role") == "tool" and (
+                    prompts.estimate_messages(messages, s.chars_per_token)
+                    + prompts.estimate_tokens(RESUME_NOTE, s.chars_per_token) + 3 <= budget
+                ):
                     messages.append({"role": "user", "content": RESUME_NOTE})
             route_started = time.monotonic()
             route = await self.deps.resolver.get()
@@ -586,6 +619,17 @@ class AgentRun:
                     messages.append({"role": "user", "content": RESUME_NOTE})
                 continue
             except LLMError as exc:
+                # Some engines truncate the conversation *before* applying Qwen3.8's template.
+                # When their SSE error says the latest user query vanished, perform ONE bounded
+                # compaction and repeat the real request near the tail. Do not lose the ledger or
+                # retry indefinitely; the normal context_full error remains actionable.
+                if (exc.code in ("gpu_stream", "gpu_http") and
+                        "no user query found in messages" in exc.message.lower() and attempt == 1):
+                    self._force_compact()
+                    messages.append({"role": "user", "content":
+                                     RESUME_NOTE + "\nReal user request (restated): " + self.user_message[:1400]})
+                    self.run.emit("internal.compaction", stage="qwen_query_retry")
+                    continue
                 # Transport faults (edge timeout 524, dropped tunnel, stalled stream) are not
                 # the model failing: recover instead of killing a long run mid-task. A dead GPU
                 # still fails fast (retryable=False on auth/protocol errors).

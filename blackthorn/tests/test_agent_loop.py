@@ -364,7 +364,9 @@ async def test_context_overflow_is_recovered_by_trimming(stack):
     assert any(n["stage"] == "overflow_retry" for n in b.of("internal.compaction"))
     assert not any("compact" in n.get("text", "").lower() for n in b.of("notice"))
     retried = stack.backend.requests[-1]["messages"]
-    assert [m["role"] for m in retried] == ["system", "user"]
+    assert [m["role"] for m in retried] == ["system", "user", "assistant", "user"]
+    assert retried[1]["content"] == "q1"  # preserve the opening request
+    assert retried[-1]["content"] == "q2"
 
 
 # ---------------------------------------------------------------------------------------------------- cancel / resume

@@ -106,86 +106,93 @@ def shrink_tool_messages(messages: List[Dict[str, Any]], budget_tokens: int, cha
     Returns True when the result fits, or when only system + the protected message remain
     (always keep the current turn runnable).
     """
+    if not messages:
+        return False
+    # Pin actual message objects, not integer positions: every deletion shifts indices. The
+    # original implementation pinned index N and then removed old turns before N, eventually
+    # deleting the current user request and sending system+tools to Qwen's Jinja template.
+    pinned = {id(messages[0])}
+    pinned.update(id(messages[i]) for i in protect if isinstance(i, int) and 0 <= i < len(messages))
+    def real_user(m: Dict[str, Any]) -> bool:
+        text = str(m.get("content") or "").strip()
+        return m.get("role") == "user" and not (text.startswith("<tool_response>") and text.endswith("</tool_response>"))
+    users = [m for m in messages if real_user(m)]
+    if not users:
+        return False  # never send a request Qwen's actual template cannot render
+    if not any(m.get("role") == "user" and id(m) in pinned for m in messages):
+        pinned.add(id(users[-1]))
+    _sanitize_pairs(messages)
+
     def total() -> int:
         return estimate_messages(messages, chars_per_token)
 
-    if total() <= budget_tokens:
+    def fits() -> bool:
+        # Compaction can remove the assistant between two user turns. Repair alternation
+        # *before* the fit check; otherwise Qwen receives an invalid wire history.
+        alternate = _alternate(messages)
+        if estimate_messages(alternate, chars_per_token) > budget_tokens:
+            return False
+        messages[:] = alternate
         return True
-    pinned = {0} | {int(i) for i in protect if isinstance(i, int)}
 
-    # 1. stub the oldest tool outputs. The group the model is working from (the newest one) is left
-    #    alone except for its last result, which step 2 clips instead of stubbing.
+    if fits():
+        return True
+
     groups = _tool_groups(messages)
-    in_progress = set(groups[-1][1:]) if groups else set()
+    in_progress = {id(messages[i]) for i in groups[-1][1:]} if groups else set()
     tool_idx = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
     for i in tool_idx[:-1]:
-        if i in in_progress:
-            continue
-        if messages[i].get("content") != STUB:
+        if id(messages[i]) not in in_progress:
             messages[i]["content"] = STUB
-    if total() <= budget_tokens:
+    if fits():
         return True
 
-    # 2. clip the newest tool output (progressively, never below 400 characters)
     if tool_idx:
         i = tool_idx[-1]
         content = str(messages[i].get("content") or "")
         while total() > budget_tokens and len(content) > 400:
             content = content[: int(len(content) * 0.7)] + "\n[… clipped to fit the context window …]"
             messages[i]["content"] = content
-        if total() <= budget_tokens:
+        if fits():
             return True
 
-    # 3. drop whole tool groups, oldest first (the newest group is the work in progress)
-    guard = 0
-    while total() > budget_tokens and guard < 40:
-        guard += 1
+    # Old complete tool groups are expendable; keep the latest batch while feasible.
+    while total() > budget_tokens:
         groups = _tool_groups(messages)
-        if len(groups) < 2:
+        if len(groups) < 2 or any(id(messages[i]) in pinned for i in groups[0]):
             break
-        grp = groups[0]
-        if any(i in pinned for i in grp):
-            break
-        for i in sorted(grp, reverse=True):
+        for i in sorted(groups[0], reverse=True):
             messages.pop(i)
-        if total() <= budget_tokens:
-            _sanitize_pairs(messages)
+        if fits():
             return True
 
-    # 4. drop whole non-tool turns, oldest first
-    guard = 0
-    while total() > budget_tokens and len(messages) > 2 and guard < 40:
-        guard += 1
-        drop_at = None
-        for i in range(1, len(messages)):
-            if i in pinned or messages[i].get("role") == "tool":
-                continue
-            if messages[i].get("role") in ("user", "assistant"):
-                drop_at = i
-                break
+    # Never delete a protected request, even after all earlier turns shift left.
+    while total() > budget_tokens and len(messages) > 2:
+        drop_at = next((i for i in range(1, len(messages))
+                        if id(messages[i]) not in pinned and messages[i].get("role") in ("user", "assistant")
+                        and not messages[i].get("tool_calls")), None)
         if drop_at is None:
             break
         messages.pop(drop_at)
-        if total() <= budget_tokens:
-            _sanitize_pairs(messages)
+        if fits():
             return True
 
-    # 5. clip long assistant content
     for m in messages:
         if m.get("role") == "assistant" and isinstance(m.get("content"), str) and len(m["content"]) > 800:
             while total() > budget_tokens and len(m["content"]) > 400:
                 m["content"] = m["content"][: int(len(m["content"]) * 0.6)] + "\n[… clipped …]"
-            if total() <= budget_tokens:
+            if fits():
                 return True
 
-    _sanitize_pairs(messages)
-
-    # 6. last resort: keep the system prompt, say plainly that the middle was compacted, keep the tail
-    minimal = [messages[0], {"role": "user", "content": COMPACT_HEADER}, *[messages[i] for i in sorted(pinned) if 0 < i < len(messages)]]
+    # Last resort: keep both the opening request and the current real request where
+    # feasible. If the server state alone is too large, fail honestly instead of
+    # manufacturing a user turn while discarding the actual request.
+    protected = [m for m in messages[1:] if id(m) in pinned]
+    minimal = _alternate([messages[0], *protected])
     if estimate_messages(minimal, chars_per_token) <= budget_tokens:
         messages[:] = minimal
         return True
-    return total() <= budget_tokens
+    return False
 
 
 # ==================================================================================================
@@ -328,31 +335,36 @@ def _tool_groups(messages: List[Dict[str, Any]]) -> List[List[int]]:
 
 
 def _sanitize_pairs(messages: List[Dict[str, Any]]) -> None:
-    """Drop orphaned tool results, and stub any tool call whose result was dropped.
+    """Keep *one* immediate tool result per call, inserting a stub only if absent.
 
-    Port of Hermes ``ContextCompressor._sanitize_tool_pairs``: an assistant message carrying
-    ``tool_calls`` must be followed by exactly one result per call, or the server rejects the request.
+    Previously the scan looked only at results already emitted, so it inserted a stub for
+    EVERY call before visiting the real results. Four parallel calls became eight results,
+    doubling prefill and sometimes pushing a valid prompt over the context limit.
     """
-    call_ids = set()
-    for msg in messages:
-        for call in msg.get("tool_calls") or []:
+    out: List[Dict[str, Any]] = []
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if msg.get("role") == "tool":  # orphan (or a duplicate after this call's group)
+            i += 1
+            continue
+        out.append(msg)
+        i += 1
+        calls = msg.get("tool_calls") or []
+        if not calls:
+            continue
+        found: Dict[str, Dict[str, Any]] = {}
+        while i < len(messages) and messages[i].get("role") == "tool":
+            result = messages[i]
+            cid = result.get("tool_call_id")
+            if cid and cid not in found:
+                found[cid] = result
+            i += 1
+        for call in calls:
             cid = (call or {}).get("id")
             if cid:
-                call_ids.add(cid)
-    kept: List[Dict[str, Any]] = []
-    for msg in messages:
-        if msg.get("role") == "tool" and msg.get("tool_call_id") not in call_ids:
-            continue
-        kept.append(msg)
-    filled: List[Dict[str, Any]] = []
-    for msg in kept:
-        filled.append(msg)
-        if msg.get("role") == "assistant" and msg.get("tool_calls"):
-            for call in msg["tool_calls"]:
-                cid = (call or {}).get("id")
-                if cid and not any(m.get("role") == "tool" and m.get("tool_call_id") == cid for m in filled):
-                    filled.append({"role": "tool", "tool_call_id": cid, "content": STUB})
-    messages[:] = filled
+                out.append(found.get(cid) or {"role": "tool", "tool_call_id": cid, "content": STUB})
+    messages[:] = out
 
 
 def compact_summary(turns: Sequence[Dict[str, Any]], *, requests: int = 6, done: int = 14, failed: int = 8) -> str:

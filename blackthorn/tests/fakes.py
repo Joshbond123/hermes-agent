@@ -120,6 +120,9 @@ class FakeBackend:
                         if "sleep" in ev:
                             await asyncio.sleep(ev["sleep"])
                             continue
+                        if "stream_error" in ev:
+                            yield f'data: {json.dumps({"error": {"message": ev["stream_error"]}})}\n\n'.encode()
+                            continue
                         if "drop" in ev:
                             raise RuntimeError("simulated connection drop")
                         delta: Dict[str, Any] = {}
