@@ -119,6 +119,24 @@ async def malware_analyzer_egress() -> Dict[str, Any]:
                    reason=reason[:120]) from exc
 
 
+@router.get("/api/malware-analyzer/report/{sha256}")
+async def malware_analyzer_public_report(sha256: str) -> Dict[str, Any]:
+    """Authenticated, read-only diagnostic of a PUBLIC report via the verified exit."""
+    from .malware_analyzer import EgressUnavailable, HASH, request_report
+    if not HASH.fullmatch(sha256):
+        raise _err(422, "invalid_hash", "A SHA-256 hash is required.")
+    try:
+        result = await request_report(sha256)
+    except EgressUnavailable as exc:
+        raise _err(503, "remote_report_unavailable", "The verified VPN report lookup did not complete.") from exc
+    data = result.get("data", {}) if isinstance(result, dict) else {}
+    attrs = data.get("attributes", {}) if isinstance(data, dict) else {}
+    if not isinstance(attrs, dict):
+        attrs = {}
+    return {"ok": True, "sha256": sha256.lower(), "visibility": attrs.get("visibility"),
+            "verdict": attrs.get("verdict"), "dynamicDegraded": attrs.get("dynamicDegraded")}
+
+
 # --------------------------------------------------------------------------- sessions
 class SessionPatch(BaseModel):
     title: Optional[str] = Field(default=None, max_length=200)
