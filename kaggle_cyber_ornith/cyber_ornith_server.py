@@ -1616,7 +1616,7 @@ async def computer_activity(_=Depends(verify_api_key)):
     procs = _tagged_processes()
     state = {}
     try:
-        with open(os.path.join(COMPUTER_WORKSPACE, ".blackthorn", "checkpoint.json")) as stream:
+        with open(os.path.join(COMPUTER_ROOT, ".blackthorn", "checkpoint.json")) as stream:
             marker = json.load(stream)
         state = {"state_generation": marker.get("generation"), "state_digest": marker.get("digest")}
     except (OSError, ValueError):

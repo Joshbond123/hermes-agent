@@ -431,3 +431,24 @@ def test_checkpoint_publishes_verified_empty_state_after_last_user_file_deleted(
     marker = json.loads((ws / '.blackthorn' / 'checkpoint.json').read_text())
     assert 'last.txt' not in marker['files']
     assert marker['generation'] == empty['generation']
+
+
+def test_generated_gateway_activity_exposes_verified_snapshot_identity(srv, tmp_path, monkeypatch):
+    """Exercise the generated uvicorn module, not just the outer notebook module."""
+    from fastapi.testclient import TestClient
+    root = tmp_path / 'workspace'
+    gateway_source = srv.gateway_code().replace('/kaggle/working/blackthorn_workspace', str(root))
+    scope = {'__name__': 'blackthorn_gateway_test'}
+    exec(compile(gateway_source, 'gateway_server.py', 'exec'), scope)
+    (root / '.blackthorn').mkdir(parents=True)
+    (root / '.blackthorn' / 'checkpoint.json').write_text(json.dumps({
+        'schema': 2, 'generation': 42, 'digest': 'verified-hash', 'files': {}}))
+    scope['COMPUTER_ROOT'] = str(root)
+    scope['_tagged_processes'] = lambda: []
+    monkeypatch.setenv('BLACKTHORN_FLEET_SLOT', 'backup')
+    with TestClient(scope['app']) as client:
+        response = client.get('/computer/activity', headers={'Authorization': 'Bearer ' + srv.API_KEY})
+    assert response.status_code == 200, response.text[:200]
+    assert response.json()['fleet_slot'] == 'backup'
+    assert response.json()['state_digest'] == 'verified-hash'
+    assert response.json()['state_generation'] == 42
