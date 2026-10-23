@@ -2062,6 +2062,15 @@ def failover_fleet_role(role: str, from_slot: str, to_slot: str) -> Dict[str, An
     if new is None:
         return {"ok": False, "error": "no account for the new active slot"}
     out: Dict[str, Any] = {"role": role, "from": from_slot, "to": to_slot, "account": new.user}
+    # A second notebook pulling the SAME Render relay channel can consume the
+    # old slot's requests, while both notebooks overwrite one D1 role row.
+    # No slot identity check can make that overlapping period safe for user work.
+    # Keep the healthy source running instead of advertising an unverified
+    # "automatic" transition; isolated per-slot relay/state lanes are required.
+    if (old is not None and old.user != new.user and
+            os.environ.get("BLACKTHORN_RELAY_URL") and _fleet_role_online(role)):
+        return {**out, "ok": False, "status": "shared_relay_handover_unavailable",
+                "reason": "The live source is preserved; isolated per-slot relay and state lanes are required."}
     old_computer_jobs = None
     if role == "computer" and _fleet_role_online(role):
         try:

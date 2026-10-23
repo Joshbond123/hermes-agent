@@ -785,7 +785,10 @@ def _mirror_state_dataset_unlocked(from_account: Account, to_account: Account, *
                 src = root / f"source_{attempt}"
                 _unpack(source_download, src)
                 identity = _identity(src, create_legacy=expected_generation is None)
-                if expected_generation is None or (identity["generation"] == expected_generation and
+                # A periodic checkpoint may publish a successor while this read
+                # is in flight. Equal content from a NEWER generation is safe;
+                # an older generation or different bytes are not.
+                if expected_generation is None or (identity["generation"] >= expected_generation and
                                                    identity["digest"] == expected_digest):
                     break
                 if attempt == 4:

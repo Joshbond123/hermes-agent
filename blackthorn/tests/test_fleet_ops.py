@@ -272,3 +272,17 @@ def test_explicit_checkpoint_is_not_success_until_source_dataset_reads_back(ops,
     assert checked and checked[0][0:2] == ('primary', 'primary')
     assert checked[0][2]['expected_generation'] == 42
     assert checked[0][2]['expected_digest'] == 'live-digest'
+
+
+@pytest.mark.parametrize('role', ['model', 'computer'])
+def test_live_shared_relay_failover_fails_closed_without_stopping_source(ops, monkeypatch, role):
+    monkeypatch.setenv('BLACKTHORN_RELAY_URL', 'https://test.invalid/gpu-relay')
+    monkeypatch.setattr(d1, '_role_intended_online', lambda r: True)
+    monkeypatch.setattr(d1, '_role_boot_in_progress', lambda r: False)
+    monkeypatch.setattr(d1, '_fleet_role_online', lambda r: True)
+    monkeypatch.setattr(d1, '_fleet_manager_with_usage', lambda accounts: FleetManager(accounts))
+    before = list(ops['rows'])
+    outcome = d1.failover_fleet_role(role, 'primary', 'backup')
+    assert not outcome['ok'] and outcome['status'] == 'shared_relay_handover_unavailable'
+    assert ops['rows'] == before and not ops['starts'] and not ops['mirrors']
+    assert not any(method == 'DeleteKernel' for method, _ in ops['rpcs'])

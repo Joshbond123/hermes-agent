@@ -506,3 +506,25 @@ def test_mirror_refuses_stale_download_after_live_checkpoint(monkeypatch):
                                   expected_generation=42, expected_digest=digest)
     assert not result['ok'] and 'expected live checkpoint' in result['error']
     assert len(downloads) == 5
+
+
+def test_checkpoint_readback_accepts_newer_generation_only_with_identical_content(monkeypatch):
+    import hashlib
+    import json
+    import zipfile
+    from pathlib import Path
+    from blackthorn.fleet import mirror_state_dataset
+    files = {'safe.txt': {'size': 4, 'sha256': hashlib.sha256(b'safe').hexdigest()}}
+    digest = hashlib.sha256(json.dumps(files, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    def runner(cmd, env):
+        assert cmd[2] == 'download'  # unchanged self-mirror never uploads
+        folder = Path(cmd[cmd.index('-p') + 1])
+        with zipfile.ZipFile(folder / 'state.zip', 'w') as z:
+            z.writestr('safe.txt', 'safe')
+            z.writestr('.blackthorn/checkpoint.json', json.dumps({
+                'schema': 2, 'generation': 43, 'files': files, 'digest': digest}))
+        return 0
+    account = Account('test', 'test-token', 'computer', 'primary')
+    result = mirror_state_dataset(account, account, runner=runner,
+                                  expected_generation=42, expected_digest=digest)
+    assert result['ok'] and result['unchanged'] and result['source_generation'] == 43
