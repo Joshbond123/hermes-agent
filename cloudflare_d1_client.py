@@ -1284,10 +1284,12 @@ def get_kaggle_gpu_status(force_refresh: bool = False) -> Dict[str, Any]:
                         if d1_row.get("status") != "ONLINE" or d1_row.get("tunnel_url") != state["tunnel_url"]:
                             try:
                                 d1_query(
-                                    """INSERT INTO kaggle_gpu_state (id, status, tunnel_url, api_key, model, gpu_info, updated_at)
-                                       VALUES ('primary', 'ONLINE', ?, ?, ?, ?, ?)
-                                       ON CONFLICT(id) DO UPDATE SET status = excluded.status, tunnel_url = excluded.tunnel_url, model = excluded.model, gpu_info = excluded.gpu_info, updated_at = excluded.updated_at;""",
-                                    [state["tunnel_url"], CYBER_ORNITH_API_KEY, CYBER_ORNITH_MODEL, state["gpu_info"], time.time()],
+                                    """UPDATE kaggle_gpu_state
+                                       SET status = 'ONLINE', model = ?, gpu_info = ?, updated_at = ?
+                                       WHERE id = 'primary' AND tunnel_url = ? AND api_key <> ''
+                                         AND status NOT IN ('OFF', 'STOPPING_KAGGLE_GPU',
+                                                            'GPU_STOPPED_SAVING_QUOTA');""",
+                                    [CYBER_ORNITH_MODEL, state["gpu_info"], time.time(), state["tunnel_url"]],
                                 )
                             except Exception:
                                 pass

@@ -31,12 +31,12 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 PULL_WAIT_S = 25.0             # notebook long-poll window (below every proxy timeout)
 HEADERS_TIMEOUT_S = 90.0       # fail faster when the notebook is stuck; warm model answers in seconds
 IDLE_FAST_FAIL_S = 40.0        # no notebook seen for this long -> fail fast instead of hanging
-KEY_CACHE_TTL_S = 30.0         # ride out D1 blips without 401ing a healthy notebook
+KEY_CACHE_TTL_S = 5.0          # refresh cheaply at each long poll; avoid stale boot keys
 CONSUMER_IDLE_ABANDON_S = 120.0  # a full chunk queue with no consumer read for this long -> abandon the job
 PUSH_PUT_SLICE_S = 1.0         # how often a blocked push re-checks whether its consumer is gone
 STALL_AFTER_TIMEOUTS = 2       # consecutive header timeouts that mark the link as stalled
@@ -56,6 +56,7 @@ class _Job:
     status: int = 200
     content_type: str = "application/octet-stream"
     pushed: bool = False
+    notebook_key: str = ""               # pinned when assigned; rotation must not break a live stream
     closed: bool = False                 # the consumer is gone or the job was abandoned: never deliver it
     last_consumed: float = field(default_factory=time.monotonic)
 
@@ -63,7 +64,8 @@ class _Job:
 class RelayHub:
     """One GPU, one queue. Multiple notebooks are not a supported topology (and not needed)."""
 
-    def __init__(self) -> None:
+    def __init__(self, channel: str = "model") -> None:
+        self.channel = channel
         self.pending: "asyncio.Queue[_Job]" = asyncio.Queue()
         self.inflight: Dict[str, _Job] = {}
         self.last_seen: float = time.monotonic()
@@ -125,38 +127,35 @@ def _hub(request: Request, channel: str = "model") -> RelayHub:
         services.relay_hubs = hubs
     hub = hubs.get(channel)
     if hub is None:
-        hub = RelayHub()
+        hub = RelayHub(channel)
         hubs[channel] = hub
     return hub
 
 
-_KEY_CACHE = {"t": 0.0, "v": ()}
+_KEY_CACHE: Dict[str, tuple[float, str]] = {}
 
 
-async def _row_keys(request: Request) -> tuple:
-    """The per-boot keys the notebooks publish to D1 (model row AND computer row).
-    Each host authenticates with its own key; a D1 read blip must not 401 a healthy
-    notebook, so both keys are cached briefly.
+async def _row_keys(request: Request, channel: str = "model", *, force: bool = False) -> tuple[str, ...]:
+    """Only the D1 key of this role may poll its channel. Do not mix both hosts.
+
+    A short cache tolerates transient D1 failures; the job itself is additionally
+    pinned to the agent's bearer key before it leaves the queue.
     """
+    channel = channel if channel in CHANNELS else "model"
     now = time.monotonic()
-    if _KEY_CACHE["v"] and now - _KEY_CACHE["t"] < KEY_CACHE_TTL_S:
-        return tuple(_KEY_CACHE["v"])
-    keys = set()
+    cached_at, cached = _KEY_CACHE.get(channel, (0.0, ""))
+    if not force and cached and now - cached_at < KEY_CACHE_TTL_S:
+        return (cached,)
     try:
         store = request.app.state.bt.store
-        for getter in ("gpu_row", "computer_row"):
-            try:
-                row = await getattr(store, getter)()
-                value = str(row.get("api_key") or "")
-                if value:
-                    keys.add(value)
-            except Exception:  # noqa: BLE001 - one row missing must not lose the other
-                pass
-        if keys:
-            _KEY_CACHE.update(t=now, v=tuple(keys))
-        return tuple(keys)
-    except Exception:
-        return tuple(_KEY_CACHE["v"] or ())
+        row = await (store.computer_row() if channel == "computer" else store.gpu_row())
+        key = str(row.get("api_key") or "")
+        if key:
+            _KEY_CACHE[channel] = (now, key)
+            return (key,)
+        return ()                            # an empty D1 row must revoke old access
+    except Exception:  # noqa: BLE001 - only a read failure permits the last known key
+        return (cached,) if cached and now - cached_at < 60.0 else ()
 
 
 def _authed(request: Request, expected: tuple) -> bool:
@@ -185,7 +184,8 @@ async def relay_pull(request: Request, channel: str = "model"):
     if channel not in CHANNELS:
         channel = "model"
     hub = _hub(request, channel)
-    if not _authed(request, await _row_keys(request)):
+    if not _authed(request, await _row_keys(request, channel)) and not _authed(
+            request, await _row_keys(request, channel, force=True)):
         raise HTTPException(status_code=401, detail={"code": "relay_auth", "message": "unknown relay key"})
     hub.last_seen = time.monotonic()
     hub.waiting_pulls += 1
@@ -199,10 +199,17 @@ async def relay_pull(request: Request, channel: str = "model"):
                 candidate = hub.pending.get_nowait()
             except asyncio.QueueEmpty:
                 if time.monotonic() >= deadline:
-                    return JSONResponse({"quiet": True}, status_code=204)
+                    return Response(status_code=204)  # HTTP 204 MUST NOT carry a JSON body
                 await asyncio.sleep(0.25)
                 continue
             if hub.deliverable(candidate):
+                # The D1 cache may still admit an old notebook briefly after a
+                # key rotation. Never hand the new agent's job to that host.
+                bearer = candidate.headers.get("authorization", "")
+                if bearer.lower().startswith("bearer ") and bearer[7:].strip() != request.headers.get("x-blackthorn-key", ""):
+                    hub.pending.put_nowait(candidate)
+                    raise HTTPException(status_code=401, detail={"code": "relay_auth"})
+                candidate.notebook_key = request.headers.get("x-blackthorn-key", "")
                 job = candidate
             # else: the caller already gave up on it - executing it now would only burn GPU time
     finally:
@@ -226,12 +233,10 @@ async def relay_push(request: Request, job_id: str):
             break
     if hub is None:
         hub = _hub(request)
-    if not _authed(request, await _row_keys(request)):
+    job = hub.inflight.get(job_id)
+    if job is None or not _authed(request, (job.notebook_key,)):
         raise HTTPException(status_code=401, detail={"code": "relay_auth", "message": "unknown relay key"})
     hub.last_seen = time.monotonic()
-    job = hub.inflight.get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail={"code": "relay_gone", "message": "no such relay request"})
     try:
         job.status = int(request.headers.get("x-relay-status") or 200)
         job.content_type = request.headers.get("x-relay-content-type") or "application/octet-stream"
@@ -268,9 +273,9 @@ def _find_inflight(request: Request, job_id: str):
 
 
 async def relay_headers(request: Request, job_id: str):
-    if not _authed(request, await _row_keys(request)):
-        raise HTTPException(status_code=401, detail={"code": "relay_auth"})
     hub, job = _find_inflight(request, job_id)
+    if job is not None and not _authed(request, (job.notebook_key,)):
+        raise HTTPException(status_code=401, detail={"code": "relay_auth"})
     if job is None or job.closed or hub is None:
         return JSONResponse({"dropped": True}, status_code=410)
     job.status = int(request.headers.get("x-relay-status") or 200)
@@ -282,9 +287,9 @@ async def relay_headers(request: Request, job_id: str):
 
 
 async def relay_chunk(request: Request, job_id: str):
-    if not _authed(request, await _row_keys(request)):
-        raise HTTPException(status_code=401, detail={"code": "relay_auth"})
     hub, job = _find_inflight(request, job_id)
+    if job is not None and not _authed(request, (job.notebook_key,)):
+        raise HTTPException(status_code=401, detail={"code": "relay_auth"})
     if job is None or job.closed or not job.pushed or hub is None:
         return JSONResponse({"dropped": True}, status_code=410)
     chunk = await request.body()
@@ -297,9 +302,9 @@ async def relay_chunk(request: Request, job_id: str):
 
 
 async def relay_done(request: Request, job_id: str):
-    if not _authed(request, await _row_keys(request)):
-        raise HTTPException(status_code=401, detail={"code": "relay_auth"})
     hub, job = _find_inflight(request, job_id)
+    if job is not None and not _authed(request, (job.notebook_key,)):
+        raise HTTPException(status_code=401, detail={"code": "relay_auth"})
     if job is None or job.closed or hub is None:
         return JSONResponse({"dropped": True}, status_code=410)
     await _put_chunk(job, None, hub)

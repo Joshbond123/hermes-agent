@@ -134,7 +134,13 @@ async def test_model_and_computer_channels_never_share_jobs(stack, monkeypatch):
     nb_model.respond = {"status": 200, "content_type": "application/json", "body": b'{"who":"model"}'}
     nb_comp = Notebook(stack, channel="computer")
     nb_comp.respond = {"status": 200, "content_type": "application/json", "body": b'{"who":"computer"}'}
-    # the computer channel only exists once its notebook has polled; until then /computer/* stays on the model host
+    # Each role has its own published key; enrol the computer before polling.
+    import time
+    await stack.executor.query(
+        "INSERT INTO kaggle_gpu_state (id, status, tunnel_url, api_key, model, gpu_info, updated_at) "
+        "VALUES ('computer', 'HEARTBEAT_ONLINE', ?, ?, 'computer', 'T4', ?)",
+        [stack.backend_srv.url, KEY, time.time()])
+    relay_mod._KEY_CACHE.clear()
     await nb_comp.run_once()
 
     async def call(path):

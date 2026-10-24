@@ -138,7 +138,9 @@ async def stream_chat(route: Route, messages: List[Dict[str, Any]], *, client: h
             if resp.status_code == 400 and _is_overflow(detail):
                 raise ContextOverflow("context_overflow", detail, status=400)
             if resp.status_code in (401, 403):
-                raise LLMError("gpu_auth", "The GPU gateway rejected the access key. Turn the GPU off and on again to refresh it.",
+                # No model output has been accepted on a non-200 response. The caller may
+                # refresh the D1 route and retry this model step (never its earlier tools).
+                raise LLMError("gpu_auth", "The GPU gateway did not accept this request's access key.",
                                status=resp.status_code)
             if resp.status_code in DEAD_TUNNEL_CODES:
                 raise LLMError("gpu_unreachable", f"The GPU tunnel is unreachable (HTTP {resp.status_code}).",

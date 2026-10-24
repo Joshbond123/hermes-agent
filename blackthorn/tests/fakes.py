@@ -104,6 +104,12 @@ class FakeBackend:
         async def health():
             return {"status": "online", "model": "fake-model", "model_loaded": True}
 
+        @app.get("/v1/models")
+        async def models(request: Request):
+            if not authed(request):
+                return JSONResponse({"detail": "Invalid or missing API Key."}, status_code=401)
+            return {"data": [{"id": "fake-model"}]}
+
         @app.post("/v1/chat/completions")
         async def chat(request: Request):
             if not authed(request):

@@ -567,6 +567,7 @@ class AgentRun:
     async def _model_step(self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]]) -> StepResult:
         s = self.deps.settings
         attempt = 0
+        auth_refreshes = 0
         while True:
             attempt += 1
             self._check()
@@ -619,6 +620,36 @@ class AgentRun:
                     messages.append({"role": "user", "content": RESUME_NOTE})
                 continue
             except LLMError as exc:
+                if exc.code == "gpu_auth":
+                    # A notebook may rotate its per-boot key while a long task is
+                    # running. Retry only the rejected model step after an uncached D1
+                    # read; the completed tool ledger is NOT replayed. An unchanged
+                    # route/key (or a second rejection after refresh) is a real auth
+                    # problem and must remain visible instead of looping indefinitely.
+                    self.deps.resolver.invalidate()
+                    try:
+                        fresh = await self.deps.resolver.get(force=True)
+                    except Exception:
+                        raise exc
+                    if auth_refreshes >= 1:
+                        raise LLMError("gpu_auth", "The GPU gateway still rejects the refreshed route. "
+                                       "Check the GPU connection and retry once it is healthy.",
+                                       status=exc.status) from exc
+                    if fresh.api_key == route.api_key and fresh.url == route.url:
+                        # An edge can reject a single stream request even when the
+                        # current key is valid. Only retry unchanged credentials
+                        # when a cheap authenticated endpoint actually accepts them.
+                        try:
+                            check = await self.deps.http.get(
+                                f"{fresh.url}/v1/models",
+                                headers={"Authorization": f"Bearer {fresh.api_key}"}, timeout=5.0)
+                            if check.status_code != 200:
+                                raise exc
+                        except (OSError, httpx.HTTPError):
+                            raise exc
+                    auth_refreshes += 1
+                    self.run.emit("notice", level="info", text="GPU connection refreshed — resuming this model step…")
+                    continue
                 # Some engines truncate the conversation *before* applying Qwen3.8's template.
                 # When their SSE error says the latest user query vanished, perform ONE bounded
                 # compaction and repeat the real request near the tail. Do not lose the ledger or
