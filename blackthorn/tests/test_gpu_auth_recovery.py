@@ -97,6 +97,9 @@ async def test_relay_does_not_let_old_or_other_role_take_a_new_model_job(stack, 
         assert fresh.status_code == 200
         job = fresh.json()
         assert job["headers"]["authorization"] == "Bearer new-model-key"
+        intruder = await c.post(f"{stack.url}/api/kaggle-relay/push/{job['id']}",
+                                headers={"X-Blackthorn-Key": "computer-key"}, content=b"wrong")
+        assert intruder.status_code == 401
         # A role's key may rotate mid-stream; assigned jobs retain their own
         # authenticated push capability while new jobs require the new key.
         await stack.executor.query("UPDATE kaggle_gpu_state SET api_key='yet-newer-key' WHERE id='primary'")
