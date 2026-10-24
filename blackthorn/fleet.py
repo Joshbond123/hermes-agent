@@ -782,8 +782,28 @@ def _mirror_state_dataset_unlocked(from_account: Account, to_account: Account, *
         """Fallback for Kaggle's private combined-archive 404; verify at _identity."""
         marker_name = ".blackthorn/checkpoint.json"
         env = account_env(account)
-        command = ["kaggle", "datasets", "download", "-p", str(folder)]
-        if _run([*command, "-f", marker_name, slug], env):
+
+        def fetch_one(name: str) -> bool:
+            # Kaggle CLI 2.2.4 flattens `-f nested/file` to `file` at the
+            # destination root. Use a NEW empty staging directory for each
+            # file, so duplicate basenames never overwrite each other, and
+            # accept only that precise requested path or its basename.
+            with tempfile.TemporaryDirectory(dir=folder) as stage_name:
+                stage = Path(stage_name)
+                if _run(["kaggle", "datasets", "download", "-p", str(stage), "-f", name, slug], env):
+                    return False
+                files = [p for p in stage.rglob("*") if p.is_file() or p.is_symlink()]
+                if len(files) != 1 or files[0].is_symlink():
+                    return False
+                rel = files[0].relative_to(stage)
+                if rel not in (Path(name), Path(Path(name).name)):
+                    return False
+                dest = folder / name
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(files[0]), str(dest))
+                return True
+
+        if not fetch_one(marker_name):
             return False
         marker = folder / marker_name
         try:
@@ -799,7 +819,7 @@ def _mirror_state_dataset_unlocked(from_account: Account, to_account: Account, *
                 if (not name or path.is_absolute() or ".." in path.parts or "\\" in name or
                         name == marker_name):
                     return False
-                if _run([*command, "-f", name, slug], env) or not (folder / path).is_file():
+                if not fetch_one(name) or not (folder / path).is_file():
                     return False
             return True
         except (OSError, ValueError, TypeError, KeyError, AttributeError):
