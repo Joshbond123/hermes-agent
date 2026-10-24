@@ -105,6 +105,7 @@ def test_model_download_deletion_is_gone():
 def ready_primary(monkeypatch):
     monkeypatch.setattr(d1c, "get_auto_off_minutes", lambda: 5)
     monkeypatch.setattr(d1c, "_published_status", lambda: "HEARTBEAT_ONLINE")
+    monkeypatch.setattr(d1c, "_auto_off_roles_ready", lambda: True)
     monkeypatch.setattr(d1c, "_STATUS_CACHE", {})
     monkeypatch.setattr(d1c, "_ACTIVE_TASKS", 0)
     monkeypatch.setattr(d1c, "_LAST_ACTIVITY_TS", time.time() - 3600)   # long idle on the chat side

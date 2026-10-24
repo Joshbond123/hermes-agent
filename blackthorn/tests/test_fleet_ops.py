@@ -141,9 +141,9 @@ def test_recent_heartbeat_reuses_model_when_gateway_probe_times_out(ops, monkeyp
     monkeypatch.setattr(d1, '_fleet_role_online', lambda role: False)
     monkeypatch.setattr(d1, 'd1_query', lambda sql, params=None: (
         [{'status': 'HEARTBEAT_ONLINE', 'updated_at': time.time()}]
-        if 'SELECT status, updated_at FROM kaggle_gpu_state' in sql and params == ['primary'] else
+        if 'SELECT status, updated_at' in sql and params == ['primary'] else
         [{'status': 'BOOTING_KAGGLE_GPU', 'updated_at': time.time()}]
-        if 'SELECT status, updated_at FROM kaggle_gpu_state' in sql and params == ['computer'] else []))
+        if 'SELECT status, updated_at' in sql and params == ['computer'] else []))
     out = d1.turn_on_fleet(blocking=True)
     assert out['model']['status'] == 'reconnecting'
     assert out['computer']['status'] == 'already_starting'
@@ -286,3 +286,86 @@ def test_live_shared_relay_failover_fails_closed_without_stopping_source(ops, mo
     assert not outcome['ok'] and outcome['status'] == 'shared_relay_handover_unavailable'
     assert ops['rows'] == before and not ops['starts'] and not ops['mirrors']
     assert not any(method == 'DeleteKernel' for method, _ in ops['rpcs'])
+
+
+def test_revoked_backup_boot_recovers_from_strictly_verified_primary_snapshot(ops, monkeypatch):
+    """A stale INSTALLING_DEPS from a rejected backup must not lock the computer
+    for an hour. Recover only the already-mirrored primary snapshot, not data
+    claimed to be synchronized from the inaccessible backup.
+    """
+    import time
+    from blackthorn.fleet import FleetError
+    import blackthorn.fleet as fm
+
+    def restored(accounts):
+        fleet = FleetManager(accounts)
+        fleet.state['computer'].active = 'backup'
+        return fleet
+
+    def rpc(self, account, method, body=None):
+        if account.role == 'computer' and account.slot == 'backup':
+            raise FleetError('computer backup:GetAcceleratorQuotaStatistics HTTP 401: Unauthenticated')
+        if method == 'GetAcceleratorQuotaStatistics':
+            return _quota(108000)
+        return {'ok': True}
+
+    def row(sql, params=None):
+        if 'SELECT status, updated_at' in sql:
+            if params == ['computer']:
+                return [{'status': 'INSTALLING_DEPS', 'tunnel_url': '',
+                         'updated_at': time.time() - 700}]
+            return []
+        return []
+
+    calls = []
+    monkeypatch.setattr(d1, '_fleet_manager_with_usage', restored)
+    monkeypatch.setattr(d1, '_fleet_role_online', lambda role: role == 'model')
+    monkeypatch.setattr(d1, '_computer_authoritative_slot', lambda: 'backup')
+    monkeypatch.setattr(d1, '_durable_active_runs', lambda: 0)
+    monkeypatch.setattr(d1, '_set_meta', lambda key, value: calls.append(('meta', key, value)))
+    monkeypatch.setattr(d1, 'd1_query', row)
+    monkeypatch.setattr(FleetManager, 'rpc', rpc)
+    def mirror(src, dst, **kwargs):
+        calls.append(('mirror', src.slot, dst.slot, kwargs))
+        return {'ok': True, 'files': 23}
+    monkeypatch.setattr(fm, 'mirror_state_dataset', mirror)
+    out = d1.turn_on_fleet(blocking=True)
+    assert out['model']['status'] == 'already_online'
+    assert out['computer']['account'] == 'josh787'
+    assert out['computer']['recovered_from_existing_snapshot'] is True
+    assert out['computer']['old_account_stop_unverified'] is True
+    assert ('mirror', 'primary', 'primary', {'require_existing_checkpoint': True}) in calls
+    assert [user for user, *_ in ops['starts']] == ['josh787']
+    assert ('meta', 'bt_fleet_authoritative:computer', 'primary') in calls
+
+
+@pytest.mark.parametrize('snapshot_ok,leases', [(False, 0), (True, 1)])
+def test_revoked_backup_recovery_never_boots_without_snapshot_or_with_active_run(ops, monkeypatch,
+                                                                                snapshot_ok, leases):
+    import time
+    from blackthorn.fleet import FleetError
+    import blackthorn.fleet as fm
+    def restored(accounts):
+        f = FleetManager(accounts)
+        f.state['computer'].active = 'backup'
+        return f
+    def rpc(self, account, method, body=None):
+        if account.role == 'computer' and account.slot == 'backup':
+            raise FleetError('backup:GetAcceleratorQuotaStatistics HTTP 401: Unauthenticated')
+        return _quota(108000) if method == 'GetAcceleratorQuotaStatistics' else {'ok': True}
+    monkeypatch.setattr(d1, '_fleet_manager_with_usage', restored)
+    monkeypatch.setattr(d1, '_fleet_role_online', lambda role: role == 'model')
+    monkeypatch.setattr(d1, '_computer_authoritative_slot', lambda: 'backup')
+    monkeypatch.setattr(d1, '_durable_active_runs', lambda: leases)
+    monkeypatch.setattr(d1, '_set_meta', lambda *args: None)
+    monkeypatch.setattr(d1, 'd1_query', lambda sql, params=None: [
+        {'status': 'INSTALLING_DEPS', 'tunnel_url': '', 'updated_at': time.time()-700}]
+        if 'SELECT status, updated_at' in sql and params == ['computer'] else [])
+    monkeypatch.setattr(FleetManager, 'rpc', rpc)
+    monkeypatch.setattr(fm, 'mirror_state_dataset', lambda *args, **kwargs:
+                        {'ok': snapshot_ok, 'error': 'verification failed'} if kwargs.get('require_existing_checkpoint')
+                        else pytest.fail('read from rejected backup'))
+    out = d1.turn_on_fleet(blocking=True)
+    assert not ops['starts']
+    assert out['computer']['status'] == ('sync_failed' if not leases else 'recovery_waiting_for_idle')
+    assert ('computer', 'BOOT_FAILED') in ops['rows'] if not leases else True

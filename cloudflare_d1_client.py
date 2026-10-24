@@ -617,12 +617,39 @@ def _durable_active_runs() -> Optional[int]:
         return None
 
 
+def _auto_off_roles_ready() -> bool:
+    """An idle model never licenses stopping a computer that is still booting.
+
+    D1 is authoritative across Render workers; a per-process model status cache
+    cannot say whether the other GPU has reached its own live gateway. Unknown
+    control-plane state fails closed instead of silently killing a long restore.
+    """
+    try:
+        rows = d1_query("SELECT id, status, tunnel_url FROM kaggle_gpu_state "
+                        "WHERE id IN ('primary','computer');")
+        by_id = {str(row.get("id") or ""): row for row in rows}
+        model = by_id.get("primary") or {}
+        computer = by_id.get("computer")
+        if str(model.get("status") or "").upper() not in READY_STATUSES or not model.get("tunnel_url"):
+            return False
+        if computer is None:
+            return True  # legacy model-only installation
+        status = str(computer.get("status") or "").upper()
+        if status in ("OFF", "OFFLINE", "GPU_STOPPED_SAVING_QUOTA"):
+            return True
+        return status in READY_STATUSES and bool(computer.get("tunnel_url"))
+    except Exception:
+        return False
+
+
 def _auto_off_stop() -> Dict[str, Any]:
     """Stop both fleet roles after verified inactivity and a computer checkpoint."""
     from blackthorn.fleet import accounts_from_env
     leases = _durable_active_runs()
     if leases is None or leases:
         return {"model": {"status": "stop_refused", "error": "active run or activity unavailable"}}
+    if not _auto_off_roles_ready():
+        return {"model": {"status": "stop_refused", "error": "a GPU role is still starting or its state is unknown"}}
     if accounts_from_env(os.environ):
         # turn_off_fleet independently probes computer activity, checkpoints the
         # workspace, and refuses BOTH stops if either fact cannot be verified.
@@ -748,6 +775,14 @@ def auto_off_decision() -> Dict[str, Any]:
     if published not in READY_STATUSES:
         decided["reason"] = (f"GPU is not ready yet ({published or 'unknown'}) — "
                              "no shutdown while it boots or stops")
+        return decided
+    if not _auto_off_roles_ready():
+        # Rebase the process-local timer throughout the computer's boot.
+        # The computer may take longer than the 15-minute idle setting to
+        # restore; its first READY heartbeat starts a fresh idle window.
+        mark_activity("computer-booting")
+        decided["idle_seconds"] = 0.0
+        decided["reason"] = "Computer is still starting or its state is unknown — preserving both GPUs"
         return decided
     if snap["active_tasks"] > 0:
         decided["reason"] = f"{snap['active_tasks']} task(s) still running"
@@ -1900,10 +1935,12 @@ def turn_on_fleet(blocking: bool = False) -> Dict[str, Any]:
     plan: Dict[str, Any] = {}
     for role in ("model", "computer"):
         reusable = _fleet_role_online(role)
+        row = {}
+        age = float("inf")
         if not reusable:
             try:
                 row_id = "computer" if role == "computer" else "primary"
-                rows = d1_query("SELECT status, updated_at FROM kaggle_gpu_state WHERE id=? LIMIT 1;", [row_id])
+                rows = d1_query("SELECT status, updated_at, tunnel_url FROM kaggle_gpu_state WHERE id=? LIMIT 1;", [row_id])
                 row = rows[0] if rows else {}
                 age = time.time() - float(row.get("updated_at") or 0)
                 state = str(row.get("status") or "").upper()
@@ -1914,9 +1951,35 @@ def turn_on_fleet(blocking: bool = False) -> Dict[str, Any]:
                     reusable = "already_starting"
             except Exception:
                 pass
-        st = fleet.decide(role, force=True) if not reusable else fleet.state[role]
+        previous_slot = fleet.state[role].active
+        recover_local = False
+        # A stale boot on an account that Kaggle now rejects must not hold the
+        # computer at "already starting" for an hour. Never switch a live route
+        # or an active agent run: the other filesystem may lack unsaved work.
+        may_reassess = not reusable or (role == "computer" and reusable == "already_starting"
+                                        and age > 300 and not row.get("tunnel_url"))
+        st = fleet.decide(role, force=True) if may_reassess else fleet.state[role]
+        if role == "computer" and st.active != previous_slot:
+            old = fleet.by_slot.get((role, previous_slot))
+            rejected = old is not None and any(code in fleet.slots[old.user].last_error
+                                                for code in ("HTTP 401", "HTTP 403"))
+            if rejected and not row.get("tunnel_url"):
+                leases = _durable_active_runs()
+                if leases == 0:
+                    # Source credentials cannot read its dataset. A *different*,
+                    # authenticated owner's complete checkpoint can be used only
+                    # after strict read-back; do not pretend unsaved source changes
+                    # were transferred or trust a legacy inventory-only archive.
+                    recover_local = True
+                    reusable = False
+                else:
+                    reusable = "recovery_waiting_for_idle"
+                    st.active = previous_slot
+            elif reusable:
+                st.active = previous_slot          # don't abandon a still-booting or live host
         account = fleet.by_slot.get((role, st.active))
-        plan[role] = {"state": st, "account": account, "reusable": reusable}
+        plan[role] = {"state": st, "account": account, "reusable": reusable,
+                      "recover_local": recover_local}
     for role in ("model", "computer"):
         if plan[role]["account"] is not None and not plan[role]["reusable"]:
             row_id = "computer" if role == "computer" else "primary"
@@ -1948,20 +2011,30 @@ def turn_on_fleet(blocking: bool = False) -> Dict[str, Any]:
             source = fleet.by_slot.get(("computer", source_slot))
             if source is not None and source.user != account.user:
                 from blackthorn.fleet import mirror_state_dataset
-                ckpt = None
-                if _fleet_role_online("computer"):
-                    ckpt = checkpoint_computer(timeout=220)
-                    if not ckpt.get("ok"):
-                        _write_fleet_row(row_id, "BOOT_FAILED", gpu_info="Computer checkpoint could not be verified")
+                if plan[role]["recover_local"]:
+                    # Fail closed if the target's own private checkpoint cannot
+                    # be downloaded and authenticated file by file. The inaccessible
+                    # old owner is not declared stopped or synchronized.
+                    sync = mirror_state_dataset(account, account, require_existing_checkpoint=True)
+                    if not sync.get("ok"):
+                        _write_fleet_row(row_id, "BOOT_FAILED", gpu_info="Computer recovery snapshot could not be verified")
                         return {"role": role, "account": account.user, "status": "sync_failed",
-                                "error": "live computer checkpoint was not verified"}
-                sync = mirror_state_dataset(source, account,
-                    expected_generation=ckpt["generation"] if ckpt else None,
-                    expected_digest=ckpt["digest"] if ckpt else None)
-                if not sync.get("ok"):
-                    _write_fleet_row(row_id, "BOOT_FAILED", gpu_info="Computer dataset mirror could not be verified")
-                    return {"role": role, "account": account.user, "status": "sync_failed",
-                            "error": str(sync.get("error") or "dataset mirror not verified")[:180]}
+                                "error": "the alternate computer snapshot could not be verified"}
+                else:
+                    ckpt = None
+                    if _fleet_role_online("computer"):
+                        ckpt = checkpoint_computer(timeout=220)
+                        if not ckpt.get("ok"):
+                            _write_fleet_row(row_id, "BOOT_FAILED", gpu_info="Computer checkpoint could not be verified")
+                            return {"role": role, "account": account.user, "status": "sync_failed",
+                                    "error": "live computer checkpoint was not verified"}
+                    sync = mirror_state_dataset(source, account,
+                        expected_generation=ckpt["generation"] if ckpt else None,
+                        expected_digest=ckpt["digest"] if ckpt else None)
+                    if not sync.get("ok"):
+                        _write_fleet_row(row_id, "BOOT_FAILED", gpu_info="Computer dataset mirror could not be verified")
+                        return {"role": role, "account": account.user, "status": "sync_failed",
+                                "error": str(sync.get("error") or "dataset mirror not verified")[:180]}
         _write_fleet_row(row_id, "BOOTING_KAGGLE_GPU", gpu_info=f"Allocating on {account.user}...")
         # Attach persistent datasets when available so boots restore instead of redownload.
         datasets = []
@@ -1988,6 +2061,8 @@ def turn_on_fleet(blocking: bool = False) -> Dict[str, Any]:
             return {"role": role, "account": account.user, "slug": out.get("_slug", slug),
                     "slot": st.active, "reason": st.reason,
                     "status": "starting" if out.get("_session_running") is not False else "submitted_unconfirmed",
+                    "recovered_from_existing_snapshot": bool(plan[role]["recover_local"]),
+                    "old_account_stop_unverified": bool(plan[role]["recover_local"]),
                     "session_error": out.get("_session_error", ""), "push": bool(out),
                     "datasets": datasets}
         except Exception as exc:  # noqa: BLE001
@@ -2263,6 +2338,9 @@ def turn_off_fleet(blocking: bool = True, source: str = "", roles: tuple = ("mod
     from blackthorn.fleet import FleetManager, accounts_from_env, kernel_slug_for
     ensure_d1_schema()
     accounts = accounts_from_env(os.environ)
+    if source == "auto-off" and not _auto_off_roles_ready():
+        return {role: {"status": "stop_refused", "error": "another GPU role is still starting"}
+                for role in roles}
     _record_stop_event(source or "turn-off", "fleet stop requested" + (" (force)" if force else ""))
     try:
         _set_meta("blackthorn_gpu_boot_started", "")

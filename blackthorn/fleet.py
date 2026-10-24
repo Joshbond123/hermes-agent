@@ -638,20 +638,23 @@ def mirror_state_dataset(from_account: Account, to_account: Account, *,
                          dataset_slug: str = "blackthorn-computer-state",
                          runner: Optional[Callable[[List[str], Dict[str, str]], int]] = None,
                          expected_generation: Optional[int] = None,
-                         expected_digest: Optional[str] = None) -> Dict[str, Any]:
+                         expected_digest: Optional[str] = None,
+                         require_existing_checkpoint: bool = False) -> Dict[str, Any]:
     """Serialize periodic and threshold mirrors so an older transfer cannot win."""
     with _COMPUTER_MIRROR_LOCK:
         return _mirror_state_dataset_unlocked(from_account, to_account,
                                                dataset_slug=dataset_slug, runner=runner,
                                                expected_generation=expected_generation,
-                                               expected_digest=expected_digest)
+                                               expected_digest=expected_digest,
+                                               require_existing_checkpoint=require_existing_checkpoint)
 
 
 def _mirror_state_dataset_unlocked(from_account: Account, to_account: Account, *,
                          dataset_slug: str = "blackthorn-computer-state",
                          runner: Optional[Callable[[List[str], Dict[str, str]], int]] = None,
                          expected_generation: Optional[int] = None,
-                         expected_digest: Optional[str] = None) -> Dict[str, Any]:
+                         expected_digest: Optional[str] = None,
+                         require_existing_checkpoint: bool = False) -> Dict[str, Any]:
     """Mirror an immutable, SHA-256-identified workspace snapshot to the backup.
 
     Unchanged generations are not re-uploaded. Kaggle's versioned dataset API
@@ -852,7 +855,7 @@ def _mirror_state_dataset_unlocked(from_account: Account, to_account: Account, *
                     return {"ok": False, "error": f"source download failed: {last_error}"}
                 src = root / f"source_{attempt}"
                 _unpack(source_download, src)
-                identity = _identity(src, create_legacy=expected_generation is None)
+                identity = _identity(src, create_legacy=expected_generation is None and not require_existing_checkpoint)
                 # A periodic checkpoint may publish a successor while this read
                 # is in flight. Equal content from a NEWER generation is safe;
                 # an older generation or different bytes are not.

@@ -215,6 +215,11 @@ def test_mirror_uses_bearer_and_relabels_archive_for_backup(tmp_path):
                                  Account('backup', 'backup-token', 'computer', 'backup'), runner=runner)
     assert again['ok'] and again['unchanged']
     assert [action for action, _ in calls].count('create') == 1
+    backup.clear()  # the source is legacy; do not let the mock serve the mirrored backup as source
+    strict = mirror_state_dataset(Account('primary', 'primary-token', 'computer', 'primary'),
+                                  Account('primary', 'primary-token', 'computer', 'primary'),
+                                  runner=runner, require_existing_checkpoint=True)
+    assert not strict['ok'], 'recovery may not invent an identity for a legacy source archive'
 
 
 def test_backup_computer_restores_its_own_mirrored_dataset():

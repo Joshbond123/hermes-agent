@@ -44,6 +44,7 @@ def test_daemon_auto_off_branch_uses_the_fleet_aware_stop():
 def test_auto_off_stops_backup_accounts_when_fleet_configured(monkeypatch):
     m = _module()
     monkeypatch.setattr(m, "_durable_active_runs", lambda: 0)
+    monkeypatch.setattr(m, "_auto_off_roles_ready", lambda: True)
     calls = []
     monkeypatch.setattr(m, "turn_off_fleet", lambda blocking=True, source="", roles=(): calls.append(("fleet", blocking, roles)) or {"ok": True})
     monkeypatch.setattr(m, "turn_off_kaggle_gpu", lambda: calls.append(("single",)) or {"ok": True})
@@ -56,6 +57,7 @@ def test_auto_off_stops_backup_accounts_when_fleet_configured(monkeypatch):
 def test_auto_off_uses_the_single_session_when_no_fleet(monkeypatch):
     m = _module()
     monkeypatch.setattr(m, "_durable_active_runs", lambda: 0)
+    monkeypatch.setattr(m, "_auto_off_roles_ready", lambda: True)
     calls = []
     monkeypatch.setattr(m, "turn_off_fleet", lambda blocking=True: calls.append(("fleet", blocking)) or {})
     monkeypatch.setattr(m, "turn_off_kaggle_gpu", lambda: calls.append(("single",)) or {"ok": True})
@@ -63,3 +65,40 @@ def test_auto_off_uses_the_single_session_when_no_fleet(monkeypatch):
     monkeypatch.setattr(fleet, "accounts_from_env", lambda env: [])
     m._auto_off_stop()
     assert calls == [("single",)]
+
+
+def test_auto_off_refuses_a_booting_computer_even_when_model_is_idle(monkeypatch):
+    m = _module()
+    monkeypatch.setattr(m, 'get_auto_off_minutes', lambda: 15)
+    monkeypatch.setattr(m, '_STATUS_CACHE', {'active': True, 'booting': False})
+    monkeypatch.setattr(m, '_published_status', lambda: 'HEARTBEAT_ONLINE')
+    monkeypatch.setattr(m, '_COMPUTER_ACTIVITY', {'known': True, 'active_jobs': 0})
+    monkeypatch.setattr(m, '_durable_active_runs', lambda: 0)
+    monkeypatch.setattr(m, 'activity_snapshot', lambda: {'idle_seconds': 3600,
+                             'active_tasks': 0, 'last_activity_at': 0})
+    monkeypatch.setattr(m, 'd1_query', lambda sql, params=None: [
+        {'id': 'primary', 'status': 'HEARTBEAT_ONLINE', 'tunnel_url': 'https://model.invalid'},
+        {'id': 'computer', 'status': 'INSTALLING_DEPS', 'tunnel_url': ''}])
+    decision = m.auto_off_decision()
+    assert not decision['should_stop'] and 'Computer is still starting' in decision['reason']
+    calls = []
+    monkeypatch.setattr(m, 'turn_off_fleet', lambda **kw: calls.append(kw) or {})
+    import blackthorn.fleet as fleet
+    monkeypatch.setattr(fleet, 'accounts_from_env', lambda env: ['configured'])
+    assert m._auto_off_stop()['model']['status'] == 'stop_refused'
+    assert not calls
+    assert m._auto_off_roles_ready() is False
+
+
+def test_auto_off_allows_two_online_roles_or_a_deliberately_off_computer(monkeypatch):
+    m = _module()
+    rows = [{'id':'primary','status':'HEARTBEAT_ONLINE','tunnel_url':'https://model.invalid'},
+            {'id':'computer','status':'HEARTBEAT_ONLINE','tunnel_url':'https://computer.invalid'}]
+    monkeypatch.setattr(m, 'd1_query', lambda sql, params=None: rows)
+    assert m._auto_off_roles_ready() is True
+    rows[1]['status']='GPU_STOPPED_SAVING_QUOTA';rows[1]['tunnel_url']=''
+    assert m._auto_off_roles_ready() is True
+    rows[1]['status']='STARTING_GATEWAY'
+    assert m._auto_off_roles_ready() is False
+    monkeypatch.setattr(m, 'd1_query', lambda sql, params=None: (_ for _ in ()).throw(OSError('D1 down')))
+    assert m._auto_off_roles_ready() is False

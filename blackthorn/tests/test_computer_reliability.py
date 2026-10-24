@@ -119,6 +119,7 @@ def test_model_auto_off_never_stops_busy_computer(monkeypatch):
     stops = []
     monkeypatch.setattr(fleet, "accounts_from_env", lambda env: ["model", "computer"])
     monkeypatch.setattr(d1, "_durable_active_runs", lambda: 0)
+    monkeypatch.setattr(d1, "_auto_off_roles_ready", lambda: True)
     monkeypatch.setattr(d1, "turn_off_fleet", lambda blocking, source, roles: stops.append(roles) or {})
     d1._auto_off_stop()
     assert stops == [("model", "computer")]
