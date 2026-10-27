@@ -1,6 +1,6 @@
 {
  "files": {
-  "blackthorn/COMPUTER_DRIVE.md": "353b74f8b80e201d2289aed2bfb244fd8b524a551b951364bc3bdb573d6dec14",
+  "blackthorn/COMPUTER_DRIVE.md": "840bab5dc42a078917c905a9f0ac9ad6b7ef3ba898c612e7c994aeb3736d2112",
   "blackthorn/README.md": "26ad9ad6d9aa51cb5127cf3a661c3c80e18fb67c48cdb2d05a4ddf847c4435d4",
   "blackthorn/__init__.py": "0bff9f17b60d2e4655f341e6ab4843bc0f472c807e811768bc04e6f60128f78e",
   "blackthorn/agent.py": "d05361fac63c16578ea55bcc56a2565ff5bdea5fe447051fd4b79617ed305595",
@@ -11,7 +11,7 @@
   "blackthorn/computer_assets/install_stack.py": "a3613c1e4b5224e5b22b05ec1f760901e4d690ebab3ba972ed91674acd0d9204",
   "blackthorn/computer_assets/sample_triage.py": "fccb4097b40f7bd0a31adf089c24171482e57df468456f107771dc15a6c30a8b",
   "blackthorn/computer_assets/skillctl.py": "773df12a1f4fc65256b5b590ead5f929598c633c0bc2c90c4187a81f73c725fb",
-  "blackthorn/computer_drive.py": "429fcb67c1939f5f8958a0165b3e591cde8a5c7c8a93079d48b4c6f185903377",
+  "blackthorn/computer_drive.py": "c320b488954076948df9fcf8a69f9cc6817a1b67a7b0843d218babb6436aaa2e",
   "blackthorn/config.py": "77f18840d1234857ed75bcaa700d75682328f2d06e8f88b8e1e9832912be75e8",
   "blackthorn/fleet.py": "ce68d7ba765ae877895da3dd1d55cd6ff3c46b61ca01a19a0a281c92ddc96cd7",
   "blackthorn/gpu.py": "c905e7cb00a4c8b72721a12058cd5142f016e23eb5cfceeda2adc8c1d6bc0d9d",

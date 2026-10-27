@@ -98,23 +98,42 @@ class GitHubComputerDrive:
         except (ValueError, KeyError, TypeError):
             return None
 
+    @staticmethod
+    def _version_key(release: dict) -> tuple[str, int]:
+        # GitHub's release listing is NOT reliably sorted by publication time:
+        # all releases targeting the same commit may even share `created_at`.
+        # Draft -> published is the point a checked manifest becomes durable.
+        # Break same-second publication ties by the increasing release ID.
+        return (str(release.get("published_at") or release.get("created_at") or ""),
+                int(release.get("id") or 0))
+
     def list_files(self) -> dict[str, dict]:
-        records = {}
+        records: dict[str, dict] = {}
+        versions: dict[str, tuple[str, int]] = {}
         for release in self._releases():
             manifest = self._manifest(release)
-            if manifest and manifest["path"] not in records:
-                records[manifest["path"]] = {
+            if not manifest:
+                continue
+            path = manifest["path"]
+            key = self._version_key(release)
+            if path not in versions or key > versions[path]:
+                versions[path] = key
+                records[path] = {
                     "size": manifest["size"], "sha256": manifest["sha256"],
                     "release_id": release["id"], "chunks": len(manifest["chunks"]),
                 }
         return records
 
     def _find(self, path: str) -> tuple[dict, dict]:
+        selected: tuple[dict, dict] | None = None
         for release in self._releases():
             manifest = self._manifest(release)
-            if manifest and manifest["path"] == path:
-                return release, manifest
-        raise FileNotFoundError(path)
+            if manifest and manifest["path"] == path and (
+                    selected is None or self._version_key(release) > self._version_key(selected[0])):
+                selected = (release, manifest)
+        if selected is None:
+            raise FileNotFoundError(path)
+        return selected
 
     @staticmethod
     def _reader(source: pathlib.Path, offset: int, length: int):
