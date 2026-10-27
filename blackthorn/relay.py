@@ -142,6 +142,8 @@ async def _row_keys(request: Request, channel: str = "model", *, force: bool = F
     pinned to the agent's bearer key before it leaves the queue.
     """
     channel = channel if channel in CHANNELS else "model"
+    if channel == "computer" and __import__("os").environ.get("PANDASTACK_API_KEY"):
+        return ()  # old Kaggle computer cannot poll after the provider cutover
     now = time.monotonic()
     cached_at, cached = _KEY_CACHE.get(channel, (0.0, ""))
     if not force and cached and now - cached_at < KEY_CACHE_TTL_S:
@@ -331,6 +333,9 @@ async def relay_proxy(request: Request, path: str = ""):
         channel = "model"
         forward = raw[len("model"):].lstrip("/")
     elif raw == "computer" or raw.startswith("computer/"):
+        if __import__("os").environ.get("PANDASTACK_API_KEY"):
+            raise HTTPException(status_code=410,
+                                detail={"code": "computer_relay_retired", "message": "Computer tools use PandaStack, not the Kaggle relay."})
         # Prefer a live dedicated computer host; otherwise the model host answers /computer/*.
         services = request.app.state.bt
         hubs = getattr(services, "relay_hubs", None) or {}
