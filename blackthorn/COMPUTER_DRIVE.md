@@ -1,0 +1,18 @@
+# GitHub Computer-drive (bounded object storage)
+
+`blackthorn.computer_drive` stores versioned logical files as GitHub **release assets** in the private `jadeniran21/Computer-drive` repository. It does not use StowDrive. The repository originally contained only a README; the Python implementation lives in the existing agent project, not in that repository.
+
+Set `COMPUTER_DRIVE_GITHUB_PAT` in a secret manager and make it available only to the process that performs uploads/downloads. Never put the PAT in a release, a source file, a URL, or a log. By default the target repository is `jadeniran21/Computer-drive`; override with `COMPUTER_DRIVE_GITHUB_REPO` if needed.
+
+```sh
+python -m blackthorn.computer_drive upload /workspace/tool.tar.gz skills/tool.tar.gz
+python -m blackthorn.computer_drive list
+python -m blackthorn.computer_drive download skills/tool.tar.gz /workspace/tool.tar.gz
+python -m blackthorn.computer_drive remove skills/tool.tar.gz
+```
+
+Each upload creates a *draft* release, streams 128 MiB assets into it, and publishes a checksummed manifest only after all assets are confirmed. Listing releases reconstructs the path index after restart. Downloads verify each part and the complete SHA-256 before atomically replacing the destination file. Older versions remain retained until `remove`, which deletes every version of that logical path. Failed drafts are reconciled and removed where possible.
+
+**Limits / non-guarantees:** This is an object store, not a mounted POSIX filesystem; programs cannot execute files directly from it. Working files must be staged onto ephemeral local storage and uploaded again after changes. GitHub release assets must each be under 2 GiB and releases allow at most 1,000 assets; this implementation rejects files beyond that count. The default 128 MiB chunks bound memory usage and provide a much lower practical ceiling than an unlimited drive. GitHub may impose additional abuse, API-rate, retention or account limits. The index is reconstructed by paginating release metadata rather than using a separate mutable database; huge numbers of releases will be slow. GitHub recommends external object storage for generated data and is not a backup service. Keep independent backups of irreplaceable files.
+
+**Verified:** On 2026-10-27, the private repository was accessed with the appropriate private-document PAT. A real four-part, 13,117-byte upload was listed, downloaded with matching SHA-256, and removed. A real zero-byte round-trip also passed and was removed. A PandaStack validation sandbox executed a real Python command and produced a file. The controller uploaded that file to the private GitHub drive, deleted the sandbox, created a second sandbox, restored the file, and verified its original SHA-256 using a real command on the second sandbox. Both sandboxes and the test object were removed; the API listed zero remaining sandboxes. A further live test called the existing AI agent's `run_command`, `write_file`, and `read_file` tool handlers using the new `PandaComputerClient` adapter: the command returned 437, the named file was saved to GitHub, and after a sandbox replacement `read_file` restored it on demand with matching content. Test sandboxes and release assets were removed. This verifies these tool handlers on a live PandaStack computer, **not a deployed conversation/LLM turn** or full automation. No multi-gigabyte transfer, mounted filesystem, complete command-side-effect checkpointing, GPU ON/OFF integration, or production deployment has been verified.

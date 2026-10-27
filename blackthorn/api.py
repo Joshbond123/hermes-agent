@@ -407,7 +407,7 @@ def _relay_overlay(request: Request, out: dict) -> dict:
     for role, key in (("model", None), ("computer", "computer")):
         hub = hubs.get(role)
         target = out if key is None else out.get(key)
-        if hub is None or not isinstance(target, dict) or not target.get("online"):
+        if hub is None or not isinstance(target, dict) or not target.get("online") or target.get("host") == "PandaStack":
             continue
         if target.get("transport") == "inrok":
             # Direct Inrok tunnel: the notebook does not run the relay long-poll client, so relay liveness
@@ -505,10 +505,16 @@ async def fleet_status(request: Request, refresh: bool = False):
         else:
             s.fleet.refresh_slots()
         out = {"configured": True, **s.fleet.status()}
+        if __import__("os").environ.get("PANDASTACK_API_KEY"):
+            out.pop("computer", None)
+            out["computer_provider"] = "PandaStack"
         try:
             # Public view only: the gateway key and tunnel URL are secrets and must never leave the server.
-            out["live"] = {role: _public_row(row) for role, row in
-                           (("model", await s.store.gpu_row()), ("computer", await s.store.computer_row()))}
+            if __import__("os").environ.get("PANDASTACK_API_KEY"):
+                out["live"] = {"model": _public_row(await s.store.gpu_row())}
+            else:
+                out["live"] = {role: _public_row(row) for role, row in
+                               (("model", await s.store.gpu_row()), ("computer", await s.store.computer_row()))}
         except Exception:  # noqa: BLE001
             out["live"] = {}
         return out
@@ -522,7 +528,7 @@ async def fleet_decide(request: Request):
     if s.fleet is None:
         raise _err(503, "fleet_unconfigured", "No fleet accounts are configured on this server.")
     out = {}
-    for role in ("model", "computer"):
+    for role in (("model",) if __import__("os").environ.get("PANDASTACK_API_KEY") else ("model", "computer")):
         st = s.fleet.decide(role, force=True)
         out[role] = {"active": st.active, "reason": st.reason}
     return out
@@ -548,6 +554,8 @@ async def computer_checkpoint(request: Request):
 async def fleet_sync(request: Request):
     """Mirror the computer pair's state dataset (primary -> backup) on demand."""
     s = svc(request)
+    if __import__("os").environ.get("PANDASTACK_API_KEY"):
+        raise _err(410, "retired", "Kaggle computer dataset mirroring is retired; the active computer uses a private GitHub drive.")
     if s.fleet is None:
         raise _err(503, "fleet_unconfigured", "No fleet accounts are configured on this server.")
     from .fleet import mirror_state_dataset

@@ -128,9 +128,7 @@ export function GpuPanel({ gpu, onClose }: { gpu: GpuView; onClose: () => void }
   }
 
   const modelSlots = s?.fleet_slots?.model
-  const compSlots = s?.fleet_slots?.computer
   const modelQuota = s?.quotas?.model || s?.quota
-  const compQuota = s?.quotas?.computer
 
   const pct =
     s?.progress_bytes_done != null && s?.progress_bytes_total
@@ -194,27 +192,15 @@ export function GpuPanel({ gpu, onClose }: { gpu: GpuView; onClose: () => void }
           </div>
         </section>
 
-        <section className="gpu-section">
-          <div className="gpu-section-title">Computer GPU</div>
-          <div className="gpu-kv">
-            <span>Status</span>
-            <span>
-              {s?.computer?.display_status || s?.computer?.status || '—'}
-              {s?.computer_ready ? ' · ready' : ''}
-            </span>
-          </div>
-          <div className="gpu-kv">
-            <span>Account</span>
-            <span>{compQuota?.account || compSlots?.primary?.account || '—'}</span>
-          </div>
-          <div className="gpu-kv">
-            <span>Transport</span>
-            <span>{s?.computer?.transport || s?.computer?.host || '—'}</span>
-          </div>
-          <div className="fleet-grid">
-            <SlotRow label="Primary" slot={compSlots?.primary} active={compSlots?.active === 'primary'} />
-            <SlotRow label="Backup" slot={compSlots?.backup} active={compSlots?.active === 'backup'} />
-          </div>
+        <section className="gpu-section" aria-label="AI computer">
+          <div className="gpu-section-title">AI Computer · PandaStack</div>
+          <div className="gpu-kv"><span>Status</span><span>{s?.computer?.display_status || s?.computer?.status || 'Off'}</span></div>
+          <div className="gpu-kv"><span>Compute</span><span>Firecracker CPU microVM · no GPU</span></div>
+          <div className="gpu-kv"><span>Storage</span><span>{s?.computer?.storage || 'Private GitHub Computer-drive'}</span></div>
+          <div className="gpu-kv"><span>Connection</span><span>{s?.computer?.transport || 'PandaStack API'}</span></div>
+          <div className="muted small">{s?.computer?.usage_display || 'Actual usage: PandaStack Billing dashboard'}</div>
+          {s?.computer?.error && <div className="notice error small">{s.computer.error}</div>}
+          <div className="muted small">The model GPU and AI computer share this power control.</div>
         </section>
 
         {s?.model_cache_dataset && (
@@ -269,7 +255,7 @@ export function GpuPanel({ gpu, onClose }: { gpu: GpuView; onClose: () => void }
       {confirmOff && (
         <Confirm
           title="Turn off GPU?"
-          message="This stops the model and computer Kaggle sessions and frees weekly GPU quota."
+          message="This stops the Kaggle model GPU and hibernates the PandaStack computer. The VM stops using compute while retaining its workspace snapshot; named files are also backed by the private GitHub Computer-drive. Snapshot storage may continue counting toward PandaStack usage."
           confirmLabel="Turn off"
           danger
           onCancel={() => setConfirmOff(false)}

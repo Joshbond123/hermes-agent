@@ -1,4 +1,4 @@
-"""Tools that act on the remote Kaggle computer through the gateway's /computer/* API."""
+"""Agent computer tools using the configured /computer/* transport."""
 
 from __future__ import annotations
 
@@ -344,7 +344,7 @@ def specs() -> list[ToolSpec]:
                  timeout=60.0, kind="write", describe=lambda a: f"{a.get('path', '')} ({len(str(a.get('content') or ''))} characters)"),
         ToolSpec("fetch_url", "Open a web page as text (offset to page).", SCHEMAS["fetch_url"], fetch_url,
                  timeout=75.0, kind="net", describe=lambda a: str(a.get("url") or "")),
-        ToolSpec("computer_info", "Remote computer GPU, disk, OS.", SCHEMAS["computer_info"], computer_info,
+        ToolSpec("computer_info", "Remote computer platform and workspace.", SCHEMAS["computer_info"], computer_info,
                  timeout=90.0, describe=lambda a: ""),
     ]
 

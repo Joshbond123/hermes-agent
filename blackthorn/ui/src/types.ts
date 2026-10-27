@@ -95,6 +95,7 @@ export interface GpuStatus {
   computer?: {
     status?: string; online?: boolean; booting?: boolean; display_status?: string; gpu_info?: string
     host?: string; environment?: string; progress?: string; transport?: string
+    storage?: string; usage_display?: string; error?: string
     last_health?: { phase?: string; mode?: string; detail?: string; verified_at?: number; external_ip?: string; all_passed?: boolean; run_id?: string }
   }
   computer_ready?: boolean

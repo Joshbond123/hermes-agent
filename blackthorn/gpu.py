@@ -123,7 +123,7 @@ class GpuService:
         # Attach computer-role health + fleet quotas so the UI can show both systems.
         try:
             crow = await self._store.computer_row() if self._store is not None else {}
-            if crow:
+            if crow and not __import__("os").environ.get("PANDASTACK_API_KEY"):
                 c_status = str(crow.get("status") or "").upper()
                 c_url = str(crow.get("tunnel_url") or "").strip()
                 heartbeat_age = time.time() - float(crow.get("updated_at") or 0)
@@ -191,7 +191,7 @@ class GpuService:
                     fleet = FleetManager(accounts)
                 quotas = {}
                 fleet_slots = {}
-                for role in ("model", "computer"):
+                for role in (("model",) if os.environ.get("PANDASTACK_API_KEY") else ("model", "computer")):
                     role_accounts = [a for a in accounts if a.role == role]
                     if not role_accounts:
                         continue
@@ -229,6 +229,25 @@ class GpuService:
                 model_pub["model_name"] = "Qwen3.8-27B-Uncensored"
         except Exception:
             pass
+        import os
+        if os.environ.get("PANDASTACK_API_KEY"):
+            from .panda_control import PandaControl
+            try:
+                import httpx
+                async with httpx.AsyncClient(timeout=35) as client:
+                    computer = await PandaControl(self._store, client).status()
+                computer["display_status"] = computer.get("display_status") or computer.get("status", "off").replace("_", " ").title()
+                computer["usage_display"] = "PandaStack billing: account dashboard (live balance not exposed by this API)"
+                model_pub["computer"] = computer
+                model_pub["computer_ready"] = bool(computer.get("online") and model_pub.get("online"))
+                if model_pub.get("online") and not computer.get("online"):
+                    model_pub["display_status"] = "Model ready — PandaStack computer off"
+                elif model_pub.get("online") and computer.get("online"):
+                    model_pub["display_status"] = "Model + PandaStack computer ready"
+            except Exception:
+                model_pub["computer"] = {"host": "PandaStack", "status": "unavailable", "online": False,
+                                         "display_status": "Status unavailable", "storage": "private GitHub Computer-drive"}
+                model_pub["computer_ready"] = False
         return model_pub
 
     async def turn_on(self) -> Dict[str, Any]:
@@ -236,6 +255,24 @@ class GpuService:
         d1 = self._module()
         import os
         from .fleet import accounts_from_env
+        if os.environ.get("PANDASTACK_API_KEY"):
+            from .panda_control import PandaControl
+            if self._store is None:
+                raise RuntimeError("PandaStack requires durable computer state")
+            if hasattr(d1, "turn_on_fleet") and accounts_from_env(os.environ):
+                out = await asyncio.to_thread(d1.turn_on_fleet, True)
+                model_result = out.get("model") or {}
+                if model_result.get("status") in ("unconfigured", "start_failed", "build_failed"):
+                    raise RuntimeError("Kaggle model start failed; PandaStack computer was not started")
+            else:
+                out = await asyncio.to_thread(d1.turn_on_kaggle_gpu, True)
+            import httpx
+            async with httpx.AsyncClient(timeout=40) as client:
+                computer = await PandaControl(self._store, client).start()
+            status = await self.status(refresh=False)
+            status["computer"] = computer
+            status["fleet"] = {"model": out.get("model", out), "computer": {"status": computer.get("status")}}
+            return status
         if hasattr(d1, "turn_on_fleet") and accounts_from_env(os.environ):
             # Reset elapsed timer at the moment the user clicks Turn ON.
             try:
@@ -258,6 +295,27 @@ class GpuService:
         d1 = self._module()
         import os
         from .fleet import accounts_from_env
+        if os.environ.get("PANDASTACK_API_KEY"):
+            if role not in ("all", "model"):
+                raise ValueError("PandaStack computer power is coupled to the model GPU")
+            from .panda_control import PandaControl
+            import httpx
+            async with httpx.AsyncClient(timeout=40) as client:
+                await PandaControl(self._store, client).stop()
+            if hasattr(d1, "turn_off_fleet") and accounts_from_env(os.environ):
+                out = await asyncio.to_thread(d1.turn_off_fleet, True, "user turn-off", ("model",), True)
+                model = out.get("model") or {}
+                failed = model.get("status") in ("stop_failed", "stop_unverified", "stopped_control_plane", "stop_refused")
+                st = await self.status(refresh=False)
+                st["fleet"] = {"model": model, "computer": {"status": "stopped"}}
+                st["turn_off_ok"] = not failed
+                if failed:
+                    st["error"] = "PandaStack stopped but Kaggle model shutdown is unverified; check the model session."
+                return st
+            st = await self._augment(await asyncio.to_thread(d1.turn_off_kaggle_gpu))
+            st["computer"] = {"host": "PandaStack", "status": "off", "online": False}
+            st["turn_off_ok"] = True
+            return st
         if hasattr(d1, "turn_off_fleet") and accounts_from_env(os.environ):
             # Blocking stop so the UI does not report offline while the kernel is still up.
             roles = ("model", "computer") if role == "all" else (role,)

@@ -632,8 +632,8 @@ def _auto_off_roles_ready() -> bool:
         computer = by_id.get("computer")
         if str(model.get("status") or "").upper() not in READY_STATUSES or not model.get("tunnel_url"):
             return False
-        if computer is None:
-            return True  # legacy model-only installation
+        if os.environ.get("PANDASTACK_API_KEY") or computer is None:
+            return True  # PandaStack computer is managed separately from Kaggle fleet
         status = str(computer.get("status") or "").upper()
         if status in ("OFF", "OFFLINE", "GPU_STOPPED_SAVING_QUOTA"):
             return True
@@ -653,7 +653,8 @@ def _auto_off_stop() -> Dict[str, Any]:
     if accounts_from_env(os.environ):
         # turn_off_fleet independently probes computer activity, checkpoints the
         # workspace, and refuses BOTH stops if either fact cannot be verified.
-        return turn_off_fleet(blocking=True, source="auto-off", roles=("model", "computer"))
+        roles = ("model",) if os.environ.get("PANDASTACK_API_KEY") else ("model", "computer")
+        return turn_off_fleet(blocking=True, source="auto-off", roles=roles)
     return turn_off_kaggle_gpu()
 
 
@@ -787,7 +788,7 @@ def auto_off_decision() -> Dict[str, Any]:
     if snap["active_tasks"] > 0:
         decided["reason"] = f"{snap['active_tasks']} task(s) still running"
         return decided
-    comp = dict(_COMPUTER_ACTIVITY)
+    comp = {"known": True, "active_jobs": 0} if os.environ.get("PANDASTACK_API_KEY") else dict(_COMPUTER_ACTIVITY)
     decided["computer_jobs"] = int(comp.get("active_jobs") or 0)
     if not comp.get("known"):
         decided["reason"] = "computer activity could not be verified; preserving both roles"
@@ -1932,8 +1933,9 @@ def turn_on_fleet(blocking: bool = False) -> Dict[str, Any]:
         # legacy single-account behaviour
         return turn_on_kaggle_gpu()
     fleet = _fleet_manager_with_usage(accounts)
+    roles = ("model",) if os.environ.get("PANDASTACK_API_KEY") else ("model", "computer")
     plan: Dict[str, Any] = {}
-    for role in ("model", "computer"):
+    for role in roles:
         reusable = _fleet_role_online(role)
         row = {}
         age = float("inf")
@@ -1980,7 +1982,7 @@ def turn_on_fleet(blocking: bool = False) -> Dict[str, Any]:
         account = fleet.by_slot.get((role, st.active))
         plan[role] = {"state": st, "account": account, "reusable": reusable,
                       "recover_local": recover_local}
-    for role in ("model", "computer"):
+    for role in roles:
         if plan[role]["account"] is not None and not plan[role]["reusable"]:
             row_id = "computer" if role == "computer" else "primary"
             _write_fleet_row(row_id, "BOOTING_KAGGLE_GPU",
@@ -2071,11 +2073,11 @@ def turn_on_fleet(blocking: bool = False) -> Dict[str, Any]:
 
     import concurrent.futures as _fut
     results: Dict[str, Any] = {role: {"role": role, "account": (plan[role]["account"].user if plan[role]["account"] else None),
-                                      "status": "starting"} for role in ("model", "computer")}
+                                      "status": "starting"} for role in roles}
 
     def _boots() -> None:
-        with _fut.ThreadPoolExecutor(max_workers=2) as pool:
-            futs = {role: pool.submit(boot, role) for role in ("model", "computer")}
+        with _fut.ThreadPoolExecutor(max_workers=len(roles)) as pool:
+            futs = {role: pool.submit(boot, role) for role in roles}
             for role, fut in futs.items():
                 try:
                     results[role] = fut.result(timeout=600)
@@ -2597,8 +2599,8 @@ def start_permanent_gpu_daemon() -> None:
                     # Decide only AFTER the clock bookkeeping above, and never within
                     # the first minute of a fresh boot (a decision computed from the
                     # pre-boot idle time would otherwise kill the GPU instantly).
-                    if ready_now:
-                        refresh_computer_activity()   # background jobs on the computer count as activity
+                    if ready_now and not os.environ.get("PANDASTACK_API_KEY"):
+                        refresh_computer_activity()   # legacy Kaggle computer only
                     decision = auto_off_decision()
                     if (
                         decision.get("should_stop")

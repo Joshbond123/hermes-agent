@@ -54,8 +54,21 @@ def build_services(settings: Settings, *, executor: Any = None, http: Any = None
             fleet = FleetManager(accounts)
     except Exception as exc:  # noqa: BLE001 - the studio must run even without fleet accounts
         log.warning("fleet not configured: %s", exc)
+    # The Panda route is opt-in. Never fall back to Kaggle when a configured
+    # PandaStack sandbox fails; its filesystem is a different computer.
+    panda_key = os.environ.get("PANDASTACK_API_KEY", "").strip()
+    panda_id = os.environ.get("PANDASTACK_SANDBOX_ID", "").strip()
+    drive_key = os.environ.get("COMPUTER_DRIVE_GITHUB_PAT", "").strip()
+    if bool(panda_key) != bool(drive_key):
+        raise ValueError("PandaStack computer requires both private provider and drive credentials")
+    if panda_key:
+        from .panda_computer import PandaComputerClient
+        computer = PandaComputerClient(http, api_key=panda_key, sandbox_id=panda_id,
+                                       github_token=drive_key, store=store)
+    else:
+        computer = ComputerClient(resolver, http, store=store)
     return Services(settings=settings, store=store, resolver=resolver, registry=default_registry(), http=http,
-                    tavily=TavilyKeys(store), computer=ComputerClient(resolver, http, store=store),
+                    tavily=TavilyKeys(store), computer=computer,
                     runs=RunManager(ttl=settings.run_ttl_s, max_active=settings.max_active_runs),
                     gpu=GpuService(store), static_dir=static_dir or STATIC_DIR, fleet=fleet)
 
@@ -145,7 +158,36 @@ def create_app(settings: Optional[Settings] = None, *, services: Optional[Servic
                     _t.sleep(60)
 
             threading.Thread(target=_fleet_watchdog, daemon=True, name="fleet-watchdog").start()
-        yield
+        panda_watchdog = None
+        if os.environ.get("PANDASTACK_API_KEY"):
+            import asyncio
+            from .panda_control import PandaControl, INTENT
+
+            async def _panda_power_watchdog():
+                while True:
+                    try:
+                        if await bt.store.get_setting(INTENT) == "on":
+                            row = await bt.store.gpu_row()
+                            state = str(row.get("status") or "").upper()
+                            if state in {"OFF", "OFFLINE", "GPU_STOPPED_SAVING_QUOTA", "STOPPED", "BOOT_FAILED", "GPU_UNAVAILABLE"}:
+                                log.warning("model GPU is off; stopping linked PandaStack computer")
+                                await PandaControl(bt.store, bt.http).stop()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        log.error("PandaStack power reconciliation failed: %s", type(exc).__name__)
+                    await asyncio.sleep(15)
+
+            panda_watchdog = asyncio.create_task(_panda_power_watchdog())
+        try:
+            yield
+        finally:
+            if panda_watchdog is not None:
+                panda_watchdog.cancel()
+                try:
+                    await panda_watchdog
+                except __import__("asyncio").CancelledError:
+                    pass
         await bt.runs.shutdown()
         await bt.http.aclose()
         await bt.store.db.aclose()
