@@ -30,8 +30,16 @@ async def test_start_probe_reuse_and_stop_only_managed_sandbox():
         if request.url.path == "/v1/sandboxes" and request.method == "GET":
             return httpx.Response(200, json=records)
         if request.url.path == "/v1/sandboxes" and request.method == "POST":
+            import json
+            payload = json.loads(request.content)
+            assert payload["ttl_seconds"] == 3600 and not payload.get("persistent")
             records.append({"id": own, "status": "running", "metadata": {"purpose": PURPOSE}})
             return httpx.Response(201, json=records[-1])
+        if request.url.path == f"/v1/sandboxes/{own}/lifecycle":
+            if request.method == "PATCH":
+                return httpx.Response(200, json={"ttl_seconds": 3600, "persistent": False})
+            return httpx.Response(200, json={"ttl_seconds": 300 if not any(m == "PATCH" for m, _ in actions) else 3600,
+                                             "persistent": False})
         if request.url.path == f"/v1/sandboxes/{own}/exec":
             return httpx.Response(200, json={"stdout": "437\n", "exit_code": 0})
         if request.url.path == f"/v1/sandboxes/{own}/hibernate":
