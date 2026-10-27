@@ -162,17 +162,27 @@ def create_app(settings: Optional[Settings] = None, *, services: Optional[Servic
         panda_watchdog = None
         if os.environ.get("PANDASTACK_API_KEY"):
             import asyncio
-            from .panda_control import PandaControl, INTENT
+            from .panda_control import PandaControl, INTENT, SANDBOX
+            from .route import BOOTING
 
             async def _panda_power_watchdog():
                 while True:
                     try:
-                        if await bt.store.get_setting(INTENT) == "on":
-                            row = await bt.store.gpu_row()
-                            state = str(row.get("status") or "").upper()
-                            if state in {"OFF", "OFFLINE", "GPU_STOPPED_SAVING_QUOTA", "STOPPED", "BOOT_FAILED", "GPU_UNAVAILABLE"}:
-                                log.warning("model GPU is off; stopping linked PandaStack computer")
-                                await PandaControl(bt.store, bt.http).stop()
+                        intent = await bt.store.get_setting(INTENT)
+                        row = await bt.store.gpu_row()
+                        state = str(row.get("status") or "").upper()
+                        controller = PandaControl(bt.store, bt.http)
+                        if intent == "on" and state in {"OFF", "OFFLINE", "GPU_STOPPED_SAVING_QUOTA", "STOPPED", "BOOT_FAILED", "GPU_UNAVAILABLE"}:
+                            log.warning("model GPU is off; stopping linked PandaStack computer")
+                            await controller.stop()
+                        elif intent == "off" and state in (BOOTING | {"MODEL_READY_COLD", "MODEL_READY_AND_WARMED", "HEARTBEAT_ONLINE", "ONLINE"}):
+                            # A failed model boot may be restarted by the fleet watchdog
+                            # after we hibernated the computer. Wake an existing VM once;
+                            # never rotate expired sandboxes merely to evade tier TTL.
+                            if await bt.store.get_setting(SANDBOX):
+                                owned = await controller._owned()
+                                if len(owned) == 1 and str(owned[0].get("status") or "").lower() == "hibernated":
+                                    await controller.start()
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
