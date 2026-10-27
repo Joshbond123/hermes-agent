@@ -18,7 +18,7 @@
   "blackthorn/kaggle_bundle.py": "28034aa1180aaef47d74754f95288f3512a6c76aa5ba8cb91130bd7891fd77a3",
   "blackthorn/llm.py": "1620acd8e5331c7438a27712394f7df156dfe0474403dec9ce5ae788af18627e",
   "blackthorn/malware_analyzer.py": "83187436a3a5fa9a6537120bc4e8c35213367e7b4245d909b38d04161c7e3fb4",
-  "blackthorn/panda_computer.py": "99e68a54c013124783b302aaad5ba4ae83ef4630493fb1336e4b9c7a021342aa",
+  "blackthorn/panda_computer.py": "f276e96736e2f385074c110c9ebf2fe84f4531d5c4200387c768db0d37ba3a46",
   "blackthorn/panda_control.py": "75fb0b0fd57744de6d4c85be5e3668290c0b01ac66cf0bb3f6499234d6956fe7",
   "blackthorn/prompts.py": "1080c3ad0148d9c202ea4050eea102411af3401d06bb0ad10f29c3bb4de4b57d",
   "blackthorn/relay.py": "942f03ffcbc11db855bf73d5d620e593f9b345e226f5a89335328c57dcc2c58f",

@@ -94,3 +94,6 @@ async def test_agent_task_wakes_automatically_hibernated_computer():
         out = await client.call("/computer/exec", {"command": "echo 45"})
         assert out["ok"] and out["output"].strip() == "45"
         assert [path.rsplit("/", 1)[-1] for _, path in actions] == ["sandboxes", "wake", "exec"]
+        fetched = await client.call("/computer/fetch_url", {"url": "https://example.com"})
+        assert fetched["ok"] and fetched["text"].strip() == "45"
+        assert actions[-1][1].endswith("/exec")

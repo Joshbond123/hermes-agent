@@ -165,6 +165,15 @@ class PandaComputerClient:
             directory = "/workspace" if root == "." else "/workspace/" + self._relative(root)
             result = await self._exec("ls -la " + shlex.quote(directory))
             return {"ok": result["ok"], "path": root, "listing": result["output"]}
+        if path == "/computer/fetch_url":
+            url = str(payload.get("url") or "")
+            if not url.startswith(("https://", "http://")):
+                raise ToolError("invalid", "fetch_url requires an HTTP or HTTPS URL")
+            script = ("import sys,urllib.request; "
+                      "response=urllib.request.urlopen(sys.argv[1],timeout=25); "
+                      "print(response.read(100001).decode('utf-8',errors='replace')[:100000])")
+            result = await self._exec("python3 -c " + shlex.quote(script) + " " + shlex.quote(url), timeout=35)
+            return {"ok": result["ok"], "text": result["output"][:100000]}
         if path == "/computer/info":
             result = await self._exec("python3 -V; uname -s; df -h /workspace | tail -1")
             return {"ok": result["ok"], "platform": "PandaStack Firecracker Linux",
