@@ -88,7 +88,11 @@ export function summarize(g: GpuView): { label: string; tone: Tone; detail: stri
     return { label: `GPU starting${step}`, tone: 'warn', detail: s.progress_step || s.display_status || 'Starting' }
   }
   if (s.online && s.model_loaded === false) return { label: 'Loading model', tone: 'warn', detail: 'Loading weights into GPU memory' }
-  if (s.online) return { label: 'GPU ready', tone: 'ok', detail: s.model || 'Ready' }
+  if (s.online && s.computer && !s.computer.online) {
+    return { label: 'GPU ready · PC off', tone: 'warn', detail: 'The model is ready, but the PandaStack computer is unavailable.' }
+  }
+  if (s.online) return { label: s.computer?.online ? 'GPU + PC ready' : 'GPU ready', tone: 'ok', detail: s.model || 'Ready' }
+  if (s.computer?.online) return { label: 'GPU off · PC stopping', tone: 'warn', detail: 'Computer shutdown is being verified.' }
   if (s.error) return { label: 'GPU error', tone: 'bad', detail: s.error }
-  return { label: 'GPU off', tone: 'off', detail: s.display_status || 'Offline' }
+  return { label: s.computer ? 'GPU + PC off' : 'GPU off', tone: 'off', detail: s.display_status || 'Offline' }
 }
