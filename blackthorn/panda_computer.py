@@ -12,6 +12,7 @@ import os
 import pathlib
 import shlex
 import tempfile
+import time
 from typing import Any
 
 import httpx
@@ -32,6 +33,8 @@ class PandaComputerClient:
         self.repo = repo
         self.store = store
         self.base = "https://api.pandastack.ai/v1/sandboxes/" + sandbox_id
+        self._awake_checked_at = 0.0
+        self._awake_lock = asyncio.Lock()
 
     async def _request(self, method: str, path: str, *, timeout: float = 60,
                        payload: Any = None, params: dict | None = None,
@@ -43,7 +46,30 @@ class PandaComputerClient:
             sandbox_id = await self.store.get_setting(SANDBOX)
             if not sandbox_id:
                 raise ToolError("offline", "PandaStack computer has no verified sandbox")
+            if sandbox_id != self.sandbox_id:
+                self._awake_checked_at = 0.0
+                self.sandbox_id = sandbox_id
             self.base = "https://api.pandastack.ai/v1/sandboxes/" + sandbox_id
+            # Persistent sandboxes hibernate after inactivity even while the owner's
+            # intent is ON. Check once per short window and wake before any tool call.
+            async with self._awake_lock:
+                if time.monotonic() - self._awake_checked_at >= 15:
+                    try:
+                        listed = await self.http.get("https://api.pandastack.ai/v1/sandboxes",
+                            headers={"Authorization": "Bearer " + self.key}, timeout=35)
+                        if listed.status_code != 200 or not isinstance(listed.json(), list):
+                            raise ToolError("offline", "PandaStack computer state could not be verified")
+                        item = next((x for x in listed.json() if x.get("id") == sandbox_id), None)
+                        if item is None:
+                            raise ToolError("offline", "PandaStack computer is missing")
+                        if str(item.get("status") or "").lower() == "hibernated":
+                            woke = await self.http.post(self.base + "/wake",
+                                headers={"Authorization": "Bearer " + self.key}, json={}, timeout=35)
+                            if woke.status_code not in (200, 201, 204):
+                                raise ToolError("offline", "PandaStack computer could not be woken")
+                        self._awake_checked_at = time.monotonic()
+                    except httpx.HTTPError as exc:
+                        raise ToolError("offline", "PandaStack computer state could not be checked") from exc
         try:
             response = await self.http.request(method, self.base + path,
                 headers={"Authorization": "Bearer " + self.key},

@@ -68,3 +68,29 @@ async def test_agent_route_refuses_powered_off_computer_before_network():
         with pytest.raises(ToolError) as error:
             await client.call("/computer/exec", {"command": "echo hello"})
         assert error.value.kind == "offline"
+
+@pytest.mark.asyncio
+async def test_agent_task_wakes_automatically_hibernated_computer():
+    sid = "12345678-1234-1234-1234-123456789abc"
+    store = Settings()
+    store.values.update({INTENT: "on", SANDBOX: sid})
+    actions = []
+    state = {"status": "hibernated"}
+
+    def answer(request):
+        actions.append((request.method, request.url.path))
+        if request.method == "GET" and request.url.path == "/v1/sandboxes":
+            return httpx.Response(200, json=[{"id": sid, "status": state["status"]}])
+        if request.method == "POST" and request.url.path.endswith("/wake"):
+            state["status"] = "running"
+            return httpx.Response(200, json={"status": "running"})
+        if request.method == "POST" and request.url.path.endswith("/exec"):
+            assert state["status"] == "running"
+            return httpx.Response(200, json={"stdout": "45\n", "stderr": "", "exit_code": 0})
+        raise AssertionError(f"unexpected request {request.method} {request.url.path}")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(answer)) as http:
+        client = PandaComputerClient(http, api_key="provider-test", github_token="drive-test", store=store)
+        out = await client.call("/computer/exec", {"command": "echo 45"})
+        assert out["ok"] and out["output"].strip() == "45"
+        assert [path.rsplit("/", 1)[-1] for _, path in actions] == ["sandboxes", "wake", "exec"]
