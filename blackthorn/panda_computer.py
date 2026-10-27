@@ -1,8 +1,9 @@
 """PandaStack computer adapter for the existing agent /computer/* tool contract.
 
-Opt-in transport only. A sandbox ID alone is NOT a durable workspace; write_file
-persists through the GitHub drive, while arbitrary shell side effects require a
-separate checkpoint strategy and must not be advertised as durable.
+A sandbox ID alone is NOT a durable workspace. Named writes are persisted as
+private GitHub release assets, and foreground shell/file mutations checkpoint
+/workspace through WorkspaceMirror before their tool call is acknowledged.
+System packages and unfinished background work are not covered.
 """
 
 from __future__ import annotations
@@ -23,7 +24,8 @@ from .tools.base import ToolError
 
 class PandaComputerClient:
     def __init__(self, http: httpx.AsyncClient, *, api_key: str, sandbox_id: str = "",
-                 github_token: str, repo: str = "jadeniran21/Computer-drive", store=None):
+                 github_token: str, repo: str = "jadeniran21/Computer-drive", store=None,
+                 mirror: bool = True, snapshot_path: str = "_system/blackthorn-workspace.tar.gz"):
         if not api_key or not github_token or not (sandbox_id or store):
             raise ValueError("PandaStack, private drive and sandbox state are required")
         self.http = http
@@ -32,9 +34,55 @@ class PandaComputerClient:
         self.github_token = github_token
         self.repo = repo
         self.store = store
+        self.snapshot_path = _safe_path(snapshot_path)
         self.base = "https://api.pandastack.ai/v1/sandboxes/" + sandbox_id
         self._awake_checked_at = 0.0
         self._awake_lock = asyncio.Lock()
+        self._tool_lock = asyncio.Lock()
+        if store is not None and mirror:
+            from .workspace_mirror import WorkspaceMirror
+            self.mirror = WorkspaceMirror(self)
+        else:
+            self.mirror = None
+
+    async def ensure_ready(self) -> None:
+        """Reconcile an expired VM on an actual agent task, then restore its drive."""
+        if self.store is None:
+            return
+        from .panda_control import PandaControl, INTENT, SANDBOX
+        if await self.store.get_setting(INTENT) != "on":
+            raise ToolError("offline", "The model/computer power control is off")
+        async with self._awake_lock:
+            try:
+                owned = await PandaControl(self.store, self.http, self.key)._owned()
+                if len(owned) > 1:
+                    raise ToolError("offline", "More than one managed computer needs reconciliation")
+                if not owned or str(owned[0].get("status") or "").lower() == "hibernated":
+                    await PandaControl(self.store, self.http, self.key).ensure_for_task()
+                sid = await self.store.get_setting(SANDBOX)
+                if not sid:
+                    raise ToolError("offline", "Computer recovery did not confirm a sandbox")
+                if sid != self.sandbox_id:
+                    self._awake_checked_at = 0.0
+                    self.sandbox_id = sid
+                self.base = "https://api.pandastack.ai/v1/sandboxes/" + sid
+                self._awake_checked_at = time.monotonic()
+            except ToolError:
+                raise
+            except Exception as exc:
+                raise ToolError("offline", "Computer task recovery failed; no command was run") from exc
+        if self.mirror is not None:
+            await self.mirror.restore(self.sandbox_id)
+
+    async def keepalive(self) -> None:
+        """Keep a sandbox alive ONLY while a real agent run has a durable lease."""
+        if self.store is None:
+            return
+        from .panda_control import INTENT
+        if await self.store.get_setting(INTENT) != "on":
+            return
+        await self.ensure_ready()
+        await self._exec("true", timeout=15)
 
     async def _request(self, method: str, path: str, *, timeout: float = 60,
                        payload: Any = None, params: dict | None = None,
@@ -112,15 +160,33 @@ class PandaComputerClient:
 
     async def call(self, path: str, payload: dict | None = None, *, method: str = "POST",
                    timeout: float = 90, idempotent: bool = True) -> dict:
-        payload = payload or {}
+        # Mutating computer calls are serialized until their GitHub checkpoint
+        # commits. Parallel readers remain possible after the first restore.
+        if path in ("/computer/exec", "/computer/write_file"):
+            async with self._tool_lock:
+                await self.ensure_ready()
+                return await self._call(path, payload or {}, method=method, timeout=timeout)
+        await self.ensure_ready()
+        return await self._call(path, payload or {}, method=method, timeout=timeout)
+
+    async def _call(self, path: str, payload: dict, *, method: str, timeout: float) -> dict:
         if path == "/computer/exec":
             cwd = str(payload.get("cwd") or ".")
             if cwd == ".":
                 cwd = "/workspace"
             elif not cwd.startswith("/workspace/"):
                 cwd = "/workspace/" + self._relative(cwd)
-            command = "cd " + shlex.quote(cwd) + " && " + str(payload.get("command") or "")
-            return await self._exec(command, timeout=float(payload.get("timeout_seconds") or timeout))
+            # Package/cache paths live inside the mirrored workspace. APT/system
+            # packages outside /workspace cannot be made durable by GitHub assets.
+            setup = ("export HOME=/workspace PIP_TARGET=/workspace/.packages "
+                     "PIP_CACHE_DIR=/workspace/.pip-cache NPM_CONFIG_CACHE=/workspace/.npm-cache "
+                     "PYTHONPATH=/workspace/.packages:${PYTHONPATH:-} "
+                     "PATH=/workspace/.packages/bin:$PATH; ")
+            command = "cd " + shlex.quote(cwd) + " && " + setup + str(payload.get("command") or "")
+            result = await self._exec(command, timeout=float(payload.get("timeout_seconds") or timeout))
+            if self.mirror is not None:
+                await self.mirror.sync()  # even a non-zero command may have changed files
+            return result
         if path == "/computer/write_file":
             logical = self._relative(str(payload.get("path") or ""))
             body = str(payload.get("content") or "").encode("utf-8")
@@ -134,6 +200,8 @@ class PandaComputerClient:
             response = await self._request("PUT", "/fs", params={"path": location}, content=body)
             if response.status_code not in (200, 201, 204):
                 raise ToolError("storage", f"PandaStack file write returned HTTP {response.status_code}")
+            if self.mirror is not None:
+                await self.mirror.sync()
             return {"ok": True, "bytes": len(body), "path": logical, "persistent": True}
         if path == "/computer/read_file":
             logical = self._relative(str(payload.get("path") or ""))

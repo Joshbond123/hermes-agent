@@ -1139,12 +1139,11 @@ def build_llama_server_bin() -> str:
 def start_llama_server(gguf_path: str) -> None:
     """Start OpenAI-compatible llama-server across BOTH GPUs for maximum inference speed.
 
-    The agent's computer runs on its own dedicated hosts (josh787 / alagbo), so this
-    machine hosts the model only: all 2x T4 work for it. The 27B Q4 weights (~15.7 GiB)
-    fit in the combined VRAM with room for the KV cache only at a measured
-    working offload. In a fresh deployment, 56 did not become healthy within
-    240s and 40 did; a previous boot had succeeded at 56. Prioritize the latest
-    reliable configuration and keep larger offloads only as fallback/opt-in.
+    The computer runs separately on PandaStack, so both Kaggle T4s serve the model.
+    The 27B Q4 model has previously started at 40 GPU layers; 56 layers succeeded
+    on another boot but once timed out during startup. Full GPU offload is an
+    unverified performance experiment: attempt it first, then fall back if it
+    crashes or cannot become healthy within the bounded loading window.
     """
     binary = ensure_llama_server_bin()
     # Context window: prefer env, default 8192 to match the agent's context budget.
@@ -1208,7 +1207,12 @@ def start_llama_server(gguf_path: str) -> None:
         load_timeout = max(240, min(int(os.environ.get("LLAMA_LOAD_TIMEOUT_S", "600")), 1200))
     except ValueError:
         load_timeout = 600
-    layers = ("99", "56", "40") if os.environ.get("LLAMA_TRY_FULL_OFFLOAD") == "1" else ("40", "56")
+    # The Kaggle computer no longer shares GPU 1: both T4s belong to inference.
+    # The previous default of 40 layers left CPU layers on every token and made
+    # production tool turns spend ~97% of their wall time waiting for the model.
+    # Try full VRAM offload first; retain measured smaller fallback configurations
+    # for CUDA OOM / slow initialization rather than making the model unavailable.
+    layers = ("99", "56", "40") if os.environ.get("LLAMA_TRY_FULL_OFFLOAD", "1") == "1" else ("40", "56")
     for ngl in layers:
         proc = _launch(ngl)
         if _wait(proc, load_timeout):

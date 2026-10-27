@@ -7,12 +7,16 @@ from __future__ import annotations
 
 import os
 import re
+import asyncio
+import time
+import uuid
 
 import httpx
 
 INTENT = "pandastack_computer_intent"
 SANDBOX = "pandastack_computer_sandbox_id"
 PURPOSE = "blackthorn-production-computer"
+RECOVERY_LOCK = "pandastack_computer_recovery_lock"
 UUID = re.compile(r"^[0-9a-fA-F-]{32,36}$")
 BASE = "https://api.pandastack.ai/v1/sandboxes"
 
@@ -57,7 +61,7 @@ class PandaControl:
         if len(owned) != 1:
             return {"status": "missing" if not owned else "duplicate", "online": False,
                     "host": "PandaStack", "storage": "private GitHub Computer-drive",
-                    "error": ("Provider idle TTL expired; press GPU ON to create a new computer. Named GitHub-drive files remain."
+                    "error": ("Provider VM expired while idle; the next computer tool call will create a replacement and restore the GitHub workspace."
                               if not owned else "Expected exactly one production computer")}
         item = owned[0]
         if sid != item["id"]:
@@ -81,6 +85,52 @@ class PandaControl:
             check = await self._request("GET", "/" + sid + "/lifecycle")
             if check.status_code != 200 or int(check.json().get("ttl_seconds") or 0) < 3600:
                 raise RuntimeError("PandaStack sandbox lifetime was not confirmed")
+
+    async def ensure_for_task(self):
+        """Recreate only for a real task after provider expiry, never as an idle quota loop.
+
+        A D1 compare-and-insert lease prevents two Render workers creating two
+        billable sandboxes. It expires if the worker crashes during creation.
+        """
+        if await self.store.get_setting(INTENT) != "on":
+            raise RuntimeError("PandaStack computer is powered off")
+        owned = await self._owned()
+        if len(owned) > 1:
+            raise RuntimeError("Multiple production computers need reconciliation")
+        if owned:
+            sid = owned[0]["id"]
+            if await self.store.get_setting(SANDBOX) != sid:
+                await self.store.set_setting(SANDBOX, sid)
+            if str(owned[0].get("status") or "").lower() == "hibernated":
+                return await self.start()
+            return await self.status()
+        if not hasattr(self.store, "db"):
+            return await self.start()
+        token = f"{time.time()+100:.3f}:{uuid.uuid4().hex}"
+        for _ in range(50):
+            if await self.store.get_setting(INTENT) != "on":
+                raise RuntimeError("Computer was turned off during task recovery")
+            await self.store.db.query("DELETE FROM state_meta WHERE key = ? AND CAST(value AS REAL) < ?",
+                                      [RECOVERY_LOCK, time.time()])
+            claim = await self.store.db.query(
+                "INSERT INTO state_meta (key,value) SELECT ?,? WHERE NOT EXISTS "
+                "(SELECT 1 FROM state_meta WHERE key = ?)", [RECOVERY_LOCK, token, RECOVERY_LOCK])
+            if claim.changes:
+                try:
+                    # Recheck after acquiring the lease: an earlier owner may have
+                    # finished between the initial list and this claim.
+                    if await self.store.get_setting(INTENT) != "on":
+                        raise RuntimeError("Computer was turned off during task recovery")
+                    return await self.start()
+                finally:
+                    await self.store.db.query("DELETE FROM state_meta WHERE key = ? AND value = ?", [RECOVERY_LOCK, token])
+            await asyncio.sleep(0.5)
+            owned = await self._owned()
+            if len(owned) == 1:
+                return await self.status()
+            if len(owned) > 1:
+                raise RuntimeError("Multiple production computers need reconciliation")
+        raise RuntimeError("Timed out waiting for computer recovery lease")
 
     async def start(self):
         # Reconcile before create because a lost response could have already

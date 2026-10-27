@@ -1,9 +1,9 @@
 {
  "files": {
-  "blackthorn/COMPUTER_DRIVE.md": "bf3fc5d06d1983589031826b69d6b9dafd3a5ede70a4fa8bb0edfb2850f07f3c",
+  "blackthorn/COMPUTER_DRIVE.md": "353b74f8b80e201d2289aed2bfb244fd8b524a551b951364bc3bdb573d6dec14",
   "blackthorn/README.md": "26ad9ad6d9aa51cb5127cf3a661c3c80e18fb67c48cdb2d05a4ddf847c4435d4",
   "blackthorn/__init__.py": "0bff9f17b60d2e4655f341e6ab4843bc0f472c807e811768bc04e6f60128f78e",
-  "blackthorn/agent.py": "3e1bb67a8bf612531a7ae76fe7c206047bcc472ec3bcd21cc107bdb1212b40df",
+  "blackthorn/agent.py": "d05361fac63c16578ea55bcc56a2565ff5bdea5fe447051fd4b79617ed305595",
   "blackthorn/api.py": "fbc8f57c427e39037021152fa678b184470faa10b40dc3c64058f875ac0efaa8",
   "blackthorn/app.py": "71c55007d42be648db02d52fd60b6111564a4613956882531030c454df921b12",
   "blackthorn/auth.py": "daa51b4209187b523912b663bc793cb3fdf760603440cf3c971cc787d9bbea32",
@@ -18,9 +18,9 @@
   "blackthorn/kaggle_bundle.py": "28034aa1180aaef47d74754f95288f3512a6c76aa5ba8cb91130bd7891fd77a3",
   "blackthorn/llm.py": "1620acd8e5331c7438a27712394f7df156dfe0474403dec9ce5ae788af18627e",
   "blackthorn/malware_analyzer.py": "83187436a3a5fa9a6537120bc4e8c35213367e7b4245d909b38d04161c7e3fb4",
-  "blackthorn/panda_computer.py": "f276e96736e2f385074c110c9ebf2fe84f4531d5c4200387c768db0d37ba3a46",
-  "blackthorn/panda_control.py": "32da1058bbe30cd067fc95d05bfb6abe05de766a49bf6dc42af2f4fcf4f9831b",
-  "blackthorn/prompts.py": "1080c3ad0148d9c202ea4050eea102411af3401d06bb0ad10f29c3bb4de4b57d",
+  "blackthorn/panda_computer.py": "ab8b932682610b616ab4c3b95944986136bf6bddca693a85bf9f35f9df765791",
+  "blackthorn/panda_control.py": "69adbdd50d238b85355082ced1f1d1b2b49f263ea636c78e143030c2f0b9654e",
+  "blackthorn/prompts.py": "69ed7e316c6c12666804dbe5388c67c4b01f6083de008b888564c10820741ce9",
   "blackthorn/relay.py": "942f03ffcbc11db855bf73d5d620e593f9b345e226f5a89335328c57dcc2c58f",
   "blackthorn/route.py": "d0ead4b982168dafe6a7229f6ec8020003f1bf5dc7440d5148ae88823a6b3d25",
   "blackthorn/runs.py": "ef2d5deb094f9b9c879f80776b104218bb8a1cd4cc0a1ae695bd564c66e650db",
@@ -41,10 +41,10 @@
   "blackthorn/skills/web-evidence-research/SKILL.md": "d821319223a598605c79af3749cd1fcb044b06b25d4a432cef756367a76d40d3",
   "blackthorn/skills/web-evidence-research/references/workflows.md": "051b7a650a4f040c892d82331e8a22090687e45d2c923ae0f3bfcf13ee5f6997",
   "blackthorn/sql.py": "5456acba070cbc885b1ec3bac085a725b9becc67b21eded3447e1f10c892fcb0",
+  "blackthorn/static/assets/index-BQ0rMpX4.js": "6b1038345f26c287d82c83b914632b3f27cd74fe7717020a64b19a680eccf5f0",
   "blackthorn/static/assets/index-RgnNFsrT.css": "37ebb3d5cf58db6c666d12bc9a125cfe3c2b65ce21a10872461358bdcca4c97f",
-  "blackthorn/static/assets/index-gmwuzr6W.js": "d0373309f436815584e634ecf2a54f32a3f23613c77ca45db52afb2418b2b6d9",
-  "blackthorn/static/build.json": "ddcd8707422c191e3206d24a2b262a0f85a56da1b8d371c569a39e5ab6adc73d",
-  "blackthorn/static/index.html": "de84769203c8b2bee3f25fc62593836fb65fb5ea07f0562b56751dc75e85a34b",
+  "blackthorn/static/build.json": "93fb10f87bbb5e32cd1c68ccb97c4509f54ac46571157c1be4a1bfd5134b3434",
+  "blackthorn/static/index.html": "d5d3afeab4c1457aebce81cdfbda3859b2f969fc0b7ed0ea27a14fc08424225c",
   "blackthorn/store.py": "738b99d297b9270d671ba63b8a767224523f71dde077e7cb84edca37eae6a0ff",
   "blackthorn/tools/__init__.py": "9cc2ffd2404bc65de1388cc703a419006ffbfe4efb7345c953e82a27a07be7c8",
   "blackthorn/tools/base.py": "fa100a27fc95ba0ca90ab80bf8948660604b00048feddfb814fb18a4a8225f32",
@@ -54,9 +54,10 @@
   "blackthorn/tools/task.py": "d516e5fe82517e63ede1551b859e885766a4a2d3a144b2d3e7585792eeea9340",
   "blackthorn/tools/web.py": "e98acbf8521a9cd1492aff0eb2a35e89bc97800d0bde5e2215b40df244f084fd",
   "blackthorn/version.py": "5d43f6378622c4ddeeec627755c2e98152f6077be9334b2770c3a8199018bf37",
+  "blackthorn/workspace_mirror.py": "a5d0cc06b6dc75d80b3f7780d930ea54dc25c4c9d0a7ff6c4e47f9fd7dbf5573",
   "blackthorn_start.py": "d8189febd25f393cc6b41cd17f7cc88d73ecaa44942fa52f51dd310602b108df",
   "cloudflare_d1_client.py": "2e861f10c90ac3a48297b1f19bf9a6447cb44eab078e84703c6e1a69dc8dcf1d",
-  "kaggle_cyber_ornith/cyber_ornith_server.py": "4801d548c8688e5f7679657fc1eae336055be6a82c286c99e7c7248df52aea21"
+  "kaggle_cyber_ornith/cyber_ornith_server.py": "825645af620eae872cc57d1bb3d23830a38a24b11e0ad3c2d7c0643dd8234647"
  },
  "version": "5.3.0"
 }

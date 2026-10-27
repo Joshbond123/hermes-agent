@@ -201,7 +201,7 @@ export function GpuPanel({ gpu, onClose }: { gpu: GpuView; onClose: () => void }
           <div className="gpu-kv"><span>Connection</span><span>{s?.computer?.transport || 'PandaStack API'}</span></div>
           <div className="muted small">{s?.computer?.usage_display || 'Actual usage: PandaStack Billing dashboard'}</div>
           {s?.computer?.error && <div className="notice error small">{s.computer.error}</div>}
-          <div className="muted small">The model GPU and AI computer share this power control. Only named file writes are backed by GitHub; shell-created files and installed packages expire with the VM unless saved separately.</div>
+          <div className="muted small">The model GPU and AI computer share this power control. Tool commands checkpoint /workspace—including workspace-local Python packages—to the private GitHub drive. The VM is temporary; system-level packages outside /workspace are not portable.</div>
         </section>
 
         {s?.model_cache_dataset && (
@@ -256,7 +256,7 @@ export function GpuPanel({ gpu, onClose }: { gpu: GpuView; onClose: () => void }
       {confirmOff && (
         <Confirm
           title="Turn off GPU?"
-          message="This stops the Kaggle model GPU and hibernates the PandaStack computer. Its snapshot lasts only until the provider's idle TTL and may use storage. Named files saved with the computer's write_file tool remain in the private GitHub Computer-drive; shell-created files and installed packages are not independently backed up."
+          message="This stops the Kaggle model GPU and hibernates the temporary PandaStack VM. The VM snapshot expires with its provider TTL; completed /workspace tool-command checkpoints and workspace-local Python packages remain in the private GitHub Computer-drive. System packages outside /workspace and unpolled background jobs are not guaranteed durable."
           confirmLabel="Turn off"
           danger
           onCancel={() => setConfirmOff(false)}

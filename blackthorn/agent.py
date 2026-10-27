@@ -189,12 +189,24 @@ class AgentRun:
             # model step. Keep the nine core research/computer/task tools available, and load
             # specialised schemas only when the current task (or its recent context) needs them.
             # Full schemas remain in the registry: no tool or capability is uninstalled.
-            core = {"web_search", "job_status", "run_command", "list_files", "read_file", "write_file",
-                    "fetch_url", "computer_info", "todo_list", "optional_tool"}
+            # On the live dual-T4 Qwen, model prefill dominates a computer turn.
+            # Offer the five computer primitives first; disclose unrelated schemas
+            # only when the task calls for them (or a prior ledger used them).
+            core = {"run_command", "list_files", "read_file", "write_file", "job_status"}
             context_lower = (context + " " + " ".join(str(t.get("content") or "")[:300]
                             for t in self.turns[-4:] if t.get("role") == "user")).lower()
             def mentions(*words: str) -> bool:
                 return any(word in context_lower for word in words)
+            if mentions("search", "research", "latest", "current", "news", "source", "web", "internet"):
+                core.add("web_search")
+            if mentions("url", "http", "fetch", "page"):
+                core.add("fetch_url")
+            if mentions("computer info", "computer status", "system specs", "hardware"):
+                core.add("computer_info")
+            if mentions("plan", "multi-step", "long task", "todo", "project"):
+                core.add("todo_list")
+            if mentions("optional tool", "catalog", "skill", "browser", "browse", "sample"):
+                core.add("optional_tool")
             if mentions("remember", "memory", "recall", "previous", "earlier", "history", "session", "past chat"):
                 core.update(("remember", "session_search"))
             if mentions("skill", "playbook", "workflow", "training"):
@@ -400,13 +412,23 @@ class AgentRun:
     async def _lease_heartbeat(self) -> None:
         """Durable, expiring run lease: shutdown checks other Render workers too."""
         import json
+        ticks = 0
         while True:
             await asyncio.sleep(30)
+            ticks += 1
             try:
                 await self.deps.store.set_setting("bt_run:" + self.run.id, json.dumps({
                     "session_id": self.run.session_id, "expires": time.time() + 120}))
             except Exception as exc:
                 log.warning("run lease refresh failed: %s", type(exc).__name__)
+            # Provider TTL is an IDLE timer, not a durable disk. While this real
+            # agent task is running (including slow model prefill), touch its VM
+            # every two minutes; never do this when idle/off to evade the tier.
+            if ticks % 4 == 0 and hasattr(self.deps.computer, "keepalive"):
+                try:
+                    await self.deps.computer.keepalive()
+                except Exception as exc:
+                    log.warning("active computer keepalive failed: %s", type(exc).__name__)
 
     async def execute(self) -> None:
         status, error = "stop", None

@@ -72,7 +72,7 @@ async def test_start_probe_reuse_and_stop_only_managed_sandbox():
 async def test_agent_route_refuses_powered_off_computer_before_network():
     store = Settings()
     async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _: (_ for _ in ()).throw(AssertionError("network used")))) as http:
-        client = PandaComputerClient(http, api_key="provider-test", github_token="drive-test", store=store)
+        client = PandaComputerClient(http, api_key="provider-test", github_token="drive-test", store=store, mirror=False)
         with pytest.raises(ToolError) as error:
             await client.call("/computer/exec", {"command": "echo hello"})
         assert error.value.kind == "offline"
@@ -88,20 +88,61 @@ async def test_agent_task_wakes_automatically_hibernated_computer():
     def answer(request):
         actions.append((request.method, request.url.path))
         if request.method == "GET" and request.url.path == "/v1/sandboxes":
-            return httpx.Response(200, json=[{"id": sid, "status": state["status"]}])
+            return httpx.Response(200, json=[{"id": sid, "status": state["status"], "metadata": {"purpose": PURPOSE}}])
+        if request.method == "GET" and request.url.path.endswith("/lifecycle"):
+            return httpx.Response(200, json={"persistent": False, "ttl_seconds": 3600})
         if request.method == "POST" and request.url.path.endswith("/wake"):
             state["status"] = "running"
             return httpx.Response(200, json={"status": "running"})
         if request.method == "POST" and request.url.path.endswith("/exec"):
             assert state["status"] == "running"
-            return httpx.Response(200, json={"stdout": "45\n", "stderr": "", "exit_code": 0})
+            value = "437\n" if b"19*23" in request.content else "45\n"
+            return httpx.Response(200, json={"stdout": value, "stderr": "", "exit_code": 0})
         raise AssertionError(f"unexpected request {request.method} {request.url.path}")
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(answer)) as http:
-        client = PandaComputerClient(http, api_key="provider-test", github_token="drive-test", store=store)
+        client = PandaComputerClient(http, api_key="provider-test", github_token="drive-test", store=store, mirror=False)
         out = await client.call("/computer/exec", {"command": "echo 45"})
         assert out["ok"] and out["output"].strip() == "45"
-        assert [path.rsplit("/", 1)[-1] for _, path in actions] == ["sandboxes", "wake", "exec"]
+        assert any(path.endswith("/wake") for _, path in actions)
+        assert not any(method == "POST" and path == "/v1/sandboxes" for method, path in actions)
         fetched = await client.call("/computer/fetch_url", {"url": "https://example.com"})
         assert fetched["ok"] and fetched["text"].strip() == "45"
         assert actions[-1][1].endswith("/exec")
+
+@pytest.mark.asyncio
+async def test_expired_vm_is_replaced_only_once_across_concurrent_workers():
+    import asyncio
+    from blackthorn.sql import SqliteExecutor
+    from blackthorn.store import ChatStore
+    db = SqliteExecutor()
+    await db.query('CREATE TABLE state_meta (key TEXT, value TEXT)')
+    store = ChatStore(db)
+    await store.set_setting(INTENT, 'on')
+    sid = '12345678-1234-1234-1234-123456789abc'
+    records = []
+    creates = []
+
+    def answer(request):
+        path = request.url.path
+        if path == '/v1/sandboxes' and request.method == 'GET':
+            return httpx.Response(200, json=records)
+        if path == '/v1/sandboxes' and request.method == 'POST':
+            creates.append(1)
+            records.append({'id': sid, 'status': 'running', 'metadata': {'purpose': PURPOSE}})
+            return httpx.Response(201, json=records[-1])
+        if path.endswith('/lifecycle'):
+            return httpx.Response(200, json={'persistent': False, 'ttl_seconds': 3600})
+        if path.endswith('/exec'):
+            return httpx.Response(200, json={'stdout': '437\n', 'exit_code': 0})
+        raise AssertionError(path)
+
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(answer)) as http:
+            a, b = PandaControl(store, http, 'test'), PandaControl(store, http, 'test')
+            states = await asyncio.gather(a.ensure_for_task(), b.ensure_for_task())
+        assert all(x['online'] for x in states)
+        assert len(creates) == 1
+        assert await store.get_setting(SANDBOX) == sid
+    finally:
+        await db.aclose()
