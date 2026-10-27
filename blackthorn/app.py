@@ -132,10 +132,11 @@ def create_app(settings: Optional[Settings] = None, *, services: Optional[Servic
             import threading
 
             def _fleet_watchdog() -> None:
-                active = {role: bt.fleet.state[role].active for role in ("model", "computer")}
+                roles = ("model",) if os.environ.get("PANDASTACK_API_KEY") else ("model", "computer")
+                active = {role: bt.fleet.state[role].active for role in roles}
                 while True:
                     try:
-                        for role in ("model", "computer"):
+                        for role in roles:
                             before = active[role]
                             st = bt.fleet.decide(role)
                             if st.active != before:

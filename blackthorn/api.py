@@ -500,7 +500,7 @@ async def fleet_status(request: Request, refresh: bool = False):
         return {"configured": False}
     try:
         if refresh:
-            for role in ("model", "computer"):
+            for role in (("model",) if __import__("os").environ.get("PANDASTACK_API_KEY") else ("model", "computer")):
                 s.fleet.decide(role, force=True)
         else:
             s.fleet.refresh_slots()
