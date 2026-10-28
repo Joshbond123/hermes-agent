@@ -90,7 +90,14 @@ def _err(status: int, code: str, message: str, **extra: Any) -> HTTPException:
 # --------------------------------------------------------------------------- health / version
 @router.api_route("/api/health", methods=["GET", "HEAD"])
 async def health() -> Dict[str, Any]:
-    return {"ok": True, "app": "blackthorn"}
+    """Liveness plus the deployed build identity, so a deploy can be verified externally.
+
+    Only non-secret identifiers are exposed: version, commit, start time and uptime.
+    """
+    from . import __version__
+    from .version import STARTED_AT, _git_commit
+    return {"ok": True, "app": "blackthorn", "version": __version__, "commit": _git_commit(),
+            "started_at": STARTED_AT, "uptime_seconds": int(time.time() - STARTED_AT)}
 
 
 @router.get("/api/version")

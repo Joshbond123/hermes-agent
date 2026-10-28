@@ -98,7 +98,9 @@ async def skill_search(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
                                        f"(skills {data.get('counts', {}).get('skills', '?')}, tools "
                                        f"{data.get('counts', {}).get('tools', '?')})\n{body}",
                       summary=f"{data.get('matches', 0)} capability matches",
-                      data={"matches": data.get("matches", 0), "results": [r.get("id") for r in data.get("results", [])][:10]})
+                      data={"matches": data.get("matches", 0),
+                            "results": [r.get("id") for r in data.get("results", [])][:10],
+                            "runnable": [r.get("id") for r in data.get("results", []) if r.get("runnable")][:10]})
 
 
 async def skill_load(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
@@ -143,7 +145,10 @@ async def tool_search(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
         lines.append(f"{r['id']} [{r.get('category')}]: {r.get('title')} - {r.get('description', '')[:160]}")
     body = "\n".join(lines) or "no matching tools in the catalog"
     return ToolResult(ok=True, content=f"{data.get('matches', 0)} catalog matches (metadata only; nothing installed)\n{body}",
-                      summary=f"{data.get('matches', 0)} tool matches", data={"matches": data.get("matches", 0)})
+                      summary=f"{data.get('matches', 0)} tool matches",
+                      data={"matches": data.get("matches", 0),
+                            "results": [r.get("id") for r in data.get("results", [])][:10],
+                            "runnable": [r.get("id") for r in data.get("results", []) if r.get("runnable")][:10]})
 
 
 async def browse(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:

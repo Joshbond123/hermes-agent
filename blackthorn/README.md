@@ -118,6 +118,31 @@ without rebuilding `blackthorn/static`.
    *completed* against an unchanged workspace can strike, and even then the model is first told to
    change strategy. `BLACKTHORN_MAX_RECOVERY_ROUNDS` bounds the automatic recovery rounds.
 
+### Live verification (PandaStack, this deployment)
+
+Two scripts exist because "it works in a unit test" is not evidence:
+
+| Script | What it proves |
+| --- | --- |
+| `blackthorn/scripts/live_acceptance.py` | Real provider: creates the managed sandbox, runs python/git on it, publishes a workspace checkpoint to the private GitHub drive, performs a full handover (replacement created → workspace restored → probe → promoted → old VM deleted), proves a file written *before* the handover is readable *after*, clones all three repositories in the guest, builds the 897-skill/183-tool registry, and releases every sandbox it created. |
+| `blackthorn/scripts/live_browser_test.py` | Real Camoufox inside a real microVM: install (disk-backed scratch), browser fetch, then open / click / type+submit / scroll / screenshot / accessibility / tabs / download / challenge detection / session persistence / close, plus "no browser processes left behind". |
+| `blackthorn/scripts/smoke_catalog.py` | The cybersecurity tools through the **real ToolRegistry** against a real catalogue: `cyber_preflight`, `skill_search`, `tool_search`, `skill_load`, `cyber_run` (including honest refusal of an entry with no command and rejection of a malformed id), and that no credential travels to the computer. |
+
+Operational notes learned from the live run:
+
+* The guest's `/tmp` is a ~1 GB tmpfs. The Camoufox bundle is ~1.5 GB, so `browse.py` moves
+  `TMPDIR`/`XDG_CACHE_HOME` to disk (`/workspace/.cache` by default, `BLACKTHORN_BROWSER_CACHE`/`_TMP`
+  to override) before fetching. Fetching into `/tmp` fails with `No space left on device`.
+* Firefox needs its shared libraries; a bare microVM ships none of them and the browser dies with an
+  opaque `XPCOMGlueLoad error`. `browse.py` checks the binary with `ldd` and installs the package set
+  in `LINUX_LIBS` before launching, and raises a named error if a library still cannot be resolved.
+* Rebuildable caches (`.cache`, `__pycache__`, `.npm`, `.tmp`) are excluded from the durable
+  workspace checkpoint, and an archive over `BLACKTHORN_WORKSPACE_MAX_BYTES` is refused instead of
+  pushed to GitHub.
+* `export VAR=value command` in a guest shell exports a variable named `command` and runs nothing —
+  environment assignments must prefix the command. This silently produced empty tool output until the
+  harness was fixed.
+
 ### New API
 
 * `GET /api/computer/session` — provider-reported sandbox timing (`seconds_left`, `handover_due`),

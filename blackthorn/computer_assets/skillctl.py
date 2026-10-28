@@ -165,6 +165,31 @@ def _skill_entry(source: str, skill_id: str, name: str, category: str, folder: s
             "description": description[:400], "path": os.path.relpath(folder, ROOT)}
 
 
+def _resolve_skill_folder(source: str, name: str, hinted: str = "") -> str:
+    """Locate a skill folder across the layouts the upstream repositories actually use.
+
+    ``Anthropic-Cybersecurity-Skills`` keeps ``<name>/SKILL.md`` at the repository root,
+    while other repositories nest skills under ``skills/`` or ``Skills/<Category>/``, and
+    ``index.json`` sometimes records a path that does not exist in the checkout. The
+    filesystem is the source of truth; the index path is only a hint.
+    """
+    base = path_of(source)
+    candidates = []
+    if hinted:
+        stripped = hinted.lstrip("./")
+        candidates += [os.path.join(base, stripped), os.path.join(base, stripped.replace("skills/", "", 1))]
+    candidates += [os.path.join(base, name), os.path.join(base, "skills", name)]
+    for candidate in candidates:
+        if os.path.isfile(os.path.join(candidate, "SKILL.md")):
+            return os.path.relpath(candidate, ROOT)
+    for dirpath, dirnames, filenames in os.walk(base):
+        if ".git" in dirpath.split(os.sep):
+            continue
+        if "SKILL.md" in filenames and os.path.basename(dirpath) == name:
+            return os.path.relpath(dirpath, ROOT)
+    return os.path.relpath(candidates[0] if candidates else os.path.join(base, name), ROOT)
+
+
 def build_registry() -> dict:
     skills: list[dict] = []
     index_path = path_of("anthropic", "index.json")
@@ -178,7 +203,7 @@ def build_registry() -> dict:
                        "description": str(item.get("description") or "")[:400],
                        # Registry paths are always ROOT-relative, so a skill resolves the same
                        # way whichever repository it came from.
-                       "path": os.path.join(SOURCES["anthropic"]["dir"], "skills", name)})
+                       "path": _resolve_skill_folder("anthropic", name, str(item.get("path") or ""))})
     red_root = path_of("claude-red", "Skills")
     if os.path.isdir(red_root):
         for category in sorted(os.listdir(red_root)):
