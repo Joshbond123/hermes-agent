@@ -46,6 +46,7 @@ class Settings:
     max_tool_calls: int = field(default_factory=lambda: _int("BLACKTHORN_MAX_TOOL_CALLS", 400))
     max_calls_per_step: int = field(default_factory=lambda: _int("BLACKTHORN_MAX_CALLS_PER_STEP", 16))  # concurrency
     max_repeat_calls: int = 2          # identical (tool, args) executions allowed per run
+    tool_progress_s: float = 10.0      # heartbeat cadence while a tool is still running (never look idle)
     max_malformed_calls: int = 8
     # Bounded continuation nudges when the model stops while its own task list is still open.
     max_completion_nudges: int = field(default_factory=lambda: _int("BLACKTHORN_COMPLETION_NUDGES", 3))

@@ -1022,13 +1022,39 @@ class AgentRun:
                 self._maybe_flush()
                 emit_next += 1
 
+        async def _progress(index: int, part: Dict[str, Any], started: float) -> None:
+            """Never look idle while a tool is genuinely working.
+
+            A long command (a browser install, a scan, a build) can run for many minutes
+            between ``tool.start`` and ``tool.end``. Silence there is indistinguishable
+            from a hung agent, so report elapsed time on a fixed cadence, keep the run
+            lease and the computer's activity clock warm, and persist progress.
+            """
+            # Configurable cadence, with a floor that prevents a busy loop if it is set to 0.
+            interval = max(0.05, float(getattr(s, "tool_progress_s", 10.0) or 10.0))
+            while True:
+                await asyncio.sleep(interval)
+                elapsed = time.monotonic() - started
+                part["elapsed_s"] = round(elapsed, 1)
+                self.run.emit("tool.progress", id=part["id"], name=part["name"],
+                              elapsed_s=round(elapsed, 1), step=self.steps)
+                self._activity("run_touched", "tool")
+                self._maybe_flush()
+
         async def _run_one(index: int, call: Dict[str, str], part: Dict[str, Any], started: float) -> None:
+            ticker = asyncio.create_task(_progress(index, part, started))
             try:
                 result = await _execute(call)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # a tool bug must never kill the run
                 result = ToolResult.failure(f"{type(exc).__name__}: {exc}")
+            finally:
+                ticker.cancel()
+                try:
+                    await ticker
+                except (asyncio.CancelledError, Exception):  # noqa: B014 - a stuck ticker must not fail the call
+                    pass
             # The execution ledger: what ran, with which arguments, and what came back. It is the only
             # evidence of work, so it is written before the model ever sees the result and is persisted
             # with the message — the model's later claims are checked against it, not trusted.

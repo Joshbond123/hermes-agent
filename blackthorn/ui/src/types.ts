@@ -21,6 +21,8 @@ export interface ToolPart {
   exit_code?: number
   /** epoch ms when the run started this tool (live elapsed display) */
   startedAt?: number
+  /** seconds the server reports the tool has been running (progress heartbeat) */
+  elapsed_s?: number
 }
 export type Part = TextPart | ToolPart
 
@@ -123,6 +125,7 @@ export type ServerEvent =
   | (Base & { type: 'thinking'; state: 'start' | 'end'; ms?: number })
   | (Base & { type: 'text.delta'; text: string })
   | (Base & { type: 'tool.start'; id: string; name: string; summary: string; step?: number })
+  | (Base & { type: 'tool.progress'; id: string; name: string; elapsed_s: number; step?: number })
   | (Base & { type: 'tool.end'; id: string; name: string; status: 'ok' | 'error'; summary: string; duration_ms: number; error?: string | null; output?: string | null; sources?: Source[] | null; answer?: string | null; exit_code?: number | null; truncated?: boolean })
   | (Base & { type: 'notice'; level: 'info' | 'warn' | 'error'; text: string })
   | (Base & { type: 'internal.compaction'; stage: string; count?: number })

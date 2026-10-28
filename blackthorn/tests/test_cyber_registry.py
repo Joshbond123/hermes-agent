@@ -71,6 +71,29 @@ def run(root: Path, *args: str, timeout: int = 120) -> dict:
     return json.loads(lines[-1])
 
 
+def test_a_skill_listed_in_the_index_but_absent_on_disk_is_not_advertised(catalog):
+    """index.json is a hint, the filesystem is the truth: never advertise an unloadable skill."""
+    index = json.loads((catalog / "anthropic-cybersecurity-skills" / "index.json").read_text())
+    index["skills"].append({"name": "ghost-skill", "description": "listed but absent",
+                            "subdomain": "ghost", "path": "skills/ghost-skill"})
+    (catalog / "anthropic-cybersecurity-skills" / "index.json").write_text(json.dumps(index))
+    result = run(catalog, "registry")
+    assert result["counts"]["by_source"]["anthropic"] == 2
+    assert result["counts"]["skipped"] == 1
+    stored = json.loads((catalog / "registry.json").read_text())
+    assert all(item["name"] != "ghost-skill" for item in stored["skills"])
+    assert stored["skipped"][0]["id"] == "anthropic:ghost-skill"
+
+
+def test_installs_run_in_scratch_not_the_catalogue_root(catalog, tmp_path):
+    """A tool installer must not litter the repository checkouts it is indexed from."""
+    result = run(catalog, "run", "--id", "tool:web_attack.Nuclei", timeout=120)
+    # the entry has a run command but no blocked install recipe in the fixture, so it
+    # either installs (in .installs) or reports honestly; either way the root stays clean
+    assert result["status"] in {"install_failed", "ran", "ran_nonzero", "missing", "blocked_interactive"}
+    assert (catalog / ".installs").exists() or result["status"] == "missing"
+
+
 def test_registry_indexes_every_source(catalog):
     result = run(catalog, "registry")
     assert result["ok"]

@@ -5,8 +5,8 @@ Runs ON THE COMPUTER, never in model context. One registry covers all three
 upstream repositories, so the agent discovers and executes capabilities without
 a human choosing a skill:
 
-  anthropic   mukul975/Anthropic-Cybersecurity-Skills   818 defensive+offensive SKILL.md playbooks
-  claude-red  SnailSploit/Claude-Red                    79 offensive SKILL.md playbooks by category
+  anthropic   mukul975/Anthropic-Cybersecurity-Skills   811 loadable SKILL.md playbooks (of 818 indexed)
+  claude-red  SnailSploit/Claude-Red                    68 offensive SKILL.md playbooks by category
   hackingtool AKCodez/hackingtool-plugin                183 installable/runnable tools + wrapper scripts
 
 Design rules
@@ -49,6 +49,9 @@ SOURCES = {
 }
 REGISTRY = os.path.join(ROOT, "registry.json")
 INSTALLED = os.path.join(ROOT, "installed.json")
+# Tool installers clone and build; they run here so the repository checkouts stay pristine
+# (a previous run left a cloned tool at the catalogue root, which then polluted the index).
+SCRATCH = os.path.join(ROOT, ".installs")
 CLONE_TIMEOUT = 300
 MAX_READ = 20000
 MAX_OUTPUT = 20000
@@ -152,6 +155,23 @@ def _frontmatter(text: str) -> dict:
     return meta
 
 
+def _map_parallel(fn, items, workers: int = 16) -> list:
+    """Run ``fn`` over ``items`` with bounded concurrency, preserving input order.
+
+    Building the registry touches ~900 SKILL.md files. Reading them one at a time
+    dominated registry build time; a small thread pool (filesystem reads release the
+    GIL) keeps it bounded so a tiny sandbox is not overloaded.
+    """
+    items = list(items)
+    if not items:
+        return []
+    if len(items) == 1:
+        return [fn(items[0])]
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(items)))) as pool:
+        return list(pool.map(fn, items))
+
+
 def _skill_entry(source: str, skill_id: str, name: str, category: str, folder: str) -> dict:
     description = ""
     md = os.path.join(folder, "SKILL.md")
@@ -194,26 +214,34 @@ def build_registry() -> dict:
     skills: list[dict] = []
     index_path = path_of("anthropic", "index.json")
     index = _load(index_path, {"skills": []})
+    skipped: list[dict] = []
     for item in index.get("skills", []):
         name = str(item.get("name") or "")
         if not name:
+            continue
+        folder = _resolve_skill_folder("anthropic", name, str(item.get("path") or ""))
+        if not os.path.isfile(os.path.join(ROOT, folder, "SKILL.md")):
+            # The index can list a skill whose folder is absent from the checkout. Never
+            # advertise something that cannot be loaded: record it and leave it out.
+            skipped.append({"kind": "skill", "id": "anthropic:" + name, "reason": "SKILL.md absent"})
             continue
         skills.append({"kind": "skill", "id": "anthropic:" + name, "name": name, "source": "anthropic",
                        "category": str(item.get("subdomain") or item.get("domain") or "cybersecurity"),
                        "description": str(item.get("description") or "")[:400],
                        # Registry paths are always ROOT-relative, so a skill resolves the same
                        # way whichever repository it came from.
-                       "path": _resolve_skill_folder("anthropic", name, str(item.get("path") or ""))})
+                       "path": folder})
     red_root = path_of("claude-red", "Skills")
     if os.path.isdir(red_root):
         for category in sorted(os.listdir(red_root)):
             cat_dir = os.path.join(red_root, category)
             if not os.path.isdir(cat_dir):
                 continue
-            for name in sorted(os.listdir(cat_dir)):
-                folder = os.path.join(cat_dir, name)
-                if os.path.isfile(os.path.join(folder, "SKILL.md")):
-                    skills.append(_skill_entry("claude-red", f"claude-red:{name}", name, category, folder))
+            names = [n for n in sorted(os.listdir(cat_dir))
+                     if os.path.isfile(os.path.join(cat_dir, n, "SKILL.md"))]
+            skills.extend(_map_parallel(
+                lambda n, c=category, d=cat_dir: _skill_entry("claude-red", f"claude-red:{n}", n, c,
+                                                              os.path.join(d, n)), names))
     tools: list[dict] = []
     catalog_path = path_of("hackingtool", "plugins", "hackingtool", "data", "tools.json")
     catalog = _load(catalog_path, {"tools": []})
@@ -237,7 +265,9 @@ def build_registry() -> dict:
                             for name, meta in SOURCES.items()},
                 "counts": {"skills": len(skills), "tools": len(tools),
                            "by_source": {s: sum(1 for x in skills if x["source"] == s)
-                                         for s in ("anthropic", "claude-red")}},
+                                         for s in ("anthropic", "claude-red")},
+                           "skipped": len(skipped)},
+                "skipped": skipped[:50],
                 "skills": skills, "tools": tools}
     _save(REGISTRY, registry)
     return registry
@@ -432,7 +462,8 @@ def run_tool(name_or_id: str, args: str = "", timeout: int = 300, install: bool 
                 return {"ok": False, "id": item["id"], "status": "blocked_remote_script",
                         "error": "refusing to pipe a downloaded script into a shell", "cmd": cmd[:200]}
             clean = re.sub(r"\bsudo\s+", "", cmd)               # the guest runs as root
-            step = _run(clean, min(timeout, 1500), cwd=ROOT)
+            os.makedirs(SCRATCH, exist_ok=True)
+            step = _run(clean, min(timeout, 1500), cwd=SCRATCH)
             state[item["id"]] = {"status": "install_attempted", "at": time.time(),
                                  "cmd": clean[:200], "exit_code": step["exit_code"]}
             _save(INSTALLED, state)

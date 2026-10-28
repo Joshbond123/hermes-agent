@@ -21,6 +21,17 @@ describe('streaming reducer', () => {
     expect(s.sessions[0]).toMatchObject({ id: 'S1', title: 'hello' })
   })
 
+  it('a long-running tool keeps reporting progress instead of looking frozen', () => {
+    let s = started()
+    s = run(s, E({ type: 'tool.start', id: 't1', name: 'run_command', summary: '$ install', step: 1 }, 2))
+    s = run(s, E({ type: 'tool.progress', id: 't1', name: 'run_command', elapsed_s: 30, step: 1 }, 3))
+    s = run(s, E({ type: 'tool.progress', id: 't1', name: 'run_command', elapsed_s: 60, step: 1 }, 4))
+    const part = s.chat.messages.filter((m) => m.role === 'assistant')[0].parts[0]
+    expect(part).toMatchObject({ id: 't1', status: 'running', elapsed_s: 60 })
+    // a progress heartbeat means the run is alive: no spinner-from-silence state
+    expect(s.chat.run).not.toBeNull()
+  })
+
   it('builds ONE continuous assistant message with ordered text and tool parts', () => {
     let s = started()
     s = run(s, E({ type: 'text.delta', text: 'Let me ' }, 2))

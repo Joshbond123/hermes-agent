@@ -88,6 +88,13 @@ export function applyToMessage(msg: Message, ev: ServerEvent): Message {
       )
       return { ...msg, parts }
     }
+    case 'tool.progress': {
+      // A long-running tool reports elapsed time so the UI never looks frozen.
+      const parts: Part[] = msg.parts.map((p) =>
+        p.type === 'tool' && p.id === ev.id ? { ...p, elapsed_s: ev.elapsed_s } : p,
+      )
+      return { ...msg, parts, thinkingSince: null }
+    }
     case 'internal.compaction':
       return msg // context management is not an assistant reply or user-facing notice
     case 'notice':
