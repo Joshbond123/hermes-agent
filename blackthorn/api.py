@@ -600,7 +600,10 @@ async def computer_checkpoint(request: Request):
         result = await svc(request).computer.call("/computer/checkpoint", {}, timeout=230.0,
                                                   idempotent=False)
     except ToolError as exc:
-        raise _err(502, "checkpoint_failed", "The computer could not confirm the checkpoint.") from exc
+        # Report the computer's real reason (offline / storage / unsupported), not a
+        # generic failure: the operator needs to know what actually broke.
+        raise _err(502, "checkpoint_failed",
+                   "Checkpoint failed: " + (str(getattr(exc, "message", "") or exc) or "the computer did not confirm it")) from exc
     if not result.get("ok"):
         raise _err(502, "checkpoint_failed", str(result.get("error") or "Checkpoint not published")[:160])
     return result

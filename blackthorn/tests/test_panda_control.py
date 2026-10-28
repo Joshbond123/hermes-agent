@@ -309,3 +309,34 @@ async def test_status_honours_the_persisted_rotation(monkeypatch):
         await control._owned()
     assert key_b in used, "the persisted active key must be used, not the first env key"
     assert key_a not in used
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_is_implemented_and_reports_real_failures():
+    """The API endpoint used to 502 with a generic message because the adapter lacked the path."""
+    from blackthorn.tools.base import ToolError as _ToolError
+
+    class Mirror:
+        def __init__(self, ok):
+            self.ok, self.calls = ok, 0
+
+        async def sync(self, force=False):
+            self.calls += 1
+            if isinstance(self.ok, Exception):
+                raise self.ok
+            return self.ok
+
+    computer = object.__new__(PandaComputerClient)
+    computer.sandbox_id = "abc"
+    computer.store = None
+    computer.mirror = Mirror(True)
+    assert (await computer._call("/computer/checkpoint", {}, method="POST", timeout=30))["published"] is True
+
+    computer.mirror = Mirror(RuntimeError("github 403"))
+    with pytest.raises(_ToolError) as failed:
+        await computer._call("/computer/checkpoint", {}, method="POST", timeout=30)
+    assert "github 403" in str(failed.value), "the real cause must survive to the caller"
+
+    computer.mirror = Mirror(False)
+    with pytest.raises(_ToolError):
+        await computer._call("/computer/checkpoint", {}, method="POST", timeout=30)

@@ -332,4 +332,22 @@ class PandaComputerClient:
             return {"ok": result["ok"], "platform": "PandaStack Firecracker Linux",
                     "workspace": "/workspace (ephemeral; named writes backed by private GitHub releases)",
                     "gpu": "none", "details": result["output"][:400]}
+        if path == "/computer/checkpoint":
+            # Durability barrier: publish /workspace to the private drive and only
+            # report success when the upload was actually confirmed.
+            if self.mirror is None:
+                raise ToolError("unsupported", "No workspace mirror is configured, so a checkpoint cannot be published")
+            try:
+                published = bool(await self.mirror.sync(force=True))
+            except Exception as exc:
+                raise ToolError("storage", "Checkpoint upload failed: " + (str(exc) or type(exc).__name__)) from exc
+            digest = ""
+            if self.store is not None:
+                try:
+                    digest = str(await self.store.get_setting("pandastack_workspace_drive_digest") or "")
+                except Exception:
+                    digest = ""
+            if not published:
+                raise ToolError("storage", "The workspace was unchanged or the drive did not publish a new version")
+            return {"ok": True, "published": True, "sandbox_id": self.sandbox_id, "digest": digest}
         raise ToolError("unsupported", f"PandaStack adapter does not implement {path}")
