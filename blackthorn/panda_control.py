@@ -29,14 +29,18 @@ BASE = "https://api.pandastack.ai/v1/sandboxes"
 
 
 class PandaControl:
-    def __init__(self, store, http: httpx.AsyncClient, key=None):
+    def __init__(self, store, http: httpx.AsyncClient, key=None, pool=None):
         self.store = store
         self.http = http
         # ``key`` may be a string, a callable, or a PandaKeyPool (rotation-aware).
         # With no explicit key we use the whole configured pool, not just
         # PANDASTACK_API_KEY: one rate-limited account must not take the computer down.
         self._key_source = key
-        self._pool = key if hasattr(key, "ensure_active") else None
+        # A caller that holds the pool must hand it over explicitly: ``computer.key`` is a
+        # *string* (the active key), and passing that here silently downgraded the whole
+        # rotation to one account - the reason a single exhausted 429 took the computer
+        # down while three healthy keys sat unused.
+        self._pool = pool if pool is not None else (key if hasattr(key, "ensure_active") else None)
         if self._key_source is None:
             # Build the pool up front so every request (not only create) uses the
             # whole configured key set. One rate-limited account must not look
@@ -313,16 +317,33 @@ class PandaControl:
                 "display_status": "Ready · 1-hour idle TTL" if state == "running" else ("Hibernated until provider TTL — wakes on task" if state == "hibernated" else state)}
 
     async def _ensure_lifetime(self, sid: str):
-        life = await self._request("GET", "/" + sid + "/lifecycle")
-        if life.status_code != 200:
-            raise RuntimeError("PandaStack sandbox lifetime could not be verified")
+        # The lifecycle route 404s for a moment right after create (the record is not
+        # visible yet). Treating that as fatal deleted a perfectly healthy computer and
+        # told the operator "recovery failed", so poll briefly instead.
+        life = None
+        for attempt in range(4):
+            life = await self._request("GET", "/" + sid + "/lifecycle")
+            if life.status_code == 200:
+                break
+            await asyncio.sleep(1.5 * (attempt + 1))
+        if life is None or life.status_code != 200:
+            self.attempts.append(f"lifecycle: HTTP {getattr(life, 'status_code', '?')}")
+            return
         if life.json().get("persistent") is not True and int(life.json().get("ttl_seconds") or 0) < 3600:
-            change = await self._request("PATCH", "/" + sid + "/lifecycle", json={"ttl_seconds": 3600})
-            if change.status_code != 200:
-                raise RuntimeError("PandaStack one-hour idle TTL was refused")
-            check = await self._request("GET", "/" + sid + "/lifecycle")
-            if check.status_code != 200 or int(check.json().get("ttl_seconds") or 0) < 3600:
-                raise RuntimeError("PandaStack sandbox lifetime was not confirmed")
+            # Just-created records sometimes refuse the PATCH for a few seconds. Retry, and
+            # if the provider still says no, report it as a warning instead of deleting a
+            # healthy computer - the workspace lives in the drive, so a shorter TTL costs a
+            # restore, not the task.
+            for attempt in range(4):
+                change = await self._request("PATCH", "/" + sid + "/lifecycle", json={"ttl_seconds": 3600})
+                if change.status_code == 200:
+                    check = await self._request("GET", "/" + sid + "/lifecycle")
+                    if check.status_code == 200 and int(check.json().get("ttl_seconds") or 0) >= 3600:
+                        return
+                    if check.status_code == 200:
+                        life = check
+                await asyncio.sleep(1.5 * (attempt + 1))
+            self.attempts.append("lifecycle: one-hour TTL not granted")
 
     async def ensure_for_task(self):
         """Recreate only for a real task after provider expiry, never as an idle quota loop.
@@ -408,9 +429,22 @@ class PandaControl:
             # created, start_with_fallback() retries with the lab-style base VM and
             # reports which one is running, so the failure is never hidden.
             sid = await self.create(templates=("code-interpreter",))
-        except RuntimeError:
-            await self.store.set_setting(INTENT, "off")
-            raise
+        except RuntimeError as first:
+            # Never switch the owner's power intent off because one account ran out of
+            # quota: doing that left the whole studio "off" until a human flipped the
+            # switch back, even though three other keys were healthy. Invalidate the
+            # pool (so the exhausted account is not picked first again) and retry once
+            # before reporting failure - the intent stays exactly as the owner set it.
+            if self._pool is not None:
+                try:
+                    self._pool.invalidate()
+                    await self._rotate(reason="computer create failed")
+                except Exception:
+                    pass
+            try:
+                sid = await self.create(templates=("code-interpreter",))
+            except RuntimeError:
+                raise first from None
         await self.store.set_setting(SANDBOX, sid)
         # A successful create is not enough: execute harmless work on the live VM.
         try:

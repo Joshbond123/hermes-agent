@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import logging
 import pathlib
 import shlex
 import tempfile
@@ -20,6 +21,7 @@ from .tools.base import ToolError
 SNAPSHOT = "_system/blackthorn-workspace.tar.gz"
 DIGEST_KEY = "pandastack_workspace_drive_digest"
 RESTORED_KEY = "pandastack_workspace_restored_id"
+log = logging.getLogger(__name__)
 CHUNK = 16 * 1024 * 1024
 SCRATCH = "/workspace/.blackthorn-sync"
 # Rebuildable caches stay out of the durable checkpoint: the browser bundle alone is
@@ -93,14 +95,31 @@ class WorkspaceMirror:
                     await self.computer.store.set_setting(RESTORED_KEY, sid)
                     return
                 await self._run("mkdir -p " + shlex.quote(SCRATCH))
-                names = []
+                # A real workspace archive runs to hundreds of megabytes. Pushing the parts
+                # one after another over a 120 s-per-request transfer took minutes and looked
+                # like a hang, so recovery stalled on every replacement VM. Send a small,
+                # bounded number of parts concurrently and log progress: same bytes, same
+                # order, several times faster, and the operator can see it moving.
+                parts: list[tuple[str, bytes]] = []
                 with archive.open("rb") as stream:
                     for i, chunk in enumerate(iter(lambda: stream.read(CHUNK), b"")):
-                        name = f"part-{i:05d}"
-                        await self._transfer("PUT", f"{SCRATCH}/{name}", chunk)
-                        names.append(name)
-                if not names:
+                        parts.append((f"part-{i:05d}", chunk))
+                if not parts:
                     raise ToolError("storage", "Empty workspace snapshot")
+                total = sum(len(c) for _, c in parts)
+                done = 0
+                gate = asyncio.Semaphore(4)
+
+                async def push(name: str, chunk: bytes) -> None:
+                    nonlocal done
+                    async with gate:
+                        await self._transfer("PUT", f"{SCRATCH}/{name}", chunk)
+                        done += len(chunk)
+                        log.info("workspace restore %d%% (%d/%d MiB)", int(done * 100 / total),
+                                 done // (1024 * 1024), total // (1024 * 1024))
+
+                await asyncio.gather(*(push(name, chunk) for name, chunk in parts))
+                names = [name for name, _ in parts]
                 await self._run(f"cat {SCRATCH}/part-* | tar -xzf - -C /workspace && rm -f {SCRATCH}/part-*", timeout=300)
             await self.computer.store.set_setting(RESTORED_KEY, sid)
 

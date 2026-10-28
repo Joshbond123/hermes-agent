@@ -19,6 +19,7 @@ normal turn.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import json
@@ -128,6 +129,22 @@ def version_of(bundle: bytes, sources: Dict[str, str]) -> str:
     return f"v{FORMAT}-{stamp}-{digest}"
 
 
+def _normalise(result: Dict[str, Any]) -> Dict[str, Any]:
+    """One result shape for both transports.
+
+    The computer client reports ``output`` and the lab reports ``stdout``/``stderr``; a
+    restore that checks ``stdout`` therefore "failed" on a computer that had in fact
+    extracted 43 MB of catalog perfectly. Normalise once, here.
+    """
+    data = dict(result or {})
+    out = data.get("stdout")
+    if out is None:
+        out = data.get("output") or ""
+    data["stdout"] = str(out)
+    data.setdefault("stderr", "")
+    return data
+
+
 class _ComputerTarget:
     """Adapts the PandaStack computer client to the few operations install needs."""
 
@@ -135,12 +152,23 @@ class _ComputerTarget:
         self.computer = computer
 
     async def put(self, path: str, data: bytes) -> None:
-        response = await self.computer._request("PUT", "/fs", params={"path": path}, content=data)
-        if response.status_code not in (200, 201, 204):
-            raise CapabilityError(f"PandaStack file transfer returned HTTP {response.status_code}")
+        # A 7-43 MB bundle over a microVM's fs bridge sees occasional resets. One reset
+        # must not leave the computer without its catalog, so retry the same bytes.
+        last = ""
+        for attempt in range(4):
+            try:
+                response = await self.computer._request("PUT", "/fs", params={"path": path},
+                                                        content=data, timeout=300)
+                if response.status_code in (200, 201, 204):
+                    return
+                last = f"HTTP {response.status_code}"
+            except Exception as exc:  # noqa: BLE001 - transient transport failure
+                last = f"{type(exc).__name__}: {str(exc)[:120]}"
+            await asyncio.sleep(1.5 * (attempt + 1))
+        raise CapabilityError(f"PandaStack file transfer failed after retries ({last})")
 
     async def run(self, command: str, timeout: float = 300) -> Dict[str, Any]:
-        return await self.computer._exec(command, timeout=timeout)
+        return _normalise(await self.computer._exec(command, timeout=timeout))
 
 
 class _LabTarget:
@@ -153,7 +181,7 @@ class _LabTarget:
         await self.lab._put(path, data, sid=self.sid)
 
     async def run(self, command: str, timeout: float = 300) -> Dict[str, Any]:
-        return await self.lab._exec(command, timeout=timeout, sid=self.sid)
+        return _normalise(await self.lab._exec(command, timeout=timeout, sid=self.sid))
 
 
 class CapabilityManager:
@@ -276,8 +304,13 @@ class CapabilityManager:
         bundle = local.read_bytes()
         await adapter.run(f"mkdir -p {CATALOG_DIR} {BIN_DIR}", timeout=60)
         await adapter.put(BUNDLE_PATH, bundle)
+        # The bundle's members are the three source repos at the top level, so it must be
+        # extracted *into* the catalog root. Extracting it beside the root left the skills
+        # under /opt/blackthorn/<repo> and made the VERSION write fail on a fresh VM.
         extracted = await adapter.run(
-            f"cd /opt/blackthorn && rm -rf catalog && tar xzf catalog.tar.gz && "
+            f"rm -rf {CATALOG_DIR} && mkdir -p {CATALOG_DIR} && "
+            f"tar xzf {BUNDLE_PATH} -C {CATALOG_DIR} && "
+            f"ls {CATALOG_DIR} >/dev/null && "
             f"printf '%s' '{version}' > {VERSION_FILE} && chmod -R a+rX {CATALOG_DIR} && "
             f"du -sh {CATALOG_DIR} >/dev/null && echo restored", timeout=600)
         if "restored" not in str(extracted.get("stdout") or ""):

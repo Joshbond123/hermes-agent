@@ -154,3 +154,141 @@ def _async(value):
     async def inner():
         return value
     return inner()
+
+
+# --------------------------------------------------------------------------- deadlock guard
+async def test_the_wake_lock_can_be_re_entered_by_its_owner():
+    """ensure_ready() holds the lock while calling _exec, which takes it again.
+
+    A plain asyncio.Lock self-deadlocks there: a freshly created or replaced computer
+    hung on its first command with no network traffic and no error. The lock must let
+    its own task back in and still exclude other tasks.
+    """
+    from blackthorn.panda_computer import _ReentrantLock
+
+    lock = _ReentrantLock()
+    order: List[str] = []
+
+    async def outer():
+        async with lock:
+            order.append("outer")
+            async with lock:                    # nested: must not block
+                order.append("nested")
+            await asyncio.sleep(0.05)
+
+    async def other():
+        await asyncio.sleep(0.01)
+        async with lock:
+            order.append("other")
+
+    await asyncio.wait_for(asyncio.gather(outer(), other()), timeout=2)
+    assert order[0:2] == ["outer", "nested"] and order[-1] == "other", order
+
+
+# --------------------------------------------------------------------------- quota failover
+class QuotaPanda:
+    """A provider whose first account has burned today's transfer allowance."""
+
+    def __init__(self):
+        self.created: List[str] = []
+        self.deleted: List[str] = []
+        self.probes = 0
+
+    class _Resp:
+        def __init__(self, status, payload=None):
+            self.status_code = status
+            self._payload = payload if payload is not None else {}
+            self.text = ""
+
+        def json(self):
+            return self._payload
+
+    async def post(self, url, **kw):
+        key = (kw.get("headers") or {}).get("Authorization", "").split()[-1]
+        if url.endswith("/sandboxes"):
+            if key == "pds_spent":
+                return self._Resp(429, {"detail": "outbound data transfer allowance"})
+            sid = "12345678-1234-1234-1234-12345678" + ("0001" if key == "pds_spent" else "0002")
+            self.created.append(sid)
+            return self._Resp(201, {"id": sid})
+        if url.endswith("/lifecycle"):
+            return self._Resp(200, {"persistent": True, "ttl_seconds": 3600})
+        if url.endswith("/exec"):
+            self.probes += 1
+            return self._Resp(200, {"exit_code": 0, "stdout": "437", "stderr": ""})
+        return self._Resp(200, {})
+
+    async def get(self, url, **kw):
+        return self._Resp(200, [])          # nothing owned yet: start() will create one
+
+    async def request(self, method, url, **kw):
+        if url.endswith("/lifecycle"):
+            return self._Resp(200, {"persistent": True, "ttl_seconds": 3600})
+        if method == "GET":
+            return self._Resp(200, [])
+        if method == "DELETE":
+            self.deleted.append(url.rsplit("/", 1)[-1])
+            return self._Resp(204)
+        return await self.post(url, **kw)
+
+
+class MemoryStore:
+    def __init__(self):
+        self.values = {}
+
+    async def get_setting(self, key):
+        return self.values.get(key, "")
+
+    async def set_setting(self, key, value):
+        self.values[key] = value
+
+
+@pytest.mark.asyncio
+async def test_an_exhausted_account_never_switches_the_owners_power_off():
+    """A 429 on the first key used to set intent=off and strand the studio.
+
+    The pool must move to a healthy account and the owner's intent must survive the
+    failure untouched - that is the difference between "today's quota ran out on one
+    account" and "the computer is off".
+    """
+    from blackthorn.panda_control import INTENT, PandaControl
+
+    store = MemoryStore()
+    await store.set_setting(INTENT, "on")
+    panda = QuotaPanda()
+    control = PandaControl(store, panda, ["pds_spent", "pds_fresh"])
+    status = await control.start()
+    assert panda.created == ["12345678-1234-1234-1234-123456780002"], panda.created
+    assert await store.get_setting(INTENT) == "on", "the owner's power intent must not be flipped"
+    assert status is not None
+
+
+@pytest.mark.asyncio
+async def test_the_lifecycle_and_the_computer_both_hand_the_pool_over():
+    """A string key must never silently downgrade rotation to a single account."""
+    from blackthorn.panda_control import PandaControl
+
+    class Pool:
+        def __init__(self):
+            self.states = {"aaaa": type("S", (), {"fingerprint": "aaaa", "key": "pds_aaaa"})(),
+                           "bbbb": type("S", (), {"fingerprint": "bbbb", "key": "pds_bbbb"})()}
+            self.active = type("S", (), {"key": "pds_aaaa", "fingerprint": "aaaa"})()
+
+        async def ensure_active(self):
+            return self.active
+
+        async def restore_active(self):
+            return None
+
+        def active_key(self):
+            return "pds_aaaa"
+
+        def invalidate(self):
+            return None
+
+        async def rotate(self, reason=""):
+            return True
+
+    control = PandaControl(MemoryStore(), QuotaPanda(), "pds_aaaa", pool=Pool())
+    keys = await control._keys()
+    assert [fp for _, fp in keys] == ["aaaa", "bbbb"], "both accounts must stay in rotation"

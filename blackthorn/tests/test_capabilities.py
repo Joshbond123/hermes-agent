@@ -68,6 +68,7 @@ class FakeVM:
     """A VM that keeps files and shells out to a tiny command router."""
 
     def __init__(self, *, version: str = "", catalog_ok: bool = True):
+        self.extract_commands = []
         self.files = {}
         self.commands = []
         self.version = version
@@ -79,6 +80,8 @@ class FakeVM:
 
     async def run(self, command, timeout=300):
         self.commands.append(command)
+        if "tar xzf" in command:
+            self.extract_commands.append(command)
         if command.startswith("cat ") and "VERSION" in command:
             return {"stdout": self.version + "\n" if self.version else "", "stderr": "", "exit_code": 0}
         if "tar xzf" in command:
@@ -198,3 +201,19 @@ def test_lab_vm_target_uses_the_lab_transport(tmp_path):
     assert result["ok"] is True and result["kind"] == "lab"
     assert caps.BUNDLE_PATH in lab.puts
     assert all(c for c in lab.execs)
+
+
+def test_the_bundle_is_extracted_into_the_catalog_root_not_beside_it(tmp_path):
+    """A live restore failed once because the members landed in /opt/blackthorn/<repo>.
+
+    skillctl resolves skills from the catalog root, so the extraction target is part of
+    the contract: extract with -C <catalog>, then write VERSION inside it.
+    """
+    manager = _manager(tmp_path)
+    manager.publish()
+    vm = FakeVM()
+    asyncio.run(manager.ensure(vm))
+    joined = " ".join(vm.extract_commands)
+    assert "tar xzf" in joined and f"-C {caps.CATALOG_DIR}" in joined, joined
+    assert f"rm -rf {caps.CATALOG_DIR}" in joined, "a stale catalog must be replaced, not merged"
+    assert caps.VERSION_FILE in joined

@@ -48,6 +48,8 @@ SCHEMAS: Dict[str, Dict[str, Any]] = {
         "command": {"type": "string", "minLength": 1, "maxLength": 8000},
         "os": {"type": "string", "enum": ["auto", "linux", "windows"], "default": "auto"},
         "timeout_seconds": {"type": "integer", "minimum": 5, "maximum": 900, "default": 120},
+        "job": {"type": "string", "maxLength": 64,
+                "description": "a job handle returned by an earlier lab_exec; polls it instead of running a command"},
         "note": {"type": "string", "maxLength": 200, "default": ""}},
         "required": ["command"]},
     "lab_os": {"type": "object", "properties": {
@@ -238,13 +240,33 @@ async def lab_exec(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
     if lab is None:
         return _unconfigured()
     command = str(args.get("command") or "").strip()
-    if not command:
-        return ToolResult.failure("command is required")
+    job = str(args.get("job") or "").strip()
+    if not command and not job:
+        return ToolResult.failure("command (or a job handle) is required")
     timeout = int(args.get("timeout_seconds") or 120)
+    if job:
+        # Polling a long-running lab job (an install, a long dynamic run). It keeps running
+        # whether or not this call returns, so the provider edge can never time it out.
+        lab.hold()
+        try:
+            status = await lab.job_status(job)
+        finally:
+            lab.release()
+        return ToolResult(ok=True, content=redact(
+            f"job {job}: running={status['running']} exit={status['exit_code']}\n"
+            f"{clip(status.get('log_tail') or '', 4000)[0]}"),
+            summary=f"lab job {job} running={status['running']}", data=status)
+    long_job = timeout > 90
     lab.hold()                       # the idle watchdog must not close the lab mid-command
     try:
         if lab.session is None:
             await lab.open(reason=args.get("note") or "lab command")
+        if long_job:
+            handle = await lab.start_job(command, name="exec")
+            return ToolResult(ok=True, content=(
+                f"Started lab job {handle['job']} (pid {handle['pid']}). It keeps running after this call. "
+                f"Poll it with lab_exec(job=\"{handle['job']}\"). Long installs and long runs must be done this way."),
+                summary=f"lab job {handle['job']} started", data=handle)
         result = await lab.run_os(command, os_name=args.get("os") or "auto", timeout=timeout)
     finally:
         lab.release()

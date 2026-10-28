@@ -22,6 +22,40 @@ from .computer_drive import GitHubComputerDrive, _safe_path
 from .tools.base import ToolError
 
 
+
+class _ReentrantLock:
+    """An ``asyncio.Lock`` its owner can re-enter.
+
+    ``ensure_ready()`` holds the wake lock while it restores the drive catalog and the
+    workspace snapshot - and *both* of those call back into ``_request``, which takes the
+    same lock to verify/wake the VM. With a plain ``asyncio.Lock`` that is a self-deadlock:
+    the task waits for a lock it is already holding, so a new or replaced computer hung
+    forever on its first command (no network traffic, no error, no timeout). Re-entering
+    per task keeps mutual exclusion between *different* tasks while letting the owner's
+    own nested calls through.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._owner: Any = None
+        self._depth = 0
+
+    async def __aenter__(self):
+        task = asyncio.current_task()
+        if self._owner is task:
+            self._depth += 1
+            return self
+        await self._lock.acquire()
+        self._owner, self._depth = task, 1
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        self._depth -= 1
+        if self._depth <= 0:
+            self._owner, self._depth = None, 0
+            self._lock.release()
+
+
 class PandaComputerClient:
     def __init__(self, http: httpx.AsyncClient, *, api_key, sandbox_id: str = "",
                  github_token: str, repo: str = "jadeniran21/Computer-drive", store=None,
@@ -42,7 +76,7 @@ class PandaComputerClient:
         self.snapshot_path = _safe_path(snapshot_path)
         self.base = "https://api.pandastack.ai/v1/sandboxes/" + sandbox_id
         self._awake_checked_at = 0.0
-        self._awake_lock = asyncio.Lock()
+        self._awake_lock = _ReentrantLock()
         self._tool_lock = asyncio.Lock()
         # Drive-hosted skills/tools restored onto every new VM (set by build_services).
         self.capabilities = None
@@ -133,7 +167,8 @@ class PandaComputerClient:
             raise ToolError("offline", "The model/computer power control is off")
         async with self._awake_lock:
             try:
-                control = PandaControl(self.store, self.http, self.key)
+                control = PandaControl(self.store, self.http, self.key,
+                                       pool=self.key_pool or getattr(self, "_key_source", None))
                 owned = await control._owned()
                 current = await control.current(owned)
                 if current is None and owned:
@@ -156,7 +191,10 @@ class PandaComputerClient:
             except ToolError:
                 raise
             except Exception as exc:
-                raise ToolError("offline", "Computer task recovery failed; no command was run") from exc
+                # Never hide the provider's reason: "recovery failed" alone once cost an
+                # hour of guessing when the actual cause was a 429 on one account.
+                raise ToolError("offline", "Computer task recovery failed (%s: %s); no command was run"
+                                % (type(exc).__name__, str(exc)[:300])) from exc
         if self.mirror is not None:
             await self.mirror.restore(self.sandbox_id)
 

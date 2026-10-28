@@ -114,7 +114,8 @@ def build_services(settings: Settings, *, executor: Any = None, http: Any = None
                     tavily=TavilyKeys(store), computer=computer,
                     runs=runs,
                     gpu=GpuService(store), static_dir=static_dir or STATIC_DIR, fleet=fleet,
-                    key_pool=key_pool, lifecycle=lifecycle, lab=lab)
+                    key_pool=key_pool, lifecycle=lifecycle, lab=lab,
+                    capabilities=capabilities)
 
 
 

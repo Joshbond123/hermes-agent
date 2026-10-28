@@ -36,9 +36,24 @@ import subprocess
 import sys
 import time
 
-ROOT = os.environ.get("BLACKTHORN_SKILL_ROOT",
-                      "/workspace/security_catalog" if os.path.isdir("/workspace")
-                      else "/kaggle/working/blackthorn_workspace/security_catalog")
+def _default_root() -> str:
+    """Where the skill catalog lives on this machine.
+
+    The drive-hosted catalog (``blackthorn/capabilities.py``) installs to
+    ``/opt/blackthorn/catalog`` on every computer and lab VM; older computers kept a copy
+    under ``/workspace/security_catalog``. Prefer whichever actually carries an index so
+    a search never silently returns nothing.
+    """
+    for candidate in ("/opt/blackthorn/catalog", "/workspace/security_catalog",
+                      "/kaggle/working/blackthorn_workspace/security_catalog"):
+        if os.path.exists(os.path.join(candidate, "registry.json")):
+            return candidate
+    return "/opt/blackthorn/catalog" if os.path.isdir("/opt/blackthorn") else (
+        "/workspace/security_catalog" if os.path.isdir("/workspace")
+        else "/kaggle/working/blackthorn_workspace/security_catalog")
+
+
+ROOT = os.environ.get("BLACKTHORN_SKILL_ROOT") or _default_root()
 SOURCES = {
     "anthropic": {"repo": "https://github.com/mukul975/Anthropic-Cybersecurity-Skills",
                   "dir": "anthropic-cybersecurity-skills", "license": "Apache-2.0"},

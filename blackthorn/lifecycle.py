@@ -68,7 +68,8 @@ class SandboxLifecycle:
         key = getattr(self.computer, "key", None)
         if callable(key):
             key = key()
-        return PandaControl(self.store, self.computer.http, key)
+        pool = getattr(self.computer, "key_pool", None)
+        return PandaControl(self.store, self.computer.http, key, pool=pool)
 
     async def _sid(self) -> str:
         return str(await self.store.get_setting("pandastack_computer_sandbox_id") or "")
