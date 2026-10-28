@@ -340,3 +340,30 @@ async def test_checkpoint_is_implemented_and_reports_real_failures():
     computer.mirror = Mirror(False)
     with pytest.raises(_ToolError):
         await computer._call("/computer/checkpoint", {}, method="POST", timeout=30)
+
+
+@pytest.mark.asyncio
+async def test_a_completed_handover_does_not_leave_two_running_computers():
+    keep = "12345678-1234-1234-1234-123456789abc"
+    old = "aaaaaaaa-1111-1111-1111-111111111111"
+    rebuilding = "bbbbbbbb-2222-2222-2222-222222222222"
+    deletes = []
+
+    def answer(request):
+        if request.method == "DELETE":
+            deletes.append(request.url.path.rsplit("/", 1)[-1])
+            return httpx.Response(204)
+        if request.method == "GET" and request.url.path == "/v1/sandboxes":
+            return httpx.Response(200, json=[
+                {"id": keep, "status": "running", "metadata": {"purpose": PURPOSE, "role": "primary"}},
+                {"id": old, "status": "running", "metadata": {"purpose": PURPOSE, "role": "primary"}},
+                {"id": rebuilding, "status": "running", "metadata": {"purpose": PURPOSE, "role": "replacement"}},
+                {"id": "cccccccc-3333-3333-3333-333333333333", "status": "hibernated",
+                 "metadata": {"purpose": PURPOSE}},
+            ])
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(answer)) as client:
+        released = await PandaControl(Settings(), client, _Pool()).prune_stale(keep)
+    assert released == [old]
+    assert deletes == [old], "the live one, the incoming replacement and a hibernated VM stay"

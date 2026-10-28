@@ -429,6 +429,31 @@ class PandaControl:
             raise RuntimeError("PandaStack computer was created but its live exec probe failed; it was deleted")
         return await self.status()
 
+    async def prune_stale(self, current_id: str) -> list:
+        """Release live duplicates once a computer is confirmed running.
+
+        Handover overlap is protected by ``reconcile_extras``; this is the follow-up
+        that stops a completed handover from billing two machines at once.
+        """
+        if not current_id:
+            return []
+        owned = await self._owned()
+        released = []
+        for item in owned:
+            sid = str(item.get("id") or "")
+            if not sid or sid == current_id:
+                continue
+            if str(item.get("status") or "").lower() not in ("running", "created", "starting"):
+                continue
+            if str((item.get("metadata") or {}).get("role") or "") == ROLE_REPLACEMENT:
+                continue                       # an in-flight handover target
+            try:
+                await self.delete(sid)
+                released.append(sid)
+            except Exception:
+                continue
+        return released
+
     async def start_with_fallback(self, *, allow_lab_fallback: bool = True):
         """Start the production computer; rotate keys, then fall back to a lab-style VM.
 
@@ -444,6 +469,9 @@ class PandaControl:
             except Exception:
                 pass
             status.update({"role": ROLE_PRIMARY, "fallback": False, "last_error": ""})
+            sid = str(await self.store.get_setting(SANDBOX) or "")
+            if sid:
+                status["released_stale"] = await self.prune_stale(sid)
             return status
         except Exception as exc:
             primary_error = str(exc) or type(exc).__name__
