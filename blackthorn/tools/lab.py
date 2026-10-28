@@ -38,6 +38,7 @@ SCHEMAS: Dict[str, Dict[str, Any]] = {
         "sample_b64": {"type": "string", "maxLength": MAX_INLINE},
         "filename": {"type": "string", "minLength": 1, "maxLength": 120, "default": "sample.bin"},
         "timeout_seconds": {"type": "integer", "minimum": 5, "maximum": 600, "default": 60},
+        "network": {"type": "string", "enum": ["sealed", "live"], "default": "sealed"},
         "note": {"type": "string", "maxLength": 200, "default": ""}},
         "required": []},
     "lab_close": {"type": "object", "properties": {
@@ -143,8 +144,10 @@ async def lab_detonate(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
     except ValueError as exc:
         return ToolResult.failure(str(exc))
     note = args.get("note") or ""
+    network = "live" if str(args.get("network") or "").lower() == "live" else "sealed"
     result = await lab.detonate(sample=raw, filename=args.get("filename") or "sample.bin",
-                                timeout_s=int(args.get("timeout_seconds") or 60), note=note)
+                                timeout_s=int(args.get("timeout_seconds") or 60), note=note,
+                                network=network)
     report = result["report"]
     observed = {
         "exit_code": report.get("exit_code"),
@@ -167,8 +170,10 @@ async def lab_detonate(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
         saved = ""
     body = (f"Detonated {args.get('filename') or 'sample.bin'} in the sealed lab.\n"
             f"run: {result['run_id']} · sample came from {origin} · sha256 {result['record']['sample_sha256']}\n"
-            f"ran as {result['isolation'].get('sample_runs_as')} inside {result['isolation'].get('network_namespace')} "
-            f"with egress {result['isolation'].get('egress_inside_namespace')}\n"
+            f"ran as {result['isolation'].get('sample_runs_as')} with sample network = "
+            f"{result['record'].get('network')} (egress inside namespace "
+            f"{result['isolation'].get('egress_inside_namespace')}, lab VM internet "
+            f"{result['isolation'].get('internet')})\n"
             f"observed:\n{json.dumps(observed, indent=1)[:6000]}\n"
             f"report saved to {saved or '(not archived)'}\n"
             f"The lab is still ON; call lab_close when the analysis is finished.")

@@ -259,16 +259,39 @@ class GpuService:
             from .panda_control import PandaControl
             if self._store is None:
                 raise RuntimeError("PandaStack requires durable computer state")
-            if hasattr(d1, "turn_on_fleet") and accounts_from_env(os.environ):
-                out = await asyncio.to_thread(d1.turn_on_fleet, True)
-                model_result = out.get("model") or {}
-                if model_result.get("status") in ("unconfigured", "start_failed", "build_failed"):
-                    raise RuntimeError("Kaggle model start failed; PandaStack computer was not started")
-            else:
-                out = await asyncio.to_thread(d1.turn_on_kaggle_gpu, True)
             import httpx
-            async with httpx.AsyncClient(timeout=40) as client:
-                computer = await PandaControl(self._store, client).start()
+            # Computer first: a GPU session must never be paid for while the agent has
+            # no computer to drive. start_with_fallback rotates every configured key and
+            # only raises when no VM at all could be created, with the provider's reasons.
+            async with httpx.AsyncClient(timeout=60) as client:
+                control = PandaControl(self._store, client)
+                try:
+                    computer = await control.start_with_fallback()
+                except Exception as exc:
+                    raise RuntimeError(f"Computer did not start: {exc}") from exc
+            try:
+                if self._store is not None:
+                    await self._store.set_setting(BOOT_META_KEY, str(time.time()))
+            except Exception:
+                pass
+            try:
+                if hasattr(d1, "turn_on_fleet") and accounts_from_env(os.environ):
+                    out = await asyncio.to_thread(d1.turn_on_fleet, True)
+                    model_result = out.get("model") or {}
+                    if model_result.get("status") in ("unconfigured", "start_failed", "build_failed"):
+                        raise RuntimeError("Kaggle model status " + str(model_result.get("status")))
+                else:
+                    out = await asyncio.to_thread(d1.turn_on_kaggle_gpu, True)
+            except Exception as exc:
+                # Never leave a billable computer behind for a GPU that did not come up.
+                async with httpx.AsyncClient(timeout=40) as client:
+                    try:
+                        await PandaControl(self._store, client).stop()
+                    except Exception:
+                        pass
+                raise RuntimeError(
+                    f"Computer started ({computer.get('role') or computer.get('status')}) but the Kaggle GPU "
+                    f"did not: {exc}. The computer was powered off again.") from exc
             status = await self.status(refresh=False)
             status["computer"] = computer
             status["fleet"] = {"model": out.get("model", out), "computer": {"status": computer.get("status")}}

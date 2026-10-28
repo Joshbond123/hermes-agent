@@ -170,3 +170,95 @@ async def test_reconciliation_never_deletes_a_sandbox_a_handover_depends_on():
     released = await Control(store, None, "test-key").reconcile_extras()
     assert released == ["leaked-vm"], released
     assert set(deleted) == {"leaked-vm"}
+
+
+# --------------------------------------------------------------------------- failover
+class _Pool:
+    """Two keys: the first is rate-limited for creation, the second works."""
+
+    def __init__(self, bad="bad-key", good="good-key"):
+        from blackthorn.panda_keys import KeyState, fingerprint
+        self.states = {fingerprint(bad): KeyState(fingerprint(bad), bad),
+                       fingerprint(good): KeyState(fingerprint(good), good)}
+        self._active = fingerprint(bad)
+        self.rotations = []
+        self._good = good
+        self._bad = bad
+
+    @property
+    def active(self):
+        return self.states[self._active]
+
+    def active_key(self):
+        return self.active.key
+
+    async def restore_active(self):
+        return None
+
+    async def ensure_active(self):
+        return self.active
+
+    async def rotate(self, *, reason, seconds_left=None):
+        self._active = next(fp for fp, st in self.states.items() if st.key == self._good)
+        self.rotations.append(reason)
+        return self.active
+
+
+@pytest.mark.asyncio
+async def test_create_rotates_to_a_working_key_instead_of_failing_on_429():
+    own = "12345678-1234-1234-1234-123456789abc"
+    seen = []
+
+    def answer(request):
+        key = request.headers.get("authorization", "").replace("Bearer ", "")
+        seen.append(key)
+        if request.method == "POST" and request.url.path == "/v1/sandboxes":
+            if key == "bad-key":
+                return httpx.Response(429, json={"error": "rate limited"})
+            return httpx.Response(201, json={"id": own, "status": "running"})
+        if request.url.path == f"/v1/sandboxes/{own}/lifecycle":
+            return httpx.Response(200, json={"ttl_seconds": 3600, "persistent": False})
+        return httpx.Response(200, json=[])
+
+    settings = Settings()
+    pool = _Pool()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(answer)) as client:
+        control = PandaControl(settings, client, pool)
+        sid = await control.create()
+    assert sid == own
+    assert seen[0] == "bad-key" and "good-key" in seen, "the second account must be tried"
+    assert any("429" in reason for reason in pool.rotations)
+
+
+@pytest.mark.asyncio
+async def test_start_falls_back_to_a_lab_style_vm_and_reports_the_real_error():
+    lab_sid = "abcdefab-1234-1234-1234-123456789abc"
+    created = []
+
+    def answer(request):
+        if request.method == "POST" and request.url.path == "/v1/sandboxes":
+            payload = json.loads(request.content)
+            created.append(payload)
+            if payload["template"] == "code-interpreter":
+                return httpx.Response(500, json={"error": "template unavailable"})
+            return httpx.Response(201, json={"id": lab_sid, "status": "running"})
+        if request.url.path.endswith("/lifecycle"):
+            return httpx.Response(200, json={"ttl_seconds": 3600, "persistent": False})
+        if request.url.path == f"/v1/sandboxes/{lab_sid}/exec":
+            return httpx.Response(200, json={"exit_code": 0, "stdout": "437\n", "stderr": ""})
+        if request.method == "GET" and request.url.path == "/v1/sandboxes":
+            if not created:
+                return httpx.Response(200, json=[])
+            return httpx.Response(200, json=[{"id": lab_sid, "status": "running",
+                                              "metadata": {"purpose": PURPOSE, "role": "lab-fallback"}}])
+        return httpx.Response(200, json={})
+
+    settings = Settings()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(answer)) as client:
+        control = PandaControl(settings, client, _Pool(good="good-key"))
+        status = await control.start_with_fallback()
+    assert status["fallback"] is True
+    assert "lab-fallback" in status["role"]
+    assert status["fallback_reason"], "the primary failure must be reported, not hidden"
+    assert settings.values[SANDBOX] == lab_sid
+    assert any(p["template"] == "base" for p in created), "the lab template is the stand-in"

@@ -21,6 +21,9 @@ PURPOSE = "blackthorn-production-computer"
 ROLE_PRIMARY = "primary"
 ROLE_REPLACEMENT = "replacement"
 RECOVERY_LOCK = "pandastack_computer_recovery_lock"
+# Which production computer is live, and why the normal one could not be used.
+ROLE_SETTING = "pandastack_computer_live_role"
+LAST_ERROR = "pandastack_computer_last_error"
 UUID = re.compile(r"^[0-9a-fA-F-]{32,36}$")
 BASE = "https://api.pandastack.ai/v1/sandboxes"
 
@@ -30,7 +33,43 @@ class PandaControl:
         self.store = store
         self.http = http
         # ``key`` may be a string, a callable, or a PandaKeyPool (rotation-aware).
-        self._key_source = key if key is not None else os.environ.get("PANDASTACK_API_KEY", "")
+        # With no explicit key we use the whole configured pool, not just
+        # PANDASTACK_API_KEY: one rate-limited account must not take the computer down.
+        self._key_source = key
+        self._pool = key if hasattr(key, "ensure_active") else None
+        self.attempts: list[str] = []
+
+    async def _keys(self):
+        """Every usable key, active first. Yields (key, fingerprint)."""
+        if self._pool is None and self._key_source is None:
+            from .panda_keys import PandaKeyPool, fingerprint
+            pool = PandaKeyPool.from_env(self.http, self.store)
+            if pool is None:
+                single = (os.environ.get("PANDASTACK_API_KEY") or "").strip()
+                return [(single, fingerprint(single))] if single else []
+            self._pool = pool
+        if self._pool is not None:
+            try:
+                await self._pool.restore_active()
+                active = await self._pool.ensure_active()
+            except Exception:
+                active = self._pool.active
+            out = [(active.key, active.fingerprint)]
+            for state in self._pool.states.values():
+                if state.fingerprint != active.fingerprint:
+                    out.append((state.key, state.fingerprint))
+            return out
+        source = self._key_source
+        value = str(source() if callable(source) else (source or "")).strip()
+        return [(value, value[-4:])] if value else []
+
+    async def _rotate(self, reason: str) -> bool:
+        if self._pool is None:
+            return False
+        try:
+            return bool(await self._pool.rotate(reason=reason))
+        except Exception:
+            return False
 
     @property
     def key(self) -> str:
@@ -149,17 +188,55 @@ class PandaControl:
         body = response.json()
         return body if isinstance(body, dict) else {}
 
-    async def create(self, role: str = ROLE_PRIMARY, metadata: dict | None = None) -> str:
-        payload = {"template": "code-interpreter", "ttl_seconds": 3600,
-                   "metadata": {"purpose": PURPOSE, "role": role, **(metadata or {})}}
-        response = await self._request("POST", json=payload)
-        if response.status_code != 201:
-            raise RuntimeError(f"PandaStack create returned HTTP {response.status_code}")
-        sid = str(response.json().get("id") or "")
-        if not UUID.fullmatch(sid):
-            raise RuntimeError("PandaStack create returned no valid sandbox ID; reconcile before retry")
-        await self._ensure_lifetime(sid)
-        return sid
+    CREATE_TEMPLATES = ("code-interpreter", "base")
+
+    async def create(self, role: str = ROLE_PRIMARY, metadata: dict | None = None,
+                     templates: tuple = None) -> str:
+        """Create a computer, rotating keys and templates instead of failing on one 429.
+
+        Every attempt is recorded in ``self.attempts`` so a real failure reports the
+        provider's status per account rather than a single opaque error.
+        """
+        self.attempts = []
+        templates = templates or self.CREATE_TEMPLATES
+        keys = await self._keys()
+        if not keys:
+            raise RuntimeError("PandaStack is not configured (no API key)")
+        tried: set[str] = set()
+        while keys:
+            key, fp = keys[0]
+            if fp in tried:
+                keys = keys[1:]
+                continue
+            tried.add(fp)
+            key_level_failure = ""
+            for template in templates:
+                payload = {"template": template, "ttl_seconds": 3600,
+                           "metadata": {"purpose": PURPOSE, "role": role, **(metadata or {})}}
+                try:
+                    response = await self.http.post(
+                        BASE, json=payload, headers={"Authorization": "Bearer " + key}, timeout=60)
+                except httpx.HTTPError as exc:
+                    self.attempts.append(f"{fp}/{template}: network {type(exc).__name__}")
+                    key_level_failure = key_level_failure or f"network {type(exc).__name__}"
+                    continue
+                if response.status_code == 201:
+                    sid = str(response.json().get("id") or "")
+                    if not UUID.fullmatch(sid):
+                        raise RuntimeError("PandaStack create returned no valid sandbox ID; reconcile before retry")
+                    await self._ensure_lifetime(sid)
+                    return sid
+                detail = (response.text or "").strip().replace("\n", " ")[:160]
+                self.attempts.append(f"{fp}/{template}: HTTP {response.status_code}{(' ' + detail) if detail else ''}")
+                if response.status_code in (401, 402, 403, 429):
+                    key_level_failure = f"provider HTTP {response.status_code}"
+                    break                      # this account is unusable right now
+            if key_level_failure:
+                await self._rotate(reason="computer create: " + key_level_failure)
+                keys = await self._keys()      # re-read: the pool may have a new active key
+                continue
+            keys = keys[1:]                    # provider-side problem, not the account: next key
+        raise RuntimeError("PandaStack could not create a computer: " + "; ".join(self.attempts))
 
     async def delete(self, sid: str) -> bool:
         response = await self._request("DELETE", "/" + sid)
@@ -204,7 +281,16 @@ class PandaControl:
         state = str(item.get("status") or "unknown").lower()
         # This account cannot enable provider persistence (403). The supported idle
         # TTL is one hour; named GitHub-backed writes outlive sandbox expiry.
+        role = ""
+        last_error = ""
+        try:
+            role = str(await self.store.get_setting(ROLE_SETTING) or "")
+            last_error = str(await self.store.get_setting(LAST_ERROR) or "")
+        except Exception:
+            pass
         return {"status": state, "online": state in ("running", "hibernated"),
+                "role": role or ROLE_PRIMARY, "fallback": role == "lab-fallback",
+                "last_error": last_error,
                 "host": "PandaStack", "storage": "private GitHub Computer-drive",
                 "environment": "Firecracker CPU microVM · 1-hour idle TTL", "transport": "PandaStack API",
                 "display_status": "Ready · 1-hour idle TTL" if state == "running" else ("Hibernated until provider TTL — wakes on task" if state == "hibernated" else state)}
@@ -301,7 +387,10 @@ class PandaControl:
         # The current PandaStack tier rejects persistent=true. Request the
         # supported one-hour idle TTL explicitly; never pretend the VM is durable.
         try:
-            sid = await self.create()
+            # The production computer is a code-interpreter VM. If that cannot be
+            # created, start_with_fallback() retries with the lab-style base VM and
+            # reports which one is running, so the failure is never hidden.
+            sid = await self.create(templates=("code-interpreter",))
         except RuntimeError:
             await self.store.set_setting(INTENT, "off")
             raise
@@ -312,6 +401,49 @@ class PandaControl:
         if probe.status_code != 200 or probe.json().get("exit_code") != 0 or str(probe.json().get("stdout", "")).strip() != "437":
             raise RuntimeError("PandaStack computer was created but its live exec probe failed")
         return await self.status()
+
+    async def start_with_fallback(self, *, allow_lab_fallback: bool = True):
+        """Start the production computer; rotate keys, then fall back to a lab-style VM.
+
+        Returns the real status dict. ``fallback`` is true only when the normal
+        computer could not be created and the lab VM stood in for it, and
+        ``fallback_reason`` always carries the provider's actual error.
+        """
+        try:
+            status = await self.start()
+            try:
+                await self.store.set_setting(ROLE_SETTING, ROLE_PRIMARY)
+                await self.store.set_setting(LAST_ERROR, "")
+            except Exception:
+                pass
+            status.update({"role": ROLE_PRIMARY, "fallback": False, "last_error": ""})
+            return status
+        except Exception as exc:
+            primary_error = str(exc) or type(exc).__name__
+            try:
+                await self.store.set_setting(LAST_ERROR, primary_error[:500])
+            except Exception:
+                pass
+            if not allow_lab_fallback:
+                raise RuntimeError(primary_error) from exc
+            # Lab-style stand-in: same provider, base template, internet, but tagged as the computer.
+            sid = ""
+            try:
+                sid = await self.create(role="lab-fallback", templates=("base",),
+                                        metadata={"fallback": "true", "primary_error": primary_error[:180]})
+            except Exception as lab_exc:
+                raise RuntimeError(
+                    "No computer could be started. Primary: " + primary_error +
+                    ". Lab fallback: " + (str(lab_exc) or type(lab_exc).__name__)) from lab_exc
+            await self.store.set_setting(SANDBOX, sid)
+            await self.store.set_setting(ROLE_SETTING, "lab-fallback")
+            if not await self.probe(sid):
+                await self.delete(sid)
+                raise RuntimeError("A lab-style VM was created but could not execute work; it was deleted. Primary error: " + primary_error)
+            status = await self.status()
+            status.update({"role": "lab-fallback", "fallback": True, "fallback_reason": primary_error,
+                           "last_error": primary_error})
+            return status
 
     async def stop(self):
         """Power off CPU/network; unsaved VM state survives only until provider TTL."""
