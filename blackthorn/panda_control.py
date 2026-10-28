@@ -37,17 +37,22 @@ class PandaControl:
         # PANDASTACK_API_KEY: one rate-limited account must not take the computer down.
         self._key_source = key
         self._pool = key if hasattr(key, "ensure_active") else None
+        if self._key_source is None:
+            # Build the pool up front so every request (not only create) uses the
+            # whole configured key set. One rate-limited account must not look
+            # like "PandaStack is not configured".
+            try:
+                from .panda_keys import PandaKeyPool
+                self._pool = PandaKeyPool.from_env(http, store)
+            except Exception:
+                self._pool = None
         self.attempts: list[str] = []
 
     async def _keys(self):
         """Every usable key, active first. Yields (key, fingerprint)."""
         if self._pool is None and self._key_source is None:
-            from .panda_keys import PandaKeyPool, fingerprint
-            pool = PandaKeyPool.from_env(self.http, self.store)
-            if pool is None:
-                single = (os.environ.get("PANDASTACK_API_KEY") or "").strip()
-                return [(single, fingerprint(single))] if single else []
-            self._pool = pool
+            single = (os.environ.get("PANDASTACK_API_KEY") or "").strip()
+            return [(single, single[-4:])] if single else []
         if self._pool is not None:
             try:
                 await self._pool.restore_active()
@@ -73,6 +78,11 @@ class PandaControl:
 
     @property
     def key(self) -> str:
+        if self._pool is not None:
+            try:
+                return str(self._pool.active_key())
+            except Exception:
+                pass
         source = self._key_source
         if callable(source):
             return str(source())

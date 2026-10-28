@@ -262,3 +262,22 @@ async def test_start_falls_back_to_a_lab_style_vm_and_reports_the_real_error():
     assert status["fallback_reason"], "the primary failure must be reported, not hidden"
     assert settings.values[SANDBOX] == lab_sid
     assert any(p["template"] == "base" for p in created), "the lab template is the stand-in"
+
+
+@pytest.mark.asyncio
+async def test_pool_is_used_for_every_request_not_just_creation(monkeypatch):
+    """Regression: with only PANDASTACK_API_KEY_* configured, listing must still authenticate."""
+    key = "pds_pooled_key_for_tests"
+    monkeypatch.delenv("PANDASTACK_API_KEY", raising=False)
+    monkeypatch.setenv("PANDASTACK_API_KEY_2", key)
+    seen = []
+
+    def answer(request):
+        seen.append(request.headers.get("authorization", ""))
+        return httpx.Response(200, json=[])
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(answer)) as client:
+        control = PandaControl(Settings(), client)
+        assert control.key == key, "the pool's active key must back every request"
+        assert await control._owned() == []
+    assert seen and seen[0] == "Bearer " + key
