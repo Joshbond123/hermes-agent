@@ -210,7 +210,7 @@ class PandaComputerClient:
 
     async def _request(self, method: str, path: str, *, timeout: float = 60,
                        payload: Any = None, params: dict | None = None,
-                       content: bytes | None = None) -> httpx.Response:
+                       content: bytes | None = None, retries: int = 2) -> httpx.Response:
         if self.store is not None:
             from .panda_control import INTENT, SANDBOX
             if await self.store.get_setting(INTENT) != "on":
@@ -242,17 +242,34 @@ class PandaComputerClient:
                         self._awake_checked_at = time.monotonic()
                     except httpx.HTTPError as exc:
                         raise ToolError("offline", "PandaStack computer state could not be checked") from exc
-        try:
-            response = await self.http.request(method, self.base + path,
-                headers={"Authorization": "Bearer " + self.key},
-                json=payload, params=params, content=content, timeout=timeout)
+        # The sandbox API resets connections under load ("Server disconnected without
+        # sending a response"). A single reset used to fail the user's command outright,
+        # so a capability search on a perfectly healthy computer reported "could not be
+        # reached". Retry a bounded number of times; retries=0 for calls that must not run
+        # twice (a non-idempotent command).
+        attempts = max(0, int(retries)) + 1
+        response = None
+        last: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                response = await self.http.request(method, self.base + path,
+                    headers={"Authorization": "Bearer " + self.key},
+                    json=payload, params=params, content=content, timeout=timeout)
+            except httpx.TransportError as exc:
+                last = exc
+                if attempt + 1 >= attempts:
+                    break
+                await asyncio.sleep(1.5 * (attempt + 1))
+                continue
             if response.status_code in (401, 402, 403, 429) and await self._rotate_after(response.status_code):
                 # A rotated key must be used for exactly one retry; never loop.
                 response = await self.http.request(method, self.base + path,
                     headers={"Authorization": "Bearer " + self.key},
                     json=payload, params=params, content=content, timeout=timeout)
-        except httpx.HTTPError as exc:
-            raise ToolError("offline", "PandaStack computer could not be reached") from exc
+            break
+        if response is None:
+            raise ToolError("offline", "PandaStack computer could not be reached (%s); retried %d times"
+                            % (type(last).__name__ if last else "no response", attempts - 1))
         if response.status_code == 404 and path == "":
             raise ToolError("session_expired", "PandaStack sandbox no longer exists")
         if response.status_code in (401, 403):
@@ -271,12 +288,12 @@ class PandaComputerClient:
     def _relative(value: str) -> str:
         return _safe_path(value.removeprefix("/workspace/") if value.startswith("/workspace/") else value)
 
-    async def _exec(self, command: str, *, timeout: float = 60) -> dict:
+    async def _exec(self, command: str, *, timeout: float = 60, retries: int = 2) -> dict:
         # The guest is bounded by ``timeout`` itself: an HTTP timeout does not kill a
         # process inside the VM, so a runaway command would otherwise keep burning CPU.
         seconds = min(3600, max(1, int(timeout)))
         bounded = f"timeout -k 5 {seconds} sh -c {shlex.quote(command)}"
-        response = await self._request("POST", "/exec", timeout=seconds + 15,
+        response = await self._request("POST", "/exec", timeout=seconds + 15, retries=retries,
             payload={"cmd": bounded, "timeout_seconds": seconds})
         if response.status_code != 200:
             raise ToolError("rejected", f"PandaStack execution returned HTTP {response.status_code}")
@@ -310,11 +327,14 @@ class PandaComputerClient:
         if path in ("/computer/exec", "/computer/write_file"):
             async with self._tool_lock:
                 await self.ensure_ready()
-                return await self._call(path, payload or {}, method=method, timeout=timeout)
+                return await self._call(path, payload or {}, method=method, timeout=timeout,
+                                         idempotent=idempotent)
         await self.ensure_ready()
-        return await self._call(path, payload or {}, method=method, timeout=timeout)
+        return await self._call(path, payload or {}, method=method, timeout=timeout,
+                                idempotent=idempotent)
 
-    async def _call(self, path: str, payload: dict, *, method: str, timeout: float) -> dict:
+    async def _call(self, path: str, payload: dict, *, method: str, timeout: float,
+                    idempotent: bool = True) -> dict:
         if path == "/computer/exec":
             cwd = str(payload.get("cwd") or ".")
             if cwd == ".":
@@ -328,7 +348,8 @@ class PandaComputerClient:
                      "PYTHONPATH=/workspace/.packages:${PYTHONPATH:-} "
                      "PATH=/workspace/.packages/bin:$PATH; ")
             command = "cd " + shlex.quote(cwd) + " && " + setup + str(payload.get("command") or "")
-            result = await self._exec(command, timeout=float(payload.get("timeout_seconds") or timeout))
+            result = await self._exec(command, timeout=float(payload.get("timeout_seconds") or timeout),
+                                      retries=2 if idempotent else 0)
             if self.mirror is not None:
                 await self.mirror.sync()  # even a non-zero command may have changed files
             return result

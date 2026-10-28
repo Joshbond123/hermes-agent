@@ -447,13 +447,24 @@ class PandaControl:
                 raise first from None
         await self.store.set_setting(SANDBOX, sid)
         # A successful create is not enough: execute harmless work on the live VM.
-        try:
-            probe = await self._request("POST", "/" + sid + "/exec",
-                                        json={"cmd": "python3 -c 'print(19*23)'", "timeout_seconds": 15})
-            good = probe.status_code == 200 and probe.json().get("exit_code") == 0 and \
-                str(probe.json().get("stdout", "")).strip() == "437"
-        except Exception:
-            good = False
+        # A brand-new microVM is not necessarily exec-ready in the same instant it is
+        # reported "running", so the probe is repeated before the VM is called broken.
+        # Without this a perfectly good computer was deleted and the owner was told
+        # "task recovery failed" for a two-second boot delay.
+        good = False
+        for attempt in range(4):
+            try:
+                probe = await self._request("POST", "/" + sid + "/exec",
+                                            json={"cmd": "python3 -c 'print(19*23)'",
+                                                  "timeout_seconds": 20})
+                body = probe.json() if probe.status_code == 200 else {}
+                good = probe.status_code == 200 and body.get("exit_code") == 0 and \
+                    str(body.get("stdout", "")).strip() == "437"
+            except Exception:
+                good = False
+            if good:
+                break
+            await asyncio.sleep(2.0 * (attempt + 1))
         if not good:
             # Do not leave an unverified, billable VM behind.
             try:

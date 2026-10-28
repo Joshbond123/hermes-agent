@@ -292,3 +292,42 @@ async def test_the_lifecycle_and_the_computer_both_hand_the_pool_over():
     control = PandaControl(MemoryStore(), QuotaPanda(), "pds_aaaa", pool=Pool())
     keys = await control._keys()
     assert [fp for _, fp in keys] == ["aaaa", "bbbb"], "both accounts must stay in rotation"
+
+
+@pytest.mark.asyncio
+async def test_a_reset_connection_is_retried_instead_of_failing_the_command():
+    """The provider resets connections under load; one reset must not fail a healthy task.
+
+    A live run lost its capability search to exactly this: the VM was fine, the connection
+    was not, and the agent was told "could not be reached".
+    """
+    import httpx
+    from blackthorn.panda_computer import PandaComputerClient
+
+    class FlakyClient(httpx.AsyncClient):
+        pass
+
+    attempts = {"n": 0}
+
+    class Transport:
+        async def handle_async_request(self, request):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise httpx.RemoteProtocolError("Server disconnected without sending a response")
+            return httpx.Response(200, json={"stdout": "ok", "stderr": "", "exit_code": 0},
+                                  request=request)
+
+    http = httpx.AsyncClient(transport=Transport())
+    client = object.__new__(PandaComputerClient)
+    client.http = http
+    client.key = "pds_test"
+    client.base = "https://api.pandastack.ai/v1/sandboxes/abc"
+    client.store = None
+    client._awake_checked_at = 0.0
+    result = await PandaComputerClient._request(client, "POST", "/exec", payload={"cmd": "true"})
+    assert result.status_code == 200 and attempts["n"] == 2
+
+    # A non-idempotent call must not silently run twice.
+    attempts["n"] = 0
+    with pytest.raises(Exception):
+        await PandaComputerClient._request(client, "POST", "/exec", payload={"cmd": "true"}, retries=0)
