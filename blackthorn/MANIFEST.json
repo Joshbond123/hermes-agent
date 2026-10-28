@@ -22,7 +22,7 @@
   "blackthorn/lifecycle.py": "bbe2ef28f2f3ee2de4b4476bdddafeb1dec77ea87488de4bc745c14b4327440d",
   "blackthorn/llm.py": "1620acd8e5331c7438a27712394f7df156dfe0474403dec9ce5ae788af18627e",
   "blackthorn/malware_analyzer.py": "83187436a3a5fa9a6537120bc4e8c35213367e7b4245d909b38d04161c7e3fb4",
-  "blackthorn/malware_lab.py": "b6dd73c2fab37d87c566aca24cfb4fb18c4e70105799a23fbbed05b00fc47ae6",
+  "blackthorn/malware_lab.py": "34a8e41848033dcef01045bb5987fce76f85bedfbf7f157ed4574694db2c52ca",
   "blackthorn/panda_computer.py": "174e0d7f48a0b5e6590d93c636b80ea5c67afc2bc2152cf607cedc439aa90478",
   "blackthorn/panda_control.py": "282897b8c9282a5f2e1d0eb21602d09c70806e1d0aa15255c5913230b3a8a36c",
   "blackthorn/panda_keys.py": "fde441578a087a31a151a0e9696a03f540f984bef489e0350102cc405d78a4d1",
