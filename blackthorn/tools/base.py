@@ -21,6 +21,8 @@ _REDACTIONS: Tuple[Tuple[re.Pattern, str], ...] = tuple((re.compile(p, re.I | re
     (r"\btvly-[A-Za-z0-9_-]{16,}", "***"),
     (r"\bgh[pousr]_[A-Za-z0-9]{20,}", "***"),
     (r"\bgithub_pat_[A-Za-z0-9_]{20,}", "***"),
+    (r"\bpds_[A-Za-z0-9]{16,}", "***"),
+    (r"\bsrvc_[A-Za-z0-9]{16,}", "***"),
     (r"\bAKIA[0-9A-Z]{16}\b", "***"),
     (r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", "[private key removed]"),
 ))

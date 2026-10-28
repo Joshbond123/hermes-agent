@@ -87,6 +87,9 @@ class FakeBackend:
         self.exec_output = "hello from the remote computer\n"
         self.exec_code = 0
         self.exec_delay = 0.0
+        # Fault injection for the provider: each entry is an HTTP status returned by the next
+        # /computer/* call instead of the normal answer (503 = expired/unreachable VM).
+        self.computer_fail: List[int] = []
         self.fetch_text = "Example Domain. This domain is for use in illustrative examples."
         self.files: Dict[str, str] = {}
         self.app = self._build()
@@ -161,6 +164,9 @@ class FakeBackend:
                 return JSONResponse({"detail": "Invalid or missing API Key."}, status_code=401)
             body = await request.json() if request.method == "POST" else {}
             self.computer_calls.append({"name": name, "body": body})
+            if self.computer_fail:
+                status = self.computer_fail.pop(0)
+                return JSONResponse({"detail": "Provider VM expired while idle"}, status_code=status)
             if name == "exec":
                 if self.exec_delay:
                     await asyncio.sleep(self.exec_delay)

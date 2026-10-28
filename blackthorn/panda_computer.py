@@ -63,6 +63,17 @@ class PandaComputerClient:
     def key(self, value) -> None:
         self._key_source = value
 
+    def invalidate(self) -> None:
+        """Drop cached session/key health after a failure that never reached the guest."""
+        pool = self.key_pool if self.key_pool is not None else (
+            self._key_source if hasattr(self._key_source, "invalidate") else None)
+        if pool is not None:
+            try:
+                pool.invalidate()
+            except Exception:
+                pass
+        self._awake_checked_at = 0.0
+
     async def _rotate_after(self, status_code: int, message: str = "") -> bool:
         """Switch to another authorized key after an auth/quota rejection."""
         pool = self.key_pool if self.key_pool is not None else (
@@ -101,11 +112,17 @@ class PandaComputerClient:
             raise ToolError("offline", "The model/computer power control is off")
         async with self._awake_lock:
             try:
-                owned = await PandaControl(self.store, self.http, self.key)._owned()
-                if len(owned) > 1:
-                    raise ToolError("offline", "More than one managed computer needs reconciliation")
-                if not owned or str(owned[0].get("status") or "").lower() == "hibernated":
-                    await PandaControl(self.store, self.http, self.key).ensure_for_task()
+                control = PandaControl(self.store, self.http, self.key)
+                owned = await control._owned()
+                current = await control.current(owned)
+                if current is None and owned:
+                    # Ambiguous set (e.g. a sandbox leaked by a crashed worker): release the
+                    # extras so exactly one production computer remains, then adopt it.
+                    await control.reconcile_extras(owned)
+                    owned = await control._owned()
+                    current = await control.current(owned)
+                if current is None or str(current.get("status") or "").lower() == "hibernated":
+                    await control.ensure_for_task()
                 sid = await self.store.get_setting(SANDBOX)
                 if not sid:
                     raise ToolError("offline", "Computer recovery did not confirm a sandbox")
@@ -184,7 +201,9 @@ class PandaComputerClient:
             raise ToolError("quota", "PandaStack quota is exhausted for the active key")
         if response.status_code == 429:
             raise ToolError("rate_limited", "PandaStack is rate limiting the active key")
-        if response.status_code in (502, 503, 504):
+        if response.status_code in (502, 503, 504, 522, 524):
+            # 524 is the edge giving up on a long request while the guest keeps working;
+            # it is a provider/timeout condition, never a tool-logic rejection.
             raise ToolError("provider", f"PandaStack is temporarily unavailable (HTTP {response.status_code})")
         return response
 
@@ -193,13 +212,21 @@ class PandaComputerClient:
         return _safe_path(value.removeprefix("/workspace/") if value.startswith("/workspace/") else value)
 
     async def _exec(self, command: str, *, timeout: float = 60) -> dict:
-        response = await self._request("POST", "/exec", timeout=timeout + 15,
-            payload={"cmd": command, "timeout_seconds": min(3600, max(1, int(timeout)))})
+        # The guest is bounded by ``timeout`` itself: an HTTP timeout does not kill a
+        # process inside the VM, so a runaway command would otherwise keep burning CPU.
+        seconds = min(3600, max(1, int(timeout)))
+        bounded = f"timeout -k 5 {seconds} sh -c {shlex.quote(command)}"
+        response = await self._request("POST", "/exec", timeout=seconds + 15,
+            payload={"cmd": bounded, "timeout_seconds": seconds})
         if response.status_code != 200:
             raise ToolError("rejected", f"PandaStack execution returned HTTP {response.status_code}")
         result = response.json()
         output = str(result.get("stdout") or "") + str(result.get("stderr") or "")
         code = result.get("exit_code")
+        if code == 124:
+            raise ToolError("timeout", f"Command exceeded its {seconds}s budget inside the computer")
+        if code == 137:
+            raise ToolError("timeout", "Command was killed by the sandbox after exceeding its resource budget")
         return {"ok": code == 0, "exit_code": code, "output": output}
 
     def _save(self, content: bytes, logical: str):

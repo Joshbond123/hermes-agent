@@ -22,19 +22,26 @@ DIGEST_KEY = "pandastack_workspace_drive_digest"
 RESTORED_KEY = "pandastack_workspace_restored_id"
 CHUNK = 16 * 1024 * 1024
 SCRATCH = "/workspace/.blackthorn-sync"
+# Rebuildable caches stay out of the durable checkpoint: the browser bundle alone is
+# ~1.5 GB and would be re-uploaded to GitHub on every mutation. They are rehydrated by
+# the tool that needs them (``browse.py::_ensure_runtime``) after a replacement.
+EXCLUDES = tuple(x for x in (os.environ.get("BLACKTHORN_WORKSPACE_EXCLUDES")
+                             or ".blackthorn-sync,.cache,__pycache__,.npm,_cacache,.tmp").split(",") if x)
+MAX_ARCHIVE_BYTES = int(os.environ.get("BLACKTHORN_WORKSPACE_MAX_BYTES") or 1_600 * 1024 * 1024)
 
 FINGERPRINT = r'''python3 - <<'PY'
 import hashlib,json,os,stat
+SKIP=set(__EXCLUDES__)
 items=[]
 for root,dirs,files in os.walk('/workspace',followlinks=False):
-    dirs[:]=sorted(d for d in dirs if not (root == '/workspace' and d == '.blackthorn-sync'))
+    dirs[:]=sorted(d for d in dirs if d not in SKIP)
     for name in sorted(files+dirs):
         p=os.path.join(root,name)
         try: s=os.lstat(p)
         except FileNotFoundError: continue
         items.append((os.path.relpath(p,'/workspace'),s.st_mode,s.st_size,s.st_mtime_ns))
 print(hashlib.sha256(json.dumps(items,sort_keys=True,separators=(',',':')).encode()).hexdigest())
-PY'''
+PY'''.replace("__EXCLUDES__", repr(list(EXCLUDES)))
 
 
 class WorkspaceMirror:
@@ -107,14 +114,19 @@ class WorkspaceMirror:
         if not self.computer.store:
             return False
         async with self._lock:
-            fingerprint = (await self._run(FINGERPRINT, timeout=90)).strip().splitlines()[-1]
+            fingerprint = (await self._run(FINGERPRINT, timeout=120)).strip().splitlines()[-1]
             previous = await self.computer.store.get_setting(DIGEST_KEY)
             if fingerprint == previous:
                 return bool(force and previous)
+            excludes = " ".join(f"--exclude='./{name}'" for name in EXCLUDES)
             await self._run(f"mkdir -p {SCRATCH} && rm -f {SCRATCH}/part-* {SCRATCH}/current.tar.gz && "
-                            f"tar --sort=name --exclude='./.blackthorn-sync' -czf {SCRATCH}/current.tar.gz "
+                            f"tar --sort=name {excludes} -czf {SCRATCH}/current.tar.gz "
                             f"-C /workspace . && split -b {CHUNK} -d -a 5 {SCRATCH}/current.tar.gz {SCRATCH}/part-",
-                            timeout=300)
+                            timeout=600)
+            size = int((await self._run(f"stat -c %s {SCRATCH}/current.tar.gz", timeout=60)).strip() or 0)
+            if size > MAX_ARCHIVE_BYTES:
+                raise ToolError("storage", f"Workspace checkpoint is {size} bytes, over the "
+                                           f"{MAX_ARCHIVE_BYTES} byte ceiling; move large assets out of /workspace")
             with tempfile.TemporaryDirectory() as temp:
                 archive = pathlib.Path(temp) / "workspace.tar.gz"
                 with archive.open("wb") as dst:

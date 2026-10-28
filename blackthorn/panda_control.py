@@ -26,10 +26,24 @@ BASE = "https://api.pandastack.ai/v1/sandboxes"
 
 
 class PandaControl:
-    def __init__(self, store, http: httpx.AsyncClient, key: str | None = None):
+    def __init__(self, store, http: httpx.AsyncClient, key=None):
         self.store = store
         self.http = http
-        self.key = key if key is not None else os.environ.get("PANDASTACK_API_KEY", "")
+        # ``key`` may be a string, a callable, or a PandaKeyPool (rotation-aware).
+        self._key_source = key if key is not None else os.environ.get("PANDASTACK_API_KEY", "")
+
+    @property
+    def key(self) -> str:
+        source = self._key_source
+        if callable(source):
+            return str(source())
+        if hasattr(source, "active_key"):
+            return str(source.active_key())
+        return str(source or "")
+
+    @key.setter
+    def key(self, value) -> None:
+        self._key_source = value
 
     def _headers(self):
         if not self.key:
@@ -74,6 +88,32 @@ class PandaControl:
         if len(owned) == 1:
             return owned[0]
         return None
+
+    async def reconcile_extras(self, owned: list | None = None) -> list:
+        """Delete duplicate managed sandboxes that are not the stored one.
+
+        A worker that crashed during creation can leak a billable VM. The stored ID is
+        authoritative; anything else carrying our purpose marker is released.
+        """
+        owned = await self._owned() if owned is None else owned
+        stored = await self.store.get_setting(SANDBOX) if self.store is not None else ""
+        keep = next((x for x in owned if x.get("id") == stored), None)
+        if keep is None:
+            # No stored ID: keep the newest and release the rest.
+            ordered = sorted(owned, key=lambda x: str(x.get("created_at") or ""))
+            keep = ordered[-1] if ordered else None
+            if keep is not None:
+                await self.store.set_setting(SANDBOX, keep["id"])
+        released = []
+        for item in owned:
+            if keep is not None and item.get("id") == keep.get("id"):
+                continue
+            try:
+                await self.delete(item["id"])
+                released.append(item.get("id"))
+            except Exception:
+                continue
+        return released
 
     async def describe(self, sid: str) -> dict:
         response = await self._request("GET", "/" + sid)
@@ -174,7 +214,11 @@ class PandaControl:
         owned = await self._owned()
         item = await self.current(owned)
         if item is None and owned:
-            raise RuntimeError("Multiple production computers need reconciliation")
+            # Two sandboxes without a matching stored ID: release the extras and adopt
+            # the survivor instead of stalling the whole task on reconciliation.
+            await self.reconcile_extras(owned)
+            owned = await self._owned()
+            item = await self.current(owned)
         if item is not None:
             sid = item["id"]
             if await self.store.get_setting(SANDBOX) != sid:
@@ -207,7 +251,10 @@ class PandaControl:
             if await self.current(owned) is not None:
                 return await self.status()
             if owned:
-                raise RuntimeError("Multiple production computers need reconciliation")
+                await self.reconcile_extras(owned)
+                owned = await self._owned()
+                if await self.current(owned) is not None:
+                    return await self.status()
         raise RuntimeError("Timed out waiting for computer recovery lease")
 
     async def start(self):
@@ -217,7 +264,9 @@ class PandaControl:
         owned = await self._owned()
         item = await self.current(owned)
         if item is None and owned:
-            raise RuntimeError("Duplicate PandaStack computers require manual reconciliation")
+            await self.reconcile_extras(owned)
+            owned = await self._owned()
+            item = await self.current(owned)
         if item is not None:
             sid = item["id"]
             await self.store.set_setting(SANDBOX, sid)

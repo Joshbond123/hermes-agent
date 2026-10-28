@@ -72,7 +72,9 @@ class Page:
         self.body, self.clicked, self.filled, self.pressed = "", [], {}, []
         self.scrolled, self.screenshots, self.history = 0, [], []
         self.mouse = _Mouse(self)
-        self.accessibility = _Accessibility(self)
+        # Newer Playwright builds removed Page.accessibility entirely; the controller has
+        # to fall back, and this switch reproduces that build.
+        self.accessibility = None if os.environ.get("FAKE_BROWSER_NO_A11Y") == "1" else _Accessibility(self)
     def set_default_timeout(self, ms): self.timeout = ms
     def goto(self, url, wait_until=None, timeout=None):
         if "slow.example" in url and wait_until == "load":
@@ -114,6 +116,8 @@ class Page:
     def locator(self, selector):
         class _Wrap:
             def __init__(self, loc): self.first = loc
+            def aria_snapshot(self, timeout=None):
+                return '- heading "Main"\n- link "More"'
         return _Wrap(_Locator(self, selector))
     def wait_for_timeout(self, ms): pass
     def screenshot(self, path=None, full_page=False):
@@ -125,9 +129,20 @@ class Page:
         return _Info(_Download("x", getattr(self, "_download", b"data")))
     def close(self): self.context.closed_pages.append(self)
 
+class _RequestResponse:
+    ok = True
+    status = 200
+    def body(self): return b"file-body"
+
+
+class _Request:
+    def get(self, url, timeout=None): return _RequestResponse()
+
+
 class Context:
     def __init__(self, **kw):
         self.kw, self.pages, self.closed_pages, self.saved = kw, [], [], None
+        self.request = None if os.environ.get("FAKE_BROWSER_NO_REQUEST") == "1" else _Request()
         self.pages.append(Page(self))
     def new_page(self):
         page = Page(self); self.pages.append(page); return page
@@ -315,3 +330,37 @@ def test_unknown_action_is_rejected():
 def test_missing_selector_is_reported():
     result = run({"url": "https://example.com", "action": "click"}, expect_ok=False)
     assert result["ok"] is False and "selector" in result["error"]
+
+
+def test_download_uses_the_request_context_and_saves_bytes(site, environment, monkeypatch):
+    monkeypatch.chdir(environment)
+    result = run({"url": site + "/report.txt", "action": "download", "download_path": "downloads/report.txt"})
+    assert result["source"] == "request"
+    assert result["bytes"] == len(b"file-body")
+    assert (environment / "downloads" / "report.txt").read_bytes() == b"file-body"
+
+
+def test_download_falls_back_to_the_event_when_request_api_is_absent(site, environment, monkeypatch):
+    monkeypatch.setenv("FAKE_BROWSER_NO_REQUEST", "1")
+    monkeypatch.chdir(environment)
+    result = run({"url": site + "/report.txt", "action": "download", "download_path": "downloads/event.txt"})
+    assert result["source"] == "event"
+    # the stub's download event carries its own payload, independent of the page body
+    assert (environment / "downloads" / "event.txt").read_bytes() == b"data"
+
+
+def test_accessibility_falls_back_when_playwright_dropped_the_page_api(site, monkeypatch):
+    monkeypatch.setenv("FAKE_BROWSER_NO_A11Y", "1")
+    result = run({"url": site + "/", "action": "accessibility", "depth": 2})
+    assert result["accessibility_source"] == "aria"
+    assert "heading" in json.dumps(result["accessibility"]).lower()
+
+
+def test_unknown_action_is_rejected_without_launching_a_browser(site):
+    result = run({"url": site + "/", "action": "teleport"}, expect_ok=False)
+    assert result["error_kind"] == "bad_request"
+
+
+def test_file_scheme_is_refused(site):
+    result = run({"url": "file:///etc/passwd", "action": "open"}, expect_ok=False)
+    assert result["error_kind"] == "bad_request"

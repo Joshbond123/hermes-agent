@@ -1,0 +1,86 @@
+"""End-to-end regression for the two production defects, over real HTTP/SSE.
+
+Defect 1 — ``Provider VM expired while idle; the next computer tool call will
+create a replacement and restore the GitHub workspace.``
+    The provider answered 503/offline, the tool never ran, yet the failure was
+    charged against the "repeated identical tool call" budget, so the agent
+    aborted the task instead of reconnecting.
+
+Defect 2 — ``Stopped using tools (repeated identical tool calls); writing the
+answer from what was gathered.``
+    A recoverable outage looked exactly like a stalled model.
+
+These tests drive the real app: a scripted model server, the real tool registry,
+the real agent loop, and a fake computer that can fail the way PandaStack does.
+"""
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+
+from .fakes import call, finish, say
+
+STOP_NOTICE = "Stopped using tools"
+
+
+def run_command(cmd: str, cid: str = "c1"):
+    return call("run_command", {"command": cmd}, cid=cid)
+
+
+async def test_expired_vm_is_recovered_without_truncating_the_task(stack):
+    """Two provider failures, then success: the command's real output reaches the model."""
+    stack.backend.computer_fail = [503, 503]
+    stack.backend.queue(
+        [run_command("uname -a")],
+        [*say("The computer reports its kernel once the replacement is live."), finish("stop")],
+    )
+    out = await stack.stream({"message": "check the kernel"})
+
+    notices = [e for e in out.of("notice") if STOP_NOTICE in str(e.get("text", ""))]
+    assert notices == [], "an expired VM must not end the run"
+    assert out.end.get("status") in (None, "stop", "complete", "done")
+
+    exec_calls = [c for c in stack.backend.computer_calls if c["name"] == "exec"]
+    assert len(exec_calls) >= 3, "the runtime must retry the call that never reached the tool"
+    assert "kernel" in out.text.lower()
+
+
+async def test_recovery_attempts_are_bounded_and_reported_honestly(stack):
+    """When the provider stays down, the model is told it is infrastructure — with a way forward."""
+    stack.backend.computer_fail = [503] * 12
+    stack.backend.queue(
+        [run_command("uname -a")],
+        [*say("I could not reach the computer; here is the blocker and the next step."), finish("stop")],
+    )
+    out = await stack.stream({"message": "check the kernel"})
+
+    notices = [e for e in out.of("notice") if STOP_NOTICE in str(e.get("text", ""))]
+    assert notices == [], "persistent infrastructure failure is not a repeat-call stall"
+    exec_calls = [c for c in stack.backend.computer_calls if c["name"] == "exec"]
+    assert 1 < len(exec_calls) <= 6, "retries must be bounded, not unbounded"
+    assert out.text.strip(), "the run must still produce an answer"
+
+
+async def test_a_genuine_repeat_after_success_is_still_stopped(stack):
+    """The stall detector keeps working: identical successful calls are not free work."""
+    # One identical call per model step, seven steps in a row: a stalled loop.
+    stack.backend.queue(*[[run_command("uname -a", cid=f"c{i}")] for i in range(1, 8)],
+                        [*say("Done with what I have."), finish("stop")])
+    out = await stack.stream({"message": "run it repeatedly"})
+    notices = [e for e in out.of("notice") if STOP_NOTICE in str(e.get("text", ""))]
+    assert notices, "an unchanged repeated call must still be stopped"
+    exec_calls = [c for c in stack.backend.computer_calls if c["name"] == "exec"]
+    assert len(exec_calls) <= 4, "the duplicate budget must cap real executions"
+
+
+async def test_tool_results_after_recovery_are_marked_ok_in_the_ledger(stack):
+    stack.backend.computer_fail = [503]
+    stack.backend.queue(
+        [run_command("uname -a")],
+        [*say("Recovered and completed."), finish("stop")],
+    )
+    out = await stack.stream({"message": "check the kernel"})
+    ends = out.of("tool.end")
+    assert ends and all(e.get("status") == "ok" for e in ends), ends
+    assert out.text.strip()

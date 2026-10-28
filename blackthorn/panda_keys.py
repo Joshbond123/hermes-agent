@@ -128,6 +128,7 @@ class PandaKeyPool:
         self.states: Dict[str, KeyState] = {fingerprint(k): KeyState(fingerprint(k), k) for k in self.keys}
         self._active = fingerprint(self.keys[0])
         self.rotations: List[Dict[str, Any]] = []
+        self._checked_at = 0.0
 
     # ------------------------------------------------------------------ construction
     @classmethod
@@ -147,6 +148,12 @@ class PandaKeyPool:
         return cls(keys, http, store, threshold_s=threshold_s)
 
     # ------------------------------------------------------------------ state
+    def invalidate(self) -> None:
+        """Mark cached health/quota numbers stale so the next check re-reads the provider."""
+        for state in self.states.values():
+            state.checked_at = 0.0
+        self._checked_at = 0.0
+
     def key_for(self, fp: str) -> Optional[KeyState]:
         return self.states.get(fp)
 

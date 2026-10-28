@@ -440,13 +440,29 @@ class AgentRun:
                     and self._last_infra_signature not in self.seen_infra)
 
     async def _prepare_recovery(self) -> None:
-        """Hooks that must run before retrying a call that never reached the tool logic."""
+        """Hooks that must run before retrying a call that never reached the tool logic.
+
+        A stale session usually means the cached route and the credential that built it
+        are both suspect, so the resolver cache and the key pool are invalidated here
+        before the next attempt negotiates a fresh computer.
+        """
         try:
             invalidate = getattr(self.deps.resolver, "invalidate", None)
             if invalidate is not None:
                 invalidate()
         except Exception:  # a resolver that cannot be invalidated must not block recovery
             pass
+        computer = getattr(self.deps, "computer", None)
+        for target in (computer, getattr(computer, "key_pool", None), getattr(self.deps, "key_pool", None)):
+            invalidate = getattr(target, "invalidate", None)
+            if invalidate is None:
+                continue
+            try:
+                result = invalidate()
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception:
+                continue
 
     async def _recover_computer(self) -> bool:
         """Reconnect to (or replace) the computer and verify it with a live call.

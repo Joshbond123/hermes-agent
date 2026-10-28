@@ -36,6 +36,7 @@ import base64
 import json
 import os
 import pathlib
+import subprocess
 import sys
 import time
 
@@ -86,6 +87,115 @@ def load_request() -> dict:
 
 
 # ------------------------------------------------------------------ runtime
+def _disk_dir(preferred: str, minimum_gb: float = 2.0) -> str:
+    """Pick a directory with room for a ~1.5 GB browser download.
+
+    A sandbox's ``/tmp`` is frequently a small tmpfs; downloading the browser there
+    fails with ``No space left on device`` halfway through the fetch. Any candidate
+    that does not have room is skipped in favour of one that does.
+    """
+    import shutil
+    candidates = [preferred, os.environ.get("BLACKTHORN_BROWSER_TMP", ""),
+                  "/workspace/.cache", os.path.join(os.path.expanduser("~"), ".cache"), "/var/tmp", "/tmp"]
+    best, best_free = "", -1.0
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            os.makedirs(candidate, exist_ok=True)
+            free = shutil.disk_usage(candidate).free / (1024 ** 3)
+        except OSError:
+            continue
+        if free >= minimum_gb:
+            return candidate
+        if free > best_free:
+            best, best_free = candidate, free
+    return best or "/tmp"
+
+
+def _prepare_disk(notes: list) -> str:
+    """Point pip/camoufox at disk-backed scratch space and return the cache root."""
+    # An explicit override always wins (operators pin the cache to a mounted volume);
+    # otherwise pick whichever candidate actually has room for the browser bundle.
+    cache_root = os.environ.get("BLACKTHORN_BROWSER_CACHE", "") or _disk_dir("/workspace/.cache")
+    tmp_root = os.environ.get("BLACKTHORN_BROWSER_TMP", "") or _disk_dir(cache_root)
+    for target in (os.path.join(tmp_root, "tmp"), os.path.join(cache_root, "pip")):
+        try:
+            os.makedirs(target, exist_ok=True)
+        except OSError:
+            continue
+    os.environ["TMPDIR"] = os.path.join(tmp_root, "tmp")
+    os.environ["XDG_CACHE_HOME"] = cache_root
+    os.environ.setdefault("PIP_NO_INPUT", "1")
+    os.environ.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+    notes.append(f"browser scratch at {os.environ['TMPDIR']} (cache {cache_root})")
+    return cache_root
+
+
+# Firefox needs these at load time. A bare microVM image ships almost none of them, and
+# the failure without them is an opaque ``XPCOMGlueLoad error`` from inside the bundle.
+LINUX_LIBS = (
+    "libgtk-3-0t64", "libdbus-glib-1-2", "libxt6t64", "libasound2t64", "libx11-xcb1",
+    "libxtst6", "libnss3", "libnspr4", "libgbm1", "libxrandr2", "libxcomposite1",
+    "libxdamage1", "libxfixes3", "libatk1.0-0t64", "libatk-bridge2.0-0t64", "libcups2t64",
+    "libpango-1.0-0", "libcairo2", "libatspi2.0-0t64", "libxkbcommon0", "libdrm2",
+)
+
+
+def _browser_binary(cache_root: str) -> str:
+    for root in (pathlib.Path(cache_root) / "camoufox",
+                 pathlib.Path(os.path.expanduser("~/.cache/camoufox"))):
+        if not root.exists():
+            continue
+        for hit in sorted(root.rglob("camoufox-bin")):
+            return str(hit)
+    return ""
+
+
+def _missing_libs(binary: str) -> list:
+    """Shared objects the browser binary cannot resolve (precise, unlike a name guess)."""
+    if not binary:
+        return []
+    try:
+        proc = _run(["ldd", binary], 60)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    missing = []
+    for line in (proc.stdout or "").splitlines():
+        if "not found" in line:
+            name = line.split("=>")[0].strip()
+            if name and name not in missing:
+                missing.append(name)
+    return missing
+
+
+def _install_linux_libs(binary: str) -> tuple:
+    """Install the Firefox shared-library set. Returns (ok, detail)."""
+    _run(["apt-get", "update", "-qq"], 600, env={"DEBIAN_FRONTEND": "noninteractive"})
+    proc = _run(["apt-get", "install", "-y", "-qq", *LINUX_LIBS], 900,
+                env={"DEBIAN_FRONTEND": "noninteractive"})
+    remaining = _missing_libs(binary)
+    if remaining:
+        return False, "browser libraries still missing: " + ", ".join(remaining[:6]) + \
+                      " (" + (proc.stderr or "")[-160:] + ")"
+    return True, "restored the Firefox system libraries"
+
+
+def _browser_present(cache_root: str) -> bool:
+    roots = [pathlib.Path(cache_root) / "camoufox",
+             pathlib.Path(os.path.expanduser("~/.cache/camoufox"))]
+    for root in roots:
+        if root.exists() and any(root.rglob("camoufox-bin")):
+            return True
+    return False
+
+
+def _run(cmd: list, timeout: int, env: dict | None = None):
+    """Run a bootstrap command, capturing output (tests replace this hook)."""
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                          env={**os.environ, **(env or {})})
+
+
 def _ensure_runtime(notes: list) -> None:
     """Rehydrate rebuildable browser dependencies after a sandbox replacement.
 
@@ -94,31 +204,30 @@ def _ensure_runtime(notes: list) -> None:
     error from the browser launch, not as a mysterious crash.
     """
     import importlib.util
-    import subprocess
     if os.environ.get("BLACKTHORN_BROWSER_NO_BOOTSTRAP") == "1":
         notes.append("runtime bootstrap skipped by configuration")
         return
+    cache_root = _prepare_disk(notes)
     if importlib.util.find_spec("camoufox") is None:
-        proc = subprocess.run([sys.executable, "-m", "pip", "install", "--no-input",
-                               "--disable-pip-version-check", "camoufox"],
-                              capture_output=True, text=True, timeout=900)
+        proc = _run([sys.executable, "-m", "pip", "install", "--no-input",
+                     "--disable-pip-version-check", "camoufox"], 900)
         if proc.returncode != 0:
             raise RuntimeError("camoufox package could not be installed: " + (proc.stderr or "")[-200:])
         notes.append("restored Camoufox Python package")
-    cache = pathlib.Path(os.path.expanduser("~/.cache/camoufox"))
-    if not cache.exists() or not any(cache.rglob("camoufox-bin")):
-        proc = subprocess.run([sys.executable, "-m", "camoufox", "fetch"],
-                              capture_output=True, text=True, timeout=1200)
+    if not _browser_present(cache_root):
+        proc = _run([sys.executable, "-m", "camoufox", "fetch"], 1800,
+                    env={"XDG_CACHE_HOME": cache_root})
         if proc.returncode != 0:
-            raise RuntimeError("camoufox browser download failed: " + (proc.stderr or "")[-200:])
+            raise RuntimeError("camoufox browser download failed: " + ((proc.stderr or proc.stdout or "")[-300:]))
         notes.append("downloaded Camoufox browser after replacement")
     if sys.platform.startswith("linux"):
-        import ctypes.util
-        if ctypes.util.find_library("gtk-3") is None:
-            proc = subprocess.run(["apt-get", "install", "-y", "-qq", "libgtk-3-0t64"],
-                                  capture_output=True, text=True, timeout=600)
-            notes.append("restored GTK runtime for the browser" if proc.returncode == 0
-                         else "GTK runtime install failed (browser launch may fail)")
+        binary = _browser_binary(cache_root)
+        missing = _missing_libs(binary)
+        if missing:
+            ok, detail = _install_linux_libs(binary)
+            notes.append(detail)
+            if not ok:
+                raise RuntimeError("Camoufox cannot start: " + detail)
 
 
 # Backwards-compatible name used by older callers/tests.
@@ -183,6 +292,33 @@ def _detect_challenge(page) -> dict:
 
 def _locator(page, selector: str):
     return page.locator(selector).first
+
+
+def _accessibility_tree(context, page, depth: int) -> tuple:
+    """Bounded accessibility tree, with fallbacks for Playwright builds that dropped ``page.accessibility``."""
+    try:
+        if getattr(page, "accessibility", None) is not None:
+            return _trim_tree(page.accessibility.snapshot() or {}, depth=depth), "playwright"
+    except Exception:
+        pass
+    try:
+        aria = page.locator("body").aria_snapshot(timeout=5000)
+        if aria:
+            return {"role": "document", "aria": str(aria)[:8000]}, "aria"
+    except Exception:
+        pass
+    try:
+        flat = page.evaluate(
+            "(depth) => { const out = []; const walk = (el, d) => { if (!el || d > depth) return;"
+            " const role = el.getAttribute && (el.getAttribute('role') || el.tagName.toLowerCase());"
+            " const name = (el.getAttribute && (el.getAttribute('aria-label') || el.getAttribute('name') || ''))"
+            " || (el.innerText ? String(el.innerText).trim().slice(0, 80) : '');"
+            " if (role) out.push({role: role, name: name.slice(0, 80), depth: d});"
+            " if (el.children) Array.from(el.children).slice(0, 30).forEach(c => walk(c, d + 1)); };"
+            " walk(document.body, 0); return out.slice(0, 200); }", depth)
+        return {"role": "document", "nodes": flat or []}, "dom"
+    except Exception:
+        return {}, "unavailable"
 
 
 def _snapshot(page, req: dict, notes: list, started: float, status=None) -> dict:
@@ -277,9 +413,10 @@ def run_session(req: dict, notes: list, started: float) -> dict:
                 if req.get("url"):
                     response = _navigate(page, str(req["url"]), timeout_ms, notes)
                     status = response.status if response else None
-                snapshot = page.accessibility.snapshot() or {}
+                tree, source = _accessibility_tree(context, page, int(req.get("depth") or 4))
                 result = _snapshot(page, req, notes, started, status)
-                result["accessibility"] = _trim_tree(snapshot, depth=int(req.get("depth") or 4))
+                result["accessibility"] = tree
+                result["accessibility_source"] = source
             elif action == "tabs":
                 tabs = [{"index": i, "url": p.url, "title": _safe_title(p)} for i, p in enumerate(context.pages)]
                 if req.get("close_tab") is not None:
@@ -294,15 +431,29 @@ def run_session(req: dict, notes: list, started: float) -> dict:
                     bad("bad_request", "download requires a url")
                 target = str(req.get("download_path") or os.path.join("downloads", f"download-{time.time_ns()}"))
                 os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
-                with page.expect_download(timeout=timeout_ms) as info:
-                    try:
-                        page.goto(str(req["url"]), wait_until="domcontentloaded", timeout=timeout_ms)
-                    except Exception:
-                        pass
-                download = info.value
-                download.save_as(target)
-                result = {"ok": True, "action": "download", "path": target,
-                          "suggested_filename": download.suggested_filename,
+                # Direct fetch through the browser's request context first: a plain-text URL
+                # renders inline, so waiting for a download event alone can hang until the
+                # tool-level timeout. Fall back to the event path for URLs that need it.
+                body, source = b"", "request"
+                try:
+                    response = context.request.get(str(req["url"]), timeout=timeout_ms)
+                    if response.ok:
+                        body = response.body()
+                except Exception:
+                    body = b""
+                if not body:
+                    source = "event"
+                    with page.expect_download(timeout=min(30000, timeout_ms)) as info:
+                        try:
+                            page.goto(str(req["url"]), wait_until="domcontentloaded", timeout=timeout_ms)
+                        except Exception:
+                            pass
+                    download = info.value
+                    download.save_as(target)
+                else:
+                    with open(target, "wb") as fh:
+                        fh.write(body)
+                result = {"ok": True, "action": "download", "path": target, "source": source,
                           "bytes": os.path.getsize(target) if os.path.exists(target) else 0,
                           "notes": notes, "elapsed_s": round(time.monotonic() - started, 2)}
             else:  # close

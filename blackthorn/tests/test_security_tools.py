@@ -176,33 +176,58 @@ def test_browse_live_camoufox_example_com(fixture_root):
 
 
 def test_browser_rehydrates_missing_package_and_binary_without_touching_workspace(tmp_path, monkeypatch):
+    """A replacement sandbox reinstalls the package, the browser and its shared libraries."""
     import importlib.util
-    import ctypes.util
     from blackthorn.computer_assets import browse as helper
     monkeypatch.setenv('HOME', str(tmp_path))
+    monkeypatch.setenv('BLACKTHORN_BROWSER_CACHE', str(tmp_path / 'cache'))
+    monkeypatch.setenv('BLACKTHORN_BROWSER_TMP', str(tmp_path / 'cache' / 'tmp'))
+    monkeypatch.delenv('BLACKTHORN_BROWSER_NO_BOOTSTRAP', raising=False)
     monkeypatch.setattr(importlib.util, 'find_spec', lambda name: None if name == 'camoufox' else object())
-    monkeypatch.setattr(ctypes.util, 'find_library', lambda name: None)
     calls = []
-    monkeypatch.setattr(subprocess, 'run', lambda command, **kw: calls.append((command, kw)) or
-                        subprocess.CompletedProcess(command, 0), raising=False)
+    state = {'libs': False}
+
+    def fake_run(command, timeout, env=None):
+        calls.append((command, timeout))
+        if command[:2] == ['apt-get', 'install']:
+            state['libs'] = True
+        return subprocess.CompletedProcess(command, 0, stdout='', stderr='')
+
+    monkeypatch.setattr(helper, '_run', fake_run)
+    monkeypatch.setattr(helper, '_missing_libs', lambda binary: [] if state['libs'] else ['libgtk-3.so.0'])
     notes = []
     helper._ensure_runtime(notes)
-    assert [c[0][0] for c in calls] == [os.sys.executable, os.sys.executable, 'apt-get']
-    assert all(c[1].get('timeout', 0) > 0 for c in calls)
-    assert len(notes) == 3
+    assert [c[0][:3] for c in calls] == [
+        [os.sys.executable, '-m', 'pip'],
+        [os.sys.executable, '-m', 'camoufox'],
+        ['apt-get', 'update', '-qq'],
+        ['apt-get', 'install', '-y'],
+    ]
+    assert all(timeout > 0 for _cmd, timeout in calls)
+    assert any('Camoufox Python package' in note for note in notes)
+    assert any('downloaded Camoufox browser' in note for note in notes)
+    assert any('Firefox system libraries' in note for note in notes)
+    assert (tmp_path / 'cache').exists()
 
 
 def test_browser_skips_install_when_rebuildable_cache_is_present(tmp_path, monkeypatch):
     import importlib.util
-    import ctypes.util
     from blackthorn.computer_assets import browse as helper
-    monkeypatch.setenv('HOME', str(tmp_path))
-    browser = tmp_path / '.cache' / 'camoufox' / 'browsers' / 'official' / 'bin'
+    cache = tmp_path / '.cache'
+    browser = cache / 'camoufox' / 'browsers' / 'official' / 'bin'
     browser.mkdir(parents=True)
     (browser / 'camoufox-bin').write_bytes(b'installed')
+    monkeypatch.setenv('HOME', str(tmp_path))
+    monkeypatch.setenv('BLACKTHORN_BROWSER_CACHE', str(cache))
+    monkeypatch.setenv('BLACKTHORN_BROWSER_TMP', str(cache))
+    monkeypatch.delenv('BLACKTHORN_BROWSER_NO_BOOTSTRAP', raising=False)
     monkeypatch.setattr(importlib.util, 'find_spec', lambda name: object())
-    monkeypatch.setattr(ctypes.util, 'find_library', lambda name: 'libgtk-3.so.0')
-    monkeypatch.setattr(subprocess, 'run', lambda *a, **kw: (_ for _ in ()).throw(AssertionError('should not reinstall')), raising=False)
+    monkeypatch.setattr(helper, '_missing_libs', lambda binary: [])
+
+    def refuse(command, timeout, env=None):
+        raise AssertionError('should not reinstall: ' + ' '.join(command))
+
+    monkeypatch.setattr(helper, '_run', refuse)
     notes = []
     helper._ensure_runtime(notes)
-    assert notes == []
+    assert not any('restored' in note or 'downloaded' in note for note in notes)
