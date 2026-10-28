@@ -61,16 +61,31 @@ def build_services(settings: Settings, *, executor: Any = None, http: Any = None
     drive_key = os.environ.get("COMPUTER_DRIVE_GITHUB_PAT", "").strip()
     if bool(panda_key) != bool(drive_key):
         raise ValueError("PandaStack computer requires both private provider and drive credentials")
+    key_pool = None
+    lifecycle = None
     if panda_key:
         from .panda_computer import PandaComputerClient
-        computer = PandaComputerClient(http, api_key=panda_key, sandbox_id=panda_id,
-                                       github_token=drive_key, store=store)
+        from .panda_keys import PandaKeyPool
+        from .lifecycle import SandboxLifecycle, DEFAULT_WINDOW_S
+        try:
+            key_pool = PandaKeyPool.from_env(http, store)
+        except Exception as exc:  # noqa: BLE001 - a bad pool must not stop the app
+            log.error("PandaStack key pool unavailable: %s", type(exc).__name__)
+            key_pool = None
+        computer = PandaComputerClient(http, api_key=key_pool or panda_key, sandbox_id=panda_id,
+                                       github_token=drive_key, store=store, key_pool=key_pool)
+        try:
+            window = float(os.environ.get("PANDASTACK_HANDOVER_WINDOW_SECONDS") or DEFAULT_WINDOW_S)
+        except ValueError:
+            window = DEFAULT_WINDOW_S
+        lifecycle = SandboxLifecycle(store, computer, window_s=window)
     else:
         computer = ComputerClient(resolver, http, store=store)
     return Services(settings=settings, store=store, resolver=resolver, registry=default_registry(), http=http,
                     tavily=TavilyKeys(store), computer=computer,
                     runs=RunManager(ttl=settings.run_ttl_s, max_active=settings.max_active_runs),
-                    gpu=GpuService(store), static_dir=static_dir or STATIC_DIR, fleet=fleet)
+                    gpu=GpuService(store), static_dir=static_dir or STATIC_DIR, fleet=fleet,
+                    key_pool=key_pool, lifecycle=lifecycle)
 
 
 
@@ -190,9 +205,51 @@ def create_app(settings: Optional[Settings] = None, *, services: Optional[Servic
                     await asyncio.sleep(15)
 
             panda_watchdog = asyncio.create_task(_panda_power_watchdog())
+        lifecycle_task = None
+        rotation_task = None
+        if bt.lifecycle is not None:
+            import asyncio
+            from .lifecycle import lifecycle_daemon
+
+            async def _activity() -> bool:
+                # True while any run is streaming: an active task must not be cut by a TTL reap.
+                try:
+                    return bool(bt.runs.active_count()) if hasattr(bt.runs, "active_count") else bool(bt.runs._active)
+                except Exception:  # noqa: BLE001
+                    return False
+
+            async def _quota_rotation():
+                pool = bt.key_pool
+                while True:
+                    try:
+                        state = await pool.ensure_active()
+                        if not state.valid:
+                            log.error("PandaStack: no usable API key remains; affected operations are paused")
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        log.error("PandaStack key rotation check failed: %s", type(exc).__name__)
+                    await asyncio.sleep(60)
+
+            try:
+                interval = float(os.environ.get("PANDASTACK_LIFECYCLE_INTERVAL_SECONDS") or 60)
+            except ValueError:
+                interval = 60.0
+            lifecycle_task = asyncio.create_task(
+                lifecycle_daemon(bt.store, bt.computer, interval=interval,
+                                 window_s=bt.lifecycle.window_s, activity=_activity))
+            if bt.key_pool is not None:
+                rotation_task = asyncio.create_task(_quota_rotation())
         try:
             yield
         finally:
+            for task in (locals().get("lifecycle_task"), locals().get("rotation_task")):
+                if task is not None:
+                    task.cancel()
+                    try:
+                        await task
+                    except __import__("asyncio").CancelledError:
+                        pass
             if panda_watchdog is not None:
                 panda_watchdog.cancel()
                 try:

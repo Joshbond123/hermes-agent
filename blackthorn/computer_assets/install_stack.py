@@ -23,13 +23,18 @@ import sys
 import time
 from pathlib import Path
 
-WS = Path(os.environ.get("BLACKTHORN_WS", "/kaggle/working/blackthorn_workspace"))
+WS = Path(os.environ.get("BLACKTHORN_WS",
+                         "/workspace/blackthorn_workspace" if Path("/workspace").is_dir()
+                         else "/kaggle/working/blackthorn_workspace"))
 TOOLS = WS / "tools"
 HOME = TOOLS / "home"
 VENV = TOOLS / "venv"
 REGISTRY = TOOLS / "registry.json"
+# All three upstream repositories are pinned by URL; installation is idempotent and
+# each repo keeps its own license (Apache-2.0 / MIT / upstream README).
 CATALOG_REPO = "https://github.com/AKCodez/hackingtool-plugin"
 SKILLS_REPO = "https://github.com/mukul975/Anthropic-Cybersecurity-Skills"
+RED_REPO = "https://github.com/SnailSploit/Claude-Red"
 STEP_TIMEOUT = 1500
 PROBE_TIMEOUT = 40
 HELD = re.compile(r"\|\s*(sudo\s+)?(sh|bash)\b|\|\s*sudo\s+(sh|bash|tar)|sudo\s+su\b|rustup|sh\.rustup|curl[^|]*\|\s*sudo")
@@ -142,7 +147,8 @@ def camoufox(reg: dict) -> None:
 def sources(reg: dict) -> None:
     TOOLS.mkdir(parents=True, exist_ok=True)
     HOME.mkdir(parents=True, exist_ok=True)
-    for name, repo in (("hackingtool-plugin", CATALOG_REPO), ("anthropic-cybersecurity-skills", SKILLS_REPO)):
+    for name, repo in (("hackingtool-plugin", CATALOG_REPO), ("anthropic-cybersecurity-skills", SKILLS_REPO),
+                       ("claude-red", RED_REPO)):
         target = WS / "security_catalog" / name
         if (target / ".git").exists():
             reg["sources"][name] = {"state": "present"}
@@ -223,6 +229,12 @@ def main() -> None:
     for t in reg["tools"]:
         counts[t["status"]] = counts.get(t["status"], 0) + 1
     reg["summary"] = counts
+    # Build the unified capability registry last: it indexes all three repositories
+    # (897 skills + 183 tools) so the agent can discover them without a human choosing.
+    root = WS / "security_catalog"
+    root.mkdir(parents=True, exist_ok=True)
+    build = run(f"BLACKTHORN_SKILL_ROOT={root} python3 {WS / 'tools' / 'skillctl.py'} rebuild", 900)
+    reg["registry"] = {"rc": build["rc"], "tail": build["tail"][-800:]}
     save(reg)
     print("DONE", json.dumps(counts), flush=True)
 

@@ -64,11 +64,19 @@ class WorkspaceMirror:
             raise ToolError("storage", f"PandaStack workspace transfer returned HTTP {response.status_code}")
         return response.content
 
-    async def restore(self, sid: str) -> None:
-        if not self.computer.store or await self.computer.store.get_setting(RESTORED_KEY) == sid:
+    async def restore(self, sid: str, *, force: bool = False) -> None:
+        """Extract the newest verified archive into ``sid``.
+
+        ``force=True`` bypasses the "already restored into this sandbox" shortcut so a
+        freshly created handover sandbox receives the checkpoint even when the stored
+        marker still names it (a marker can be stale after a crash mid-restore).
+        """
+        if not self.computer.store:
+            return
+        if not force and await self.computer.store.get_setting(RESTORED_KEY) == sid:
             return
         async with self._lock:
-            if await self.computer.store.get_setting(RESTORED_KEY) == sid:
+            if not force and await self.computer.store.get_setting(RESTORED_KEY) == sid:
                 return
             with tempfile.TemporaryDirectory() as temp:
                 archive = pathlib.Path(temp) / "workspace.tar.gz"
@@ -89,15 +97,20 @@ class WorkspaceMirror:
                 await self._run(f"cat {SCRATCH}/part-* | tar -xzf - -C /workspace && rm -f {SCRATCH}/part-*", timeout=300)
             await self.computer.store.set_setting(RESTORED_KEY, sid)
 
-    async def sync(self) -> bool:
-        """Return True only if a changed workspace was durably published."""
+    async def sync(self, *, force: bool = False) -> bool:
+        """Return True only if the workspace is durably published.
+
+        ``force=True`` is used by the lifecycle manager before a handover: an unchanged
+        workspace whose digest is already published counts as checkpointed (DIGEST_KEY is
+        only written after a successful upload), so no redundant gigabytes are pushed.
+        """
         if not self.computer.store:
             return False
         async with self._lock:
             fingerprint = (await self._run(FINGERPRINT, timeout=90)).strip().splitlines()[-1]
             previous = await self.computer.store.get_setting(DIGEST_KEY)
             if fingerprint == previous:
-                return False
+                return bool(force and previous)
             await self._run(f"mkdir -p {SCRATCH} && rm -f {SCRATCH}/part-* {SCRATCH}/current.tar.gz && "
                             f"tar --sort=name --exclude='./.blackthorn-sync' -czf {SCRATCH}/current.tar.gz "
                             f"-C /workspace . && split -b {CHUNK} -d -a 5 {SCRATCH}/current.tar.gz {SCRATCH}/part-",

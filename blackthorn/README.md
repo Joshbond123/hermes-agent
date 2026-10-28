@@ -94,3 +94,42 @@ without rebuilding `blackthorn/static`.
 * The public GPU status never contains the tunnel URL, gateway key or account identifiers.
 * The gateway key is generated per Kaggle boot (`bt-…`) and published to D1 by the notebook. A previous constant key remains in
   old Git history: treat it as compromised (it stops working at the next GPU boot).
+
+---
+
+## Reliability, lifecycle and capability registry (2026-10)
+
+| Module | Responsibility |
+| --- | --- |
+| `recovery.py` | Classifies every tool outcome as `ok` / `invalid` / `duplicate` / `infra` / `logic` and supplies bounded retry policies (exponential backoff + jitter + hard deadline). Infrastructure failures are the *environment's* fault, so they are retried and never counted as the model repeating itself. |
+| `lifecycle.py` | Sandbox-lifecycle manager. Five minutes before the provider TTL it publishes a durable checkpoint, creates an overlapping replacement sandbox, restores and verifies the workspace, promotes the replacement, then deletes the old VM. Failures roll back to the still-live sandbox and are retried with backoff. |
+| `panda_keys.py` | PandaStack key pool. Verifies each key against `/v1/me` and `/v1/usage`, projects exhaustion from the provider's own month-to-date rollup + configured budget, and rotates ~5 minutes before the projected limit (or immediately on 401/402/403/429). Only 12-character fingerprints are ever logged or stored. |
+| `computer_assets/skillctl.py` | One registry over Anthropic-Cybersecurity-Skills (818 playbooks), Claude-Red (79 offensive playbooks) and hackingtool-plugin (183 executable tools): discovery, loading, `preflight`, and install-once execution with real exit codes. |
+| `computer_assets/browse.py` | Camoufox controller: open / click / type / scroll / screenshot / accessibility / tabs / download / close, with crash-relaunch, timeout retry, session persistence and bot-challenge *detection* (never a false claim of solving). |
+| `computer_assets/bootstrap.sh` | Idempotent bootstrap for a replacement sandbox: workspace layout, all three repositories, the unified registry, Camoufox and the base utilities. |
+
+### The two production failures these fix
+
+1. `Provider VM expired while idle…` — the sandbox is recreated by `PandaControl.ensure_for_task`,
+   the workspace is restored from the private GitHub drive, and the lifecycle manager now does this
+   *proactively* before the TTL expires instead of only after a failure.
+2. `Stopped using tools (repeated identical tool calls)…` — a provider failure no longer consumes the
+   duplicate-call budget and no longer produces a "strike". Only a repeated call that genuinely
+   *completed* against an unchanged workspace can strike, and even then the model is first told to
+   change strategy. `BLACKTHORN_MAX_RECOVERY_ROUNDS` bounds the automatic recovery rounds.
+
+### New API
+
+* `GET /api/computer/session` — provider-reported sandbox timing (`seconds_left`, `handover_due`),
+  per-key quota projection, and the last lifecycle events. No secrets.
+
+### Environment
+
+| Variable | Purpose |
+| --- | --- |
+| `PANDASTACK_API_KEY` (+ `_2`, `_3`, … or comma-separated `PANDASTACK_API_KEYS`) | Authorized keys available for rotation |
+| `PANDASTACK_MONTHLY_BUDGET_USD` | Optional cap used only when the provider reports none (`monthly_budget_usd: 0`) |
+| `PANDASTACK_ROTATE_BEFORE_SECONDS` | Rotation lead time (default 300) |
+| `PANDASTACK_HANDOVER_WINDOW_SECONDS` | Handover lead time (default 300) |
+| `PANDASTACK_LIFECYCLE_INTERVAL_SECONDS` | Lifecycle tick (default 60) |
+| `BLACKTHORN_MAX_STRIKES` / `BLACKTHORN_MAX_RECOVERY_ROUNDS` / `BLACKTHORN_TOOL_ATTEMPTS` | Execution-continuity bounds |

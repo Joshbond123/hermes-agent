@@ -23,12 +23,17 @@ from .tools.base import ToolError
 
 
 class PandaComputerClient:
-    def __init__(self, http: httpx.AsyncClient, *, api_key: str, sandbox_id: str = "",
+    def __init__(self, http: httpx.AsyncClient, *, api_key, sandbox_id: str = "",
                  github_token: str, repo: str = "jadeniran21/Computer-drive", store=None,
-                 mirror: bool = True, snapshot_path: str = "_system/blackthorn-workspace.tar.gz"):
+                 mirror: bool = True, snapshot_path: str = "_system/blackthorn-workspace.tar.gz",
+                 key_pool=None):
         if not api_key or not github_token or not (sandbox_id or store):
             raise ValueError("PandaStack, private drive and sandbox state are required")
         self.http = http
+        # ``api_key`` may be a string, a callable returning the current key, or a
+        # PandaKeyPool. Rotation then happens without rebuilding the client.
+        self.key_pool = key_pool
+        self._key_source = api_key
         self.key = api_key
         self.sandbox_id = sandbox_id
         self.github_token = github_token
@@ -44,6 +49,48 @@ class PandaComputerClient:
             self.mirror = WorkspaceMirror(self)
         else:
             self.mirror = None
+
+    @property
+    def key(self) -> str:  # type: ignore[override]
+        source = self._key_source
+        if callable(source):
+            return str(source())
+        if hasattr(source, "active_key"):
+            return str(source.active_key())
+        return str(source)
+
+    @key.setter
+    def key(self, value) -> None:
+        self._key_source = value
+
+    async def _rotate_after(self, status_code: int, message: str = "") -> bool:
+        """Switch to another authorized key after an auth/quota rejection."""
+        pool = self.key_pool if self.key_pool is not None else (
+            self._key_source if hasattr(self._key_source, "note_failure") else None)
+        if pool is None:
+            return False
+        try:
+            rotated = await pool.note_failure(self.key, status_code, message)
+        except Exception:
+            return False
+        return rotated is not None
+
+    async def lifecycle_snapshot(self) -> dict:
+        """Provider-reported session timing, used for honest status reporting."""
+        from .lifecycle import SandboxLifecycle
+        if self.store is None:
+            return {"sandbox_id": self.sandbox_id, "status": "unknown"}
+        return await SandboxLifecycle(self.store, self).snapshot()
+
+    async def handover(self, *, reason: str = "manual") -> dict:
+        from .lifecycle import SandboxLifecycle
+        if self.store is None:
+            return {"ok": False, "phase": "no_store"}
+        result = await SandboxLifecycle(self.store, self).handover(reason=reason)
+        if result.get("ok") and result.get("sandbox_id"):
+            self.sandbox_id = result["sandbox_id"]
+            self.base = "https://api.pandastack.ai/v1/sandboxes/" + self.sandbox_id
+        return result
 
     async def ensure_ready(self) -> None:
         """Reconcile an expired VM on an actual agent task, then restore its drive."""
@@ -122,12 +169,23 @@ class PandaComputerClient:
             response = await self.http.request(method, self.base + path,
                 headers={"Authorization": "Bearer " + self.key},
                 json=payload, params=params, content=content, timeout=timeout)
+            if response.status_code in (401, 402, 403, 429) and await self._rotate_after(response.status_code):
+                # A rotated key must be used for exactly one retry; never loop.
+                response = await self.http.request(method, self.base + path,
+                    headers={"Authorization": "Bearer " + self.key},
+                    json=payload, params=params, content=content, timeout=timeout)
         except httpx.HTTPError as exc:
             raise ToolError("offline", "PandaStack computer could not be reached") from exc
         if response.status_code == 404 and path == "":
-            raise ToolError("offline", "PandaStack sandbox no longer exists")
+            raise ToolError("session_expired", "PandaStack sandbox no longer exists")
         if response.status_code in (401, 403):
             raise ToolError("auth", "PandaStack denied computer access")
+        if response.status_code == 402:
+            raise ToolError("quota", "PandaStack quota is exhausted for the active key")
+        if response.status_code == 429:
+            raise ToolError("rate_limited", "PandaStack is rate limiting the active key")
+        if response.status_code in (502, 503, 504):
+            raise ToolError("provider", f"PandaStack is temporarily unavailable (HTTP {response.status_code})")
         return response
 
     @staticmethod

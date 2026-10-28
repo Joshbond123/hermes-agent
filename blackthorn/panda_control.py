@@ -16,6 +16,10 @@ import httpx
 INTENT = "pandastack_computer_intent"
 SANDBOX = "pandastack_computer_sandbox_id"
 PURPOSE = "blackthorn-production-computer"
+# A handover replacement is created while the old sandbox is still alive (overlap),
+# tagged so reconciliation can tell the two apart until the swap is verified.
+ROLE_PRIMARY = "primary"
+ROLE_REPLACEMENT = "replacement"
 RECOVERY_LOCK = "pandastack_computer_recovery_lock"
 UUID = re.compile(r"^[0-9a-fA-F-]{32,36}$")
 BASE = "https://api.pandastack.ai/v1/sandboxes"
@@ -44,6 +48,79 @@ class PandaControl:
             raise RuntimeError(f"PandaStack list returned HTTP {response.status_code}")
         return [s for s in response.json() if (s.get("metadata") or {}).get("purpose") == PURPOSE]
 
+    # ------------------------------------------------------------------ record helpers
+    @staticmethod
+    def role(item: dict) -> str:
+        return str(((item or {}).get("metadata") or {}).get("role") or ROLE_PRIMARY)
+
+    async def current(self, owned: list | None = None):
+        """The sandbox this deployment owns: the stored ID if it is still listed.
+
+        A second, intentionally over-lapping sandbox can exist during a handover, so
+        "more than one row" is no longer by itself an error — only an ambiguous set
+        without the stored ID is.
+        """
+        owned = await self._owned() if owned is None else owned
+        sid = await self.store.get_setting(SANDBOX) if self.store is not None else ""
+        if sid:
+            match = next((x for x in owned if x.get("id") == sid), None)
+            if match is not None:
+                return match
+        if not owned:
+            return None
+        primaries = [x for x in owned if self.role(x) == ROLE_PRIMARY]
+        if len(primaries) == 1:
+            return primaries[0]
+        if len(owned) == 1:
+            return owned[0]
+        return None
+
+    async def describe(self, sid: str) -> dict:
+        response = await self._request("GET", "/" + sid)
+        if response.status_code == 404:
+            return {}
+        if response.status_code != 200:
+            raise RuntimeError(f"PandaStack describe returned HTTP {response.status_code}")
+        body = response.json()
+        return body if isinstance(body, dict) else {}
+
+    async def lifetime(self, sid: str) -> dict:
+        response = await self._request("GET", "/" + sid + "/lifecycle")
+        if response.status_code != 200:
+            return {}
+        body = response.json()
+        return body if isinstance(body, dict) else {}
+
+    async def create(self, role: str = ROLE_PRIMARY, metadata: dict | None = None) -> str:
+        payload = {"template": "code-interpreter", "ttl_seconds": 3600,
+                   "metadata": {"purpose": PURPOSE, "role": role, **(metadata or {})}}
+        response = await self._request("POST", json=payload)
+        if response.status_code != 201:
+            raise RuntimeError(f"PandaStack create returned HTTP {response.status_code}")
+        sid = str(response.json().get("id") or "")
+        if not UUID.fullmatch(sid):
+            raise RuntimeError("PandaStack create returned no valid sandbox ID; reconcile before retry")
+        await self._ensure_lifetime(sid)
+        return sid
+
+    async def delete(self, sid: str) -> bool:
+        response = await self._request("DELETE", "/" + sid)
+        if response.status_code not in (200, 204, 404):
+            raise RuntimeError(f"PandaStack delete returned HTTP {response.status_code}")
+        return True
+
+    async def probe(self, sid: str) -> bool:
+        """Live verification that a sandbox can execute work."""
+        response = await self._request("POST", "/" + sid + "/exec",
+                                       json={"cmd": "python3 -c 'print(19*23)'", "timeout_seconds": 15})
+        if response.status_code != 200:
+            return False
+        try:
+            body = response.json()
+        except ValueError:
+            return False
+        return body.get("exit_code") == 0 and str(body.get("stdout", "")).strip() == "437"
+
     async def status(self):
         if not self.key:
             return {"status": "unconfigured", "online": False, "host": "PandaStack", "storage": "private GitHub Computer-drive"}
@@ -58,12 +135,12 @@ class PandaControl:
             return {"status": "stop_unverified", "online": False, "host": "PandaStack", "storage": "private GitHub Computer-drive",
                     "error": "Shutdown requested but a PandaStack VM is still active"}
         owned = await self._owned()
-        if len(owned) != 1:
+        item = await self.current(owned)
+        if item is None:
             return {"status": "missing" if not owned else "duplicate", "online": False,
                     "host": "PandaStack", "storage": "private GitHub Computer-drive",
                     "error": ("Provider VM expired while idle; the next computer tool call will create a replacement and restore the GitHub workspace."
                               if not owned else "Expected exactly one production computer")}
-        item = owned[0]
         if sid != item["id"]:
             await self.store.set_setting(SANDBOX, item["id"])
         state = str(item.get("status") or "unknown").lower()
@@ -95,13 +172,14 @@ class PandaControl:
         if await self.store.get_setting(INTENT) != "on":
             raise RuntimeError("PandaStack computer is powered off")
         owned = await self._owned()
-        if len(owned) > 1:
+        item = await self.current(owned)
+        if item is None and owned:
             raise RuntimeError("Multiple production computers need reconciliation")
-        if owned:
-            sid = owned[0]["id"]
+        if item is not None:
+            sid = item["id"]
             if await self.store.get_setting(SANDBOX) != sid:
                 await self.store.set_setting(SANDBOX, sid)
-            if str(owned[0].get("status") or "").lower() == "hibernated":
+            if str(item.get("status") or "").lower() == "hibernated":
                 return await self.start()
             return await self.status()
         if not hasattr(self.store, "db"):
@@ -126,9 +204,9 @@ class PandaControl:
                     await self.store.db.query("DELETE FROM state_meta WHERE key = ? AND value = ?", [RECOVERY_LOCK, token])
             await asyncio.sleep(0.5)
             owned = await self._owned()
-            if len(owned) == 1:
+            if await self.current(owned) is not None:
                 return await self.status()
-            if len(owned) > 1:
+            if owned:
                 raise RuntimeError("Multiple production computers need reconciliation")
         raise RuntimeError("Timed out waiting for computer recovery lease")
 
@@ -137,13 +215,14 @@ class PandaControl:
         # created a billable sandbox. Never blindly retry a non-idempotent create.
         await self.store.set_setting(INTENT, "on")
         owned = await self._owned()
-        if len(owned) > 1:
+        item = await self.current(owned)
+        if item is None and owned:
             raise RuntimeError("Duplicate PandaStack computers require manual reconciliation")
-        if owned:
-            sid = owned[0]["id"]
+        if item is not None:
+            sid = item["id"]
             await self.store.set_setting(SANDBOX, sid)
             await self._ensure_lifetime(sid)
-            if str(owned[0].get("status") or "").lower() == "hibernated":
+            if str(item.get("status") or "").lower() == "hibernated":
                 woke = await self._request("POST", "/" + sid + "/wake", json={})
                 if woke.status_code not in (200, 201, 204):
                     raise RuntimeError(f"PandaStack wake returned HTTP {woke.status_code}")
@@ -154,17 +233,12 @@ class PandaControl:
             return await self.status()
         # The current PandaStack tier rejects persistent=true. Request the
         # supported one-hour idle TTL explicitly; never pretend the VM is durable.
-        response = await self._request("POST", json={"template": "code-interpreter", "ttl_seconds": 3600,
-            "metadata": {"purpose": PURPOSE}})
-        if response.status_code != 201:
+        try:
+            sid = await self.create()
+        except RuntimeError:
             await self.store.set_setting(INTENT, "off")
-            raise RuntimeError(f"PandaStack create returned HTTP {response.status_code}")
-        item = response.json()
-        sid = item.get("id", "")
-        if not UUID.fullmatch(sid):
-            raise RuntimeError("PandaStack create returned no valid sandbox ID; reconcile before retry")
+            raise
         await self.store.set_setting(SANDBOX, sid)
-        await self._ensure_lifetime(sid)
         # A successful create is not enough: execute harmless work on the live VM.
         probe = await self._request("POST", "/" + sid + "/exec",
                                     json={"cmd": "python3 -c 'print(19*23)'", "timeout_seconds": 15})

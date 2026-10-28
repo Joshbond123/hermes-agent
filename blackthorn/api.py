@@ -43,6 +43,8 @@ class Services:
     static_dir: Path
     relay_hub: Any = None
     fleet: Any = None
+    key_pool: Any = None        # PandaStack API-key pool (rotation, quota projection)
+    lifecycle: Any = None       # sandbox lifecycle manager (TTL handover)
     _prompt_cache: tuple = field(default=(0.0, ""))
     _memory_cache: tuple = field(default=(0.0, ()))
 
@@ -531,6 +533,35 @@ async def fleet_decide(request: Request):
     for role in (("model",) if __import__("os").environ.get("PANDASTACK_API_KEY") else ("model", "computer")):
         st = s.fleet.decide(role, force=True)
         out[role] = {"active": st.active, "reason": st.reason}
+    return out
+
+
+@router.get("/api/computer/session")
+async def computer_session(request: Request):
+    """Provider-reported computer session state, quota projection and rotation history.
+
+    Secrets never appear here: keys are represented only by short fingerprints.
+    """
+    s = svc(request)
+    out: dict = {"provider": "PandaStack" if s.key_pool is not None or getattr(s.computer, "key_pool", None) else "relay"}
+    try:
+        if hasattr(s.computer, "lifecycle_snapshot"):
+            out["session"] = await s.computer.lifecycle_snapshot()
+    except Exception as exc:  # noqa: BLE001
+        out["session"] = {"error": type(exc).__name__}
+    pool = s.key_pool if s.key_pool is not None else getattr(s.computer, "key_pool", None)
+    if pool is not None:
+        try:
+            out["keys"] = pool.snapshot()
+            out["rotation_threshold_s"] = pool.threshold_s
+        except Exception as exc:  # noqa: BLE001
+            out["keys"] = [{"error": type(exc).__name__}]
+    try:
+        import json
+        raw = await s.store.get_setting("pandastack_lifecycle_log")
+        out["lifecycle_events"] = (json.loads(raw) if raw else [])[-10:]
+    except Exception:  # noqa: BLE001
+        out["lifecycle_events"] = []
     return out
 
 

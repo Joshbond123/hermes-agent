@@ -253,7 +253,30 @@ def test_slow_but_live_cached_loader_is_not_killed_at_four_minutes(srv, monkeypa
     monkeypatch.setattr(srv.urllib.request, 'urlopen', delayed_health)
     monkeypatch.setattr(srv.time, 'sleep', lambda *a: None)
     srv.start_llama_server(str(model))
-    assert modes == ['40'] and probes[0] == 151
+    # Full VRAM offload is attempted first by default (production latency), and the
+    # live process is allowed to finish rather than being killed at four minutes.
+    assert modes == ['99'] and probes[0] == 151
+
+
+def test_partial_offload_is_used_when_full_offload_is_disabled(srv, monkeypatch, tmp_path):
+    model = tmp_path / 'cached.gguf'
+    model.write_bytes(b'fixture')
+    monkeypatch.setattr(srv, 'ensure_llama_server_bin', lambda: '/verified/llama-server')
+    monkeypatch.setenv('LLAMA_TRY_FULL_OFFLOAD', '0')
+    modes = []
+
+    class Proc:
+        def poll(self): return None
+
+    def launch(cmd, **kw):
+        modes.append(cmd[cmd.index('-ngl') + 1])
+        return Proc()
+
+    monkeypatch.setattr(srv.subprocess, 'Popen', launch)
+    monkeypatch.setattr(srv.urllib.request, 'urlopen', lambda *a, **kw: object())
+    monkeypatch.setattr(srv.time, 'sleep', lambda *a: None)
+    srv.start_llama_server(str(model))
+    assert modes == ['40']
 
 
 def test_failed_loader_with_insufficient_disk_does_not_repeat_or_import_ollama(srv, monkeypatch, tmp_path):

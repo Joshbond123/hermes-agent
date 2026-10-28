@@ -1,11 +1,18 @@
-"""On-demand skills, security tool catalog and Camoufox browsing. All execution happens on the computer.
+"""On-demand skills, the unified security tool registry and Camoufox browsing.
 
-Design rules:
-- Nothing from the skill catalog is injected into model context up front. The model searches,
-  then loads one skill or one reference file when it needs it.
-- Model text never reaches the shell unquoted: arguments are validated, then passed as base64 JSON
-  or as shlex-quoted values to fixed command templates.
-- Skill scripts are never executed. Only SKILL.md text and reference files are returned.
+Everything here executes on the computer, never in the web process.
+
+Design rules
+- Nothing from the registry is injected into model context up front. The model searches,
+  then loads one skill, reads one reference file, or runs one catalogued tool.
+- The registry spans three upstream repositories: Anthropic-Cybersecurity-Skills (818
+  playbooks), Claude-Red (79 offensive playbooks) and hackingtool-plugin (183 executable
+  tools). ``skillctl.py`` builds one index over all three, so discovery never requires a
+  human to pick a repository or a skill.
+- Model text never reaches the shell unquoted: arguments are validated, then passed as
+  base64 JSON or as shlex-quoted values to fixed command templates.
+- Skill *documents* are read, never executed. Executable catalog tools run only through
+  ``cyber_run``, which installs a missing binary at most once and reports the real exit code.
 """
 
 from __future__ import annotations
@@ -23,6 +30,9 @@ from .base import ToolContext, ToolResult, ToolSpec, clip
 ASSET_DIR = Path(__file__).resolve().parent.parent / "computer_assets"
 REMOTE_BIN = "/tmp/blackthorn_skills/bin"
 SKILL_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{2,120}$")
+SKILL_ID = re.compile(r"^(?:anthropic|claude-red):[A-Za-z0-9][A-Za-z0-9._-]{1,150}$")
+TOOL_ID = re.compile(r"^tool:[A-Za-z0-9][A-Za-z0-9._-]{1,150}$")
+TOOL_ARGS = re.compile(r"^[A-Za-z0-9 ./_:=@+,%^*()\[\]{}\"'$-]{0,500}$")
 QUERY = re.compile(r"^[A-Za-z0-9 ._+/-]{2,120}$")
 REL_PATH = re.compile(r"^[A-Za-z0-9._/-]{1,200}$")
 SCREENSHOT_DIR = "browser_screenshots"
@@ -59,7 +69,10 @@ def _fail(message: str, data: Dict[str, Any] | None = None) -> ToolResult:
 
 
 def _valid_skill(args: Dict[str, Any]) -> str | None:
-    name = str(args.get("name") or "").strip()
+    """Accept a plain skill name or a namespaced id (``anthropic:…`` / ``claude-red:…``)."""
+    name = str(args.get("id") or args.get("name") or "").strip()
+    if SKILL_ID.match(name):
+        return name
     return name if SKILL_NAME.match(name) else None
 
 
@@ -68,26 +81,38 @@ async def skill_search(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
     if not QUERY.match(query):
         return _fail("query must be 2-120 plain characters (letters, digits, spaces, . _ + / -)")
     limit = max(1, min(15, int(args.get("limit") or 8)))
-    data = await _run_skillctl(ctx, "search", f"--q {shlex.quote(query)} --limit {limit}")
+    kind = str(args.get("kind") or "all").lower()
+    if kind not in ("all", "skill", "tool"):
+        return _fail("kind must be all, skill or tool")
+    data = await _run_skillctl(ctx, "search", f"--q {shlex.quote(query)} --limit {limit} --kind {kind}")
     if not data.get("ok"):
         return _fail(str(data.get("error") or "search failed"), {"kind": "catalog"})
-    lines = [f"{r['name']}: {r['description']}" for r in data.get("results", [])]
-    body = "\n".join(lines) or "no matching skills"
-    return ToolResult(ok=True, content=f"{data.get('matches', 0)} matches for '{query}'\n{body}",
-                      summary=f"{data.get('matches', 0)} skill matches", data={"matches": data.get("matches", 0)})
+    lines = []
+    for r in data.get("results", []):
+        tag = r.get("source") or ""
+        kind = r.get("kind") or "skill"
+        ident = r.get("id") or r.get("name")
+        lines.append(f"[{kind} {tag}] {ident}: {r.get('description', '')}")
+    body = "\n".join(lines) or "no matching capabilities"
+    return ToolResult(ok=True, content=f"{data.get('matches', 0)} matches for '{query}' "
+                                       f"(skills {data.get('counts', {}).get('skills', '?')}, tools "
+                                       f"{data.get('counts', {}).get('tools', '?')})\n{body}",
+                      summary=f"{data.get('matches', 0)} capability matches",
+                      data={"matches": data.get("matches", 0), "results": [r.get("id") for r in data.get("results", [])][:10]})
 
 
 async def skill_load(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
     name = _valid_skill(args)
     if name is None:
         return _fail("name must be a skill name returned by skill_search")
-    data = await _run_skillctl(ctx, "load", f"--name {shlex.quote(name)}")
+    data = await _run_skillctl(ctx, "load", f"--id {shlex.quote(name)}")
     if not data.get("ok"):
         return _fail(str(data.get("error") or "load failed"), {"kind": "catalog", "name": name})
     body, cut = clip(str(data.get("body") or ""), ctx.settings.tool_result_chars, "ends")
     files = data.get("files") or []
     listing = ", ".join(files[:40]) + (" ..." if len(files) > 40 else "")
-    content = (f"SKILL {name} (instructions only; its scripts were not run)\n"
+    content = (f"SKILL {data.get('id') or name} [source: {data.get('source', '?')}, category: {data.get('category', '?')}]"
+               f" (instructions only; its scripts were not run)\n"
                f"Other files (load with skill_read): {listing}\n\n{body}")
     return ToolResult(ok=True, content=content, summary=f"loaded {name}", truncated=cut or bool(data.get("truncated")),
                       data={"name": name, "files": len(files)})
@@ -98,7 +123,7 @@ async def skill_read(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
     rel = str(args.get("path") or "").strip()
     if name is None or not REL_PATH.match(rel) or rel.startswith("/") or ".." in rel.split("/"):
         return _fail("name and a relative path inside the skill folder are required")
-    data = await _run_skillctl(ctx, "read", f"--name {shlex.quote(name)} --path {shlex.quote(rel)}")
+    data = await _run_skillctl(ctx, "read", f"--id {shlex.quote(name)} --path {shlex.quote(rel)}")
     if not data.get("ok"):
         return _fail(str(data.get("error") or "read failed"), {"kind": "catalog", "name": name})
     body, cut = clip(str(data.get("content") or ""), ctx.settings.tool_result_chars, "ends")
@@ -110,7 +135,7 @@ async def tool_search(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
     if not QUERY.match(query):
         return _fail("query must be 2-120 plain characters")
     limit = max(1, min(12, int(args.get("limit") or 6)))
-    data = await _run_skillctl(ctx, "tools", f"--q {shlex.quote(query)} --limit {limit}")
+    data = await _run_skillctl(ctx, "search", f"--q {shlex.quote(query)} --limit {limit} --kind tool")
     if not data.get("ok"):
         return _fail(str(data.get("error") or "tool search failed"), {"kind": "catalog"})
     lines = []
@@ -122,19 +147,35 @@ async def tool_search(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
 
 
 async def browse(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
+    """Drive Camoufox on the computer: navigate, click, type, scroll, screenshot, tabs, download."""
+    action = str(args.get("action") or "open").lower()
+    if action not in ("open", "click", "type", "scroll", "screenshot", "accessibility", "tabs", "download", "close"):
+        return _fail("action must be one of open, click, type, scroll, screenshot, accessibility, tabs, download, close")
     url = str(args.get("url") or "").strip()
-    if not url.startswith(("http://", "https://")) or len(url) > 2000:
+    if action in ("open", "download"):
+        if not url.startswith(("http://", "https://")) or len(url) > 2000:
+            return _fail("url must start with http:// or https://")
+    elif url and not url.startswith(("http://", "https://")):
         return _fail("url must start with http:// or https://")
-    timeout_ms = max(5000, min(60000, int(args.get("timeout_ms") or 25000)))
-    request: Dict[str, Any] = {"url": url, "timeout_ms": timeout_ms, "max_chars": 6000,
-                               "storage": "/tmp/blackthorn_browser/storage.json"}
+    if action in ("click", "type") and not str(args.get("selector") or "").strip():
+        return _fail(f"{action} requires a CSS selector")
+    timeout_ms = max(3000, min(90000, int(args.get("timeout_ms") or 25000)))
+    request: Dict[str, Any] = {
+        "action": action, "timeout_ms": timeout_ms, "max_chars": 6000,
+        "storage": "/tmp/blackthorn_browser/storage.json",
+    }
+    for key in ("url", "selector", "text", "scroll_px", "wait_ms", "full_page", "download_path", "close_tab"):
+        if args.get(key) not in (None, ""):
+            request[key] = args[key]
+    if args.get("submit"):
+        request["submit"] = True
     if args.get("screenshot"):
         request["screenshot"] = f"{SCREENSHOT_DIR}/shot-{time.time_ns()}.png"
     await _upload(ctx, "browse.py")
     payload = base64.b64encode(json.dumps(request).encode()).decode()
-    cmd = f"mkdir -p {SCREENSHOT_DIR} && timeout 320 python3 {REMOTE_BIN}/browse.py {payload}"
-    data = await ctx.computer.call("/computer/exec", {"command": cmd, "timeout_seconds": 330, "cwd": "."},
-                                   timeout=350.0, idempotent=False)
+    cmd = f"mkdir -p {SCREENSHOT_DIR} && timeout 330 python3 {REMOTE_BIN}/browse.py {payload}"
+    data = await ctx.computer.call("/computer/exec", {"command": cmd, "timeout_seconds": 340, "cwd": "."},
+                                   timeout=360.0, idempotent=False)
     raw = str(data.get("output") or "").strip().splitlines()
     result = None
     for line in reversed(raw):
@@ -148,18 +189,78 @@ async def browse(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
     if result is None:
         return _fail("browser produced no result", {"kind": "browser", "output": "\n".join(raw)[-300:]})
     if not result.get("ok"):
-        return _fail(f"browse {result.get('error_kind', 'error')}: {result.get('error', '')[:300]}",
-                     {"kind": "browser_" + str(result.get("error_kind", "error"))})
+        return _fail(f"browse {result.get('error_kind', 'error')}: {str(result.get('error', ''))[:300]}",
+                     data={"kind": "browser_" + str(result.get("error_kind", "error")),
+                           "attempts": result.get("attempts")})
+    notes = "; ".join(result.get("notes") or [])
+    if action in ("tabs", "download", "close"):
+        return ToolResult(ok=True, content=json.dumps({k: v for k, v in result.items() if k != "notes"},
+                                                      ensure_ascii=False)[:4000],
+                          summary=f"browser {action}", data={"action": action, **{k: result.get(k) for k in
+                                 ("path", "bytes", "closed") if k in result}})
     text, cut = clip(str(result.get("text") or ""), ctx.settings.tool_result_chars, "ends")
     links = "\n".join(f"- {l.get('text') or '(no text)'} {l.get('href')}" for l in (result.get("links") or [])[:15])
-    notes = "; ".join(result.get("notes") or [])
     shot = f"\nScreenshot saved: {result['screenshot']}" if result.get("screenshot") else ""
+    captcha = result.get("captcha") or {}
+    challenge = (f"\nCAPTCHA/challenge detected: {', '.join(captcha.get('kinds') or [])}. "
+                 f"{captcha.get('note', '')}" if captcha.get("present") else "")
+    accessibility = (f"\nAccessibility snapshot:\n{json.dumps(result.get('accessibility'), ensure_ascii=False)[:1800]}"
+                     if result.get("accessibility") else "")
     content = (f"{result.get('title')}\nURL: {result.get('final_url')} (HTTP {result.get('status')})"
-               f"{' | notes: ' + notes if notes else ''}{shot}\n\n{text}\n\nLinks:\n{links}")
+               f"{' | notes: ' + notes if notes else ''}{shot}{challenge}{accessibility}\n\n{text}\n\nLinks:\n{links}")
     return ToolResult(ok=True, content=content, summary=f"browsed {result.get('final_url', url)}",
                       truncated=cut or bool(result.get("text_truncated")),
                       data={"final_url": result.get("final_url"), "status": result.get("status"),
-                            "screenshot": result.get("screenshot"), "elapsed_s": result.get("elapsed_s")})
+                            "screenshot": result.get("screenshot"), "elapsed_s": result.get("elapsed_s"),
+                            "captcha": bool(captcha.get("present")),
+                            "text": str(result.get("text") or "")[:2000]})
+
+
+async def cyber_run(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
+    """Install (once) and execute a catalogued security tool on the computer."""
+    tool_id = str(args.get("tool_id") or args.get("id") or "").strip()
+    if not TOOL_ID.match(tool_id):
+        return _fail("tool_id must be a registry id such as tool:web_attack.Nuclei "
+                     "(find one with tool_search)", {"kind": "invalid"})
+    raw_args = str(args.get("args") or "").strip()
+    if raw_args and not TOOL_ARGS.match(raw_args):
+        return _fail("args may contain only plain command-line characters (no quotes, semicolons or redirects)",
+                     {"kind": "invalid"})
+    timeout = max(10, min(1800, int(args.get("timeout_seconds") or 300)))
+    flags = f"--id {shlex.quote(tool_id)} --timeout {timeout}"
+    if raw_args:
+        flags += f" --args {shlex.quote(raw_args)}"
+    data = await _run_skillctl(ctx, "run", flags, timeout=timeout + 120)
+    status = str(data.get("status") or "")
+    if not data.get("ok"):
+        detail = data.get("error") or data.get("output") or "tool execution failed"
+        return ToolResult.failure(f"cyber_run {tool_id} [{status or 'error'}]: {str(detail)[:600]}",
+                                  hint="Search for another tool, or load the matching skill for a manual procedure.",
+                                  data={"kind": "tool_failed", "status": status, "tool_id": tool_id,
+                                        "exit_code": data.get("exit_code")})
+    body, cut = clip(str(data.get("output") or "(no output)"), ctx.settings.tool_result_chars, "ends")
+    return ToolResult(ok=True, content=(f"{data.get('title') or tool_id} [{status}] on the computer "
+                                        f"(exit {data.get('exit_code')}, {data.get('seconds')}s)\n"
+                                        f"$ {data.get('command')}\n{body}"),
+                      summary=f"{tool_id} {status} exit={data.get('exit_code')}",
+                      truncated=cut, data={"exit_code": data.get("exit_code"), "tool_id": tool_id,
+                                           "status": status, "output": body[:2000]})
+
+
+async def cyber_preflight(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
+    """Report which catalogued binaries are already available on this computer."""
+    data = await _run_skillctl(ctx, "preflight", "", timeout=300)
+    if not data.get("ok"):
+        return _fail(str(data.get("error") or "preflight failed"), {"kind": "registry"})
+    counts = data.get("counts") or {}
+    missing = data.get("missing") or []
+    body = (f"registry root: {data.get('root')}\n"
+            f"skills: {counts.get('skills')} (anthropic {counts.get('by_source', {}).get('anthropic')}, "
+            f"claude-red {counts.get('by_source', {}).get('claude-red')}); tools: {counts.get('tools')}\n"
+            f"binaries present: {data.get('binaries_present')}/{data.get('binaries_checked')}\n"
+            f"missing (first 40): {', '.join(missing[:40]) or 'none'}")
+    return ToolResult(ok=True, content=body, summary=f"{data.get('binaries_present')} binaries ready",
+                      data={"counts": counts})
 
 
 SAMPLE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
@@ -279,33 +380,67 @@ def specs() -> List[ToolSpec]:
                   "required": ["query"]},
                  skill_search, timeout=330.0, describe=lambda a: str(a.get("query") or "")),
         ToolSpec("skill_load",
-                 "Load one skill's instructions by exact name from skill_search. Scripts in the skill are NOT executed. "
-                 "Use only for authorised, defensive or lab work.",
-                 {"type": "object", "properties": {"name": {"type": "string", "minLength": 3, "maxLength": 121}},
-                  "required": ["name"]},
+                 "Load one skill's instructions by exact id from skill_search (e.g. anthropic:triaging-security-incident "
+                 "or claude-red:offensive-osint). Documents are read, not executed. Authorised work only.",
+                 {"type": "object", "properties": {
+                     "id": {"type": "string", "minLength": 3, "maxLength": 160},
+                     "name": {"type": "string", "minLength": 3, "maxLength": 121}},
+                  "required": []},
                  skill_load, timeout=330.0, describe=lambda a: str(a.get("name") or "")),
         ToolSpec("skill_read",
                  "Read one reference file inside a loaded skill folder (for example references/api-reference.md).",
                  {"type": "object", "properties": {
+                     "id": {"type": "string", "minLength": 3, "maxLength": 160},
                      "name": {"type": "string", "minLength": 3, "maxLength": 121},
                      "path": {"type": "string", "minLength": 1, "maxLength": 200}},
-                  "required": ["name", "path"]},
+                  "required": ["path"]},
                  skill_read, timeout=330.0, describe=lambda a: f"{a.get('name', '')}/{a.get('path', '')}"),
         ToolSpec("tool_search",
-                 "Search the security tool catalog (183 tools, metadata only: category, description, install commands). "
-                 "Nothing is installed or run by this search.",
+                 "Search the executable security tool catalog (183 tools across the three integrated repositories; "
+                 "metadata only: category, description, runnability). Nothing is installed or run by this search. "
+                 "Use cyber_run with the returned id to execute one.",
                  {"type": "object", "properties": {
                      "query": {"type": "string", "minLength": 2, "maxLength": 120},
                      "limit": {"type": "integer", "minimum": 1, "maximum": 12, "default": 6}},
                   "required": ["query"]},
                  tool_search, timeout=330.0, describe=lambda a: str(a.get("query") or "")),
-        ToolSpec("browse",
-                 "Open a web page in a stealth browser (Camoufox) on the computer. Returns title, final URL, status, "
-                 "visible text and links. Use for pages that need JavaScript; use web_search for plain research.",
+        ToolSpec("cyber_run",
+                 "Install (only if needed, once) and execute one catalogued security tool on the computer, e.g. "
+                 "tool:web_attack.Nuclei with args '-u https://target.example'. Returns the real exit code and output. "
+                 "Only for systems you are authorised to test.",
                  {"type": "object", "properties": {
-                     "url": {"type": "string", "minLength": 8, "maxLength": 2000},
-                     "timeout_ms": {"type": "integer", "minimum": 5000, "maximum": 60000, "default": 25000},
+                     "tool_id": {"type": "string", "minLength": 6, "maxLength": 160},
+                     "args": {"type": "string", "maxLength": 500, "default": ""},
+                     "timeout_seconds": {"type": "integer", "minimum": 10, "maximum": 1800, "default": 300}},
+                  "required": ["tool_id"]},
+                 cyber_run, timeout=1900.0, kind="exec",
+                 describe=lambda a: str(a.get("tool_id") or "")),
+        ToolSpec("cyber_preflight",
+                 "Show the cybersecurity registry state on the computer: skill/tool counts per source and which "
+                 "binaries are already installed. Call before a long security engagement.",
+                 {"type": "object", "properties": {}}, cyber_preflight, timeout=330.0,
+                 describe=lambda a: "registry preflight"),
+        ToolSpec("browse",
+                 "Drive the Camoufox stealth browser on the computer. action=open navigates and returns title, URL, "
+                 "status, visible text, links and any bot-challenge it detects; click/type/scroll interact with a "
+                 "page (>selector<, >text<); screenshot saves a PNG; accessibility returns a bounded accessibility "
+                 "tree; tabs lists/closes tabs; download saves a file under the workspace. Use web_search for plain "
+                 "research and browse for JavaScript pages, logins and forms.",
+                 {"type": "object", "properties": {
+                     "url": {"type": "string", "maxLength": 2000},
+                     "action": {"type": "string", "enum": ["open", "click", "type", "scroll", "screenshot",
+                                                           "accessibility", "tabs", "download", "close"],
+                                "default": "open"},
+                     "selector": {"type": "string", "maxLength": 300},
+                     "text": {"type": "string", "maxLength": 4000},
+                     "submit": {"type": "boolean", "default": False},
+                     "scroll_px": {"type": "integer", "minimum": -20000, "maximum": 20000, "default": 800},
+                     "wait_ms": {"type": "integer", "minimum": 0, "maximum": 15000},
+                     "download_path": {"type": "string", "maxLength": 300},
+                     "close_tab": {"type": "integer", "minimum": 0, "maximum": 50},
+                     "full_page": {"type": "boolean", "default": False},
+                     "timeout_ms": {"type": "integer", "minimum": 3000, "maximum": 90000, "default": 25000},
                      "screenshot": {"type": "boolean", "default": False}},
-                  "required": ["url"]},
+                  "required": []},
                  browse, timeout=360.0, kind="net", describe=lambda a: str(a.get("url") or "")),
     ]

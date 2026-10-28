@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
-from . import prompts
+from . import prompts, recovery
 from .llm import ContextOverflow, LLMError, stream_chat
 from .route import RouteError, RouteResolver
 from .runs import Run
@@ -48,6 +48,13 @@ RESUME_NOTE = ("[server] The earliest part of this turn was compacted to fit the
 NOTE_PREFIXES = (FINALIZE_NOTE[:40], LENGTH_CONTINUE_NOTE[:40], CONTINUE_NOTE[:40], GATE_NOTE[:40], RESUME_NOTE[:40],
                  prompts.COMPACT_HEADER[:40])
 GATE_STEPS = 6                      # extra steps a run may spend on the completion gate
+# Strikes: an identical *completed* call repeated this many times is a genuine stall. Infrastructure
+# failures never produce a strike (they are retried), so this can be higher than the old value of 3
+# without letting a real loop run longer.
+MAX_STRIKES = int(__import__("os").environ.get("BLACKTHORN_MAX_STRIKES", "3") or 3)
+MAX_RECOVERY_ROUNDS = int(__import__("os").environ.get("BLACKTHORN_MAX_RECOVERY_ROUNDS", "3") or 3)
+# Total attempts (including the first) for a tool call that fails for infrastructure reasons.
+COMPUTER_MAX_ATTEMPTS = int(__import__("os").environ.get("BLACKTHORN_TOOL_ATTEMPTS", "3") or 3)
 
 
 class ThinkFilter:
@@ -147,6 +154,14 @@ class AgentRun:
         self.malformed = 0
         self.seen: Dict[Tuple[str, str, int], int] = {}
         self.seen_total: Dict[Tuple[str, str], int] = {}   # lifetime cap per (tool, args), all epochs
+        # Infrastructure recovery bookkeeping (see blackthorn/recovery.py). Calls that failed because
+        # the provider VM expired are retried with backoff and never count as model repetition.
+        self.infra_failures = 0
+        self.recovery_rounds = 0
+        self.last_infra_error = ""
+        self.seen_infra: Dict[str, int] = {}
+        self._last_infra_signature: str = ""
+        self._infra_healed = False
         self.steps = 0
         self.usage = {"prompt": 0, "completion": 0}
         self.finish_reason: Optional[str] = None
@@ -192,7 +207,11 @@ class AgentRun:
             # On the live dual-T4 Qwen, model prefill dominates a computer turn.
             # Offer the five computer primitives first; disclose unrelated schemas
             # only when the task calls for them (or a prior ledger used them).
-            core = {"run_command", "list_files", "read_file", "write_file", "job_status"}
+            # Core tools are always offered: the computer primitives, web research and the
+            # task list. Losing web_search/todo_list on a plain computer turn made the agent
+            # unable to plan multi-step work or look anything up without a lucky keyword.
+            core = {"run_command", "list_files", "read_file", "write_file", "job_status",
+                    "web_search", "todo_list"}
             context_lower = (context + " " + " ".join(str(t.get("content") or "")[:300]
                             for t in self.turns[-4:] if t.get("role") == "user")).lower()
             def mentions(*words: str) -> bool:
@@ -211,8 +230,12 @@ class AgentRun:
                 core.update(("remember", "session_search"))
             if mentions("skill", "playbook", "workflow", "training"):
                 core.update(("skill_search", "skill_load", "skill_read"))
-            if mentions("catalog", "security tool", "pentest", "nmap", "install", "scan", "tool search"):
-                core.add("tool_search")
+            if mentions("catalog", "security tool", "pentest", "nmap", "install", "scan", "tool search",
+                        "security", "vulnerability", "recon", "exploit", "osint", "forensic", "malware"):
+                core.update(("tool_search", "cyber_preflight"))
+            if mentions("pentest", "scan", "security", "nmap", "nuclei", "sqlmap", "exploit", "recon",
+                        "vulnerability", "osint", "forensic"):
+                core.add("cyber_run")
             if mentions("browse", "browser", "web page", "website", "javascript", "screenshot", "login", "web app"):
                 core.add("browse")
             if mentions("triage", "suspicious file", "sample"):
@@ -369,7 +392,7 @@ class AgentRun:
         s = self.deps.settings
         if self.board is None or self._nudges >= int(getattr(s, "max_completion_nudges", 3)):
             return None
-        if self.tool_calls_total >= s.max_tool_calls or self.strikes >= 3:
+        if self.tool_calls_total >= s.max_tool_calls or self.strikes >= MAX_STRIKES:
             return None
         pending = self.board.pending()
         if not pending:
@@ -408,6 +431,50 @@ class AgentRun:
                 fn(*args)
             except Exception:  # bookkeeping must never affect a run
                 pass
+
+    # ------------------------------------------------------------------ computer recovery
+    @property
+    def infra_failures_healed(self) -> bool:
+        """True when the most recent infrastructure failure has since been retried successfully."""
+        return bool(self._infra_healed and self._last_infra_signature
+                    and self._last_infra_signature not in self.seen_infra)
+
+    async def _prepare_recovery(self) -> None:
+        """Hooks that must run before retrying a call that never reached the tool logic."""
+        try:
+            invalidate = getattr(self.deps.resolver, "invalidate", None)
+            if invalidate is not None:
+                invalidate()
+        except Exception:  # a resolver that cannot be invalidated must not block recovery
+            pass
+
+    async def _recover_computer(self) -> bool:
+        """Reconnect to (or replace) the computer and verify it with a live call.
+
+        Returns True only when the provider actually answered, so the loop never
+        claims recovery it has not verified.
+        """
+        computer = self.deps.computer
+        try:
+            ensure = getattr(computer, "ensure_ready", None)
+            if ensure is not None:
+                await ensure()
+            probe = await computer.call("/computer/info", method="GET", timeout=90.0)
+            return isinstance(probe, dict) and bool(probe)
+        except Exception as exc:  # noqa: BLE001 - reported, never raised into the loop
+            log.warning("computer recovery attempt failed: %s: %s", type(exc).__name__, str(exc)[:200])
+            return False
+
+    def _recovery_note(self, healed: bool) -> str:
+        return (
+            "[server] The previous stop was caused by an infrastructure failure, not by you repeating work. "
+            + ("The computer is verified online again and the GitHub workspace checkpoint has been restored. "
+               "Re-issue the call that failed, then continue the remaining steps; do not restart completed work."
+               if healed else
+               "The computer did not come back within the retry budget. Switch to a strategy that does not need "
+               "it for now (use web_search or the saved workspace contents), and record what is blocked.")
+            + f" Recovery round {self.recovery_rounds} of {MAX_RECOVERY_ROUNDS}."
+        )
 
     async def _lease_heartbeat(self) -> None:
         """Durable, expiring run lease: shutdown checks other Render workers too."""
@@ -541,10 +608,25 @@ class AgentRun:
             self._check()
             self.steps += 1
             if not force_final and (self.steps > s.max_steps or self.tool_calls_total >= s.max_tool_calls
-                                    or self.strikes >= 3 or self.malformed >= s.max_malformed_calls):
-                force_final = True
-                reason = ("repeated identical tool calls" if self.strikes >= 3 else
+                                    or self.strikes >= MAX_STRIKES or self.malformed >= s.max_malformed_calls):
+                reason = ("repeated identical tool calls" if self.strikes >= MAX_STRIKES else
                           "invalid tool arguments" if self.malformed >= s.max_malformed_calls else "the tool-call limit")
+                # An infrastructure failure is not the model stalling. Before giving up on tools,
+                # give the runtime one bounded recovery round (reconnect / replace the VM) so a
+                # provider expiry never truncates a long task.
+                recoverable = (self.strikes >= MAX_STRIKES and self.last_infra_error
+                               and self.recovery_rounds < MAX_RECOVERY_ROUNDS and not self.infra_failures_healed)
+                if recoverable:
+                    self.recovery_rounds += 1
+                    healed = await self._recover_computer()
+                    self.run.emit("notice", level="info",
+                                  text=("The computer was recovered; continuing the task instead of stopping."
+                                        if healed else
+                                        "The computer could not be recovered yet; continuing with a changed strategy."))
+                    self.strikes = 0
+                    self._messages.append({"role": "user", "content": self._recovery_note(healed)})
+                    continue
+                force_final = True
                 self.run.emit("notice", level="warn", text=f"Stopped using tools ({reason}); writing the answer from what was gathered.")
                 self._messages.append({"role": "user", "content": self._finalize_note()})
             result = await self._model_step(self._messages, None if force_final else self._tools_for_step(self.steps))
@@ -826,6 +908,12 @@ class AgentRun:
             # Duplicate suppression is keyed on (tool, args, epoch): the epoch advances whenever a
             # write/exec succeeds, so a legitimate re-run after a real change (edit a file, then run the
             # tests again) is allowed, while a stuck loop on an unchanged world is still stopped.
+            #
+            # Crucially the budget is only consumed by calls that actually reached the tool logic.
+            # An infrastructure failure (expired VM, tunnel down, provider 5xx) is retried below with
+            # backoff and does NOT consume the duplicate budget — that conflation was the defect that
+            # turned "the VM expired" into "the model is repeating itself; stop the task".
+            signature = recovery.signature(name, args)
             key = (name, json.dumps(args, sort_keys=True, default=str), self._epoch)
             async with seen_lock:
                 count = self.seen.get(key, 0)
@@ -834,11 +922,43 @@ class AgentRun:
                     return ToolResult.failure(
                         f"duplicate call suppressed: {name} was already run with these exact arguments "
                         f"{max(count, total)} times",
-                        hint="Use the earlier result in the conversation to answer, or try different arguments.")
-                self.seen[key] = count + 1
-                self.seen_total[key[:2]] = total + 1
-            async with sem:
-                return await self.deps.registry.run(name, args, ctx)
+                        hint=recovery.strategy_change_note(name, key[1], max(count, total)),
+                        data={"kind": "duplicate", "signature": signature})
+            policy = recovery.RetryPolicy(max_attempts=COMPUTER_MAX_ATTEMPTS)
+            attempt = 0
+            while True:
+                attempt += 1
+                async with sem:
+                    result = await self.deps.registry.run(name, args, ctx)
+                verdict = recovery.classify(result)
+                if verdict != "infra":
+                    async with seen_lock:
+                        self.seen[key] = self.seen.get(key, 0) + 1
+                        self.seen_total[key[:2]] = self.seen_total.get(key[:2], 0) + 1
+                        if verdict != "ok":
+                            self.seen_infra.pop(signature, None)
+                    return result
+                # ---- infrastructure failure: the tool never ran. Recover and retry.
+                async with seen_lock:
+                    infra_count = self.seen_infra.get(signature, 0) + 1
+                    self.seen_infra[signature] = infra_count
+                    self.infra_failures += 1
+                    self.last_infra_error = str(result.error or "")[:300]
+                    self._last_infra_signature = signature
+                if verdict == "infra":
+                    await self._prepare_recovery()
+                if not policy.should_retry(attempt, verdict):
+                    return ToolResult(
+                        ok=False,
+                        content="ERROR: " + recovery.infra_directive(name, attempt, str(result.error or ""),
+                                                                   recovered=False, occurrence=infra_count),
+                        summary=redact(str(result.error or ""))[:200],
+                        error=str(result.error or ""),
+                        data={**(result.data or {}), "kind": "infra_unrecovered", "attempts": attempt,
+                              "signature": signature, "retryable": True})
+                self.run.emit("internal.recovery", tool=name, attempt=attempt,
+                              delay_s=round(policy.delay(attempt), 2), reason=str(result.error or "")[:160])
+                await policy.sleep_for(attempt)
 
         pending: List[tuple] = []
         for call in step.calls:
@@ -897,9 +1017,11 @@ class AgentRun:
             # evidence of work, so it is written before the model ever sees the result and is persisted
             # with the message — the model's later claims are checked against it, not trusted.
             try:
-                preview = json.dumps(loads_args(call["args"]), ensure_ascii=False, sort_keys=True, default=str)
+                parsed_args = loads_args(call["args"])
+                preview = json.dumps(parsed_args, ensure_ascii=False, sort_keys=True, default=str)
             except ValueError:
-                preview = str(call.get("args") or "")
+                parsed_args, preview = {}, str(call.get("args") or "")
+            signature = recovery.signature(call["name"], parsed_args)
             self.ledger.append({
                 "n": part["name"], "a": redact(preview)[:400], "ok": bool(result.ok),
                 "s": "ok" if result.ok else "error",
@@ -913,12 +1035,21 @@ class AgentRun:
             if result.ok and spec is not None and spec.kind == "write":
                 self._epoch += 1      # the world changed: re-running the same call is now meaningful
             err = str(result.error or "")
-            if err.startswith("invalid arguments") or err.startswith("unknown tool"):
+            verdict = recovery.classify(result)
+            if verdict == "invalid":
                 self.malformed += 1
-            elif err.startswith("duplicate call"):
+            elif verdict == "duplicate":
+                # Only a *completed, unchanged* repeat is a stall worth striking.
                 self.strikes += 1
+            elif verdict == "infra":
+                # Never counted as a tool call or a strike: no work happened, and the
+                # runtime (not the model) is responsible for recovering the computer.
+                if signature in self.seen_infra and int(result.data.get("attempts") or 0) > 1:
+                    self._infra_healed = False
             else:
                 self.tool_calls_total += 1
+                if signature and signature in self.seen_infra:
+                    self._infra_healed = True
             finished[index] = (part, result, max(1, int((time.monotonic() - started) * 1000)))
             _publish(index)
 
