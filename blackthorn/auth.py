@@ -235,7 +235,8 @@ class AuthMiddleware:
         # /api/kaggle-relay/* carries its own per-request relay key; exempt from owner wall.
         if (
             not path.startswith("/api/")
-            or path in ("/api/health", "/api/auth/status", "/api/auth/login", "/api/auth/logout")
+            # /api/lab is the same kind of signal as /api/health: wiring only, no secrets.
+            or path in ("/api/health", "/api/lab", "/api/auth/status", "/api/auth/login", "/api/auth/logout")
             or path.startswith("/api/kaggle-relay/")
         ):
             await self.app(scope, receive, send)
