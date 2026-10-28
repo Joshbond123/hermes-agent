@@ -281,3 +281,31 @@ async def test_pool_is_used_for_every_request_not_just_creation(monkeypatch):
         assert control.key == key, "the pool's active key must back every request"
         assert await control._owned() == []
     assert seen and seen[0] == "Bearer " + key
+
+
+@pytest.mark.asyncio
+async def test_status_honours_the_persisted_rotation(monkeypatch):
+    """A rotated pool must list with the key that actually owns the sandbox."""
+    key_a, key_b = "pds_first", "pds_second"
+    monkeypatch.delenv("PANDASTACK_API_KEY", raising=False)
+    monkeypatch.setenv("PANDASTACK_API_KEY_2", key_a)
+    monkeypatch.setenv("PANDASTACK_API_KEY_3", key_b)
+    from blackthorn.panda_keys import fingerprint
+    own = "12345678-1234-1234-1234-123456789abc"
+    settings = Settings()
+    settings.values["pandastack_computer_intent"] = "on"
+    settings.values["pandastack_active_key_fingerprint"] = fingerprint(key_b)
+    used = []
+
+    def answer(request):
+        key = request.headers.get("authorization", "").replace("Bearer ", "")
+        used.append(key)
+        rows = [{"id": own, "status": "running", "metadata": {"purpose": PURPOSE, "role": "primary"}}] \
+            if key == key_b else []
+        return httpx.Response(200, json=rows)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(answer)) as client:
+        control = PandaControl(settings, client)
+        await control._owned()
+    assert key_b in used, "the persisted active key must be used, not the first env key"
+    assert key_a not in used

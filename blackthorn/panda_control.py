@@ -100,6 +100,13 @@ class PandaControl:
         return {"Authorization": "Bearer " + self.key}
 
     async def _request(self, method: str, path: str = "", **kw):
+        if self._pool is not None:
+            # Honour the rotation another worker performed: without this, status and
+            # listing fall back to the first configured key and see no sandboxes.
+            try:
+                await self._pool.restore_active()
+            except Exception:
+                pass
         response = await self.http.request(method, BASE + path, headers=self._headers(), timeout=35, **kw)
         if response.status_code in (401, 403):
             raise RuntimeError("PandaStack denied access")
@@ -406,10 +413,20 @@ class PandaControl:
             raise
         await self.store.set_setting(SANDBOX, sid)
         # A successful create is not enough: execute harmless work on the live VM.
-        probe = await self._request("POST", "/" + sid + "/exec",
-                                    json={"cmd": "python3 -c 'print(19*23)'", "timeout_seconds": 15})
-        if probe.status_code != 200 or probe.json().get("exit_code") != 0 or str(probe.json().get("stdout", "")).strip() != "437":
-            raise RuntimeError("PandaStack computer was created but its live exec probe failed")
+        try:
+            probe = await self._request("POST", "/" + sid + "/exec",
+                                        json={"cmd": "python3 -c 'print(19*23)'", "timeout_seconds": 15})
+            good = probe.status_code == 200 and probe.json().get("exit_code") == 0 and \
+                str(probe.json().get("stdout", "")).strip() == "437"
+        except Exception:
+            good = False
+        if not good:
+            # Do not leave an unverified, billable VM behind.
+            try:
+                await self.delete(sid)
+            finally:
+                await self.store.set_setting(SANDBOX, "")
+            raise RuntimeError("PandaStack computer was created but its live exec probe failed; it was deleted")
         return await self.status()
 
     async def start_with_fallback(self, *, allow_lab_fallback: bool = True):
@@ -447,9 +464,19 @@ class PandaControl:
                     ". Lab fallback: " + (str(lab_exc) or type(lab_exc).__name__)) from lab_exc
             await self.store.set_setting(SANDBOX, sid)
             await self.store.set_setting(ROLE_SETTING, "lab-fallback")
-            if not await self.probe(sid):
-                await self.delete(sid)
-                raise RuntimeError("A lab-style VM was created but could not execute work; it was deleted. Primary error: " + primary_error)
+            # A created VM that cannot be verified must never be left running: delete it
+            # even when the probe itself throws (that is what left orphans behind before).
+            try:
+                usable = await self.probe(sid)
+            except Exception:
+                usable = False
+            if not usable:
+                try:
+                    await self.delete(sid)
+                finally:
+                    await self.store.set_setting(SANDBOX, "")
+                raise RuntimeError("A lab-style VM was created but could not execute work; it was deleted. "
+                                   "Primary error: " + primary_error)
             status = await self.status()
             status.update({"role": "lab-fallback", "fallback": True, "fallback_reason": primary_error,
                            "last_error": primary_error})
