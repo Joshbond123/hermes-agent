@@ -364,3 +364,12 @@ def test_unknown_action_is_rejected_without_launching_a_browser(site):
 def test_file_scheme_is_refused(site):
     result = run({"url": "file:///etc/passwd", "action": "open"}, expect_ok=False)
     assert result["error_kind"] == "bad_request"
+
+
+def test_tabs_opens_a_second_tab_and_closes_it(site):
+    result = run({"action": "tabs", "url": site + "/more"})
+    tabs = result["tabs"]
+    assert len(tabs) >= 2, tabs
+    assert any(t["url"].endswith("/more") for t in tabs)
+    after = run({"action": "tabs", "close_tab": 1})
+    assert len(after["tabs"]) == len(tabs) - 1

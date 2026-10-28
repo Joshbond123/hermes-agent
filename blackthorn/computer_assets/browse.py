@@ -181,6 +181,83 @@ def _install_linux_libs(binary: str) -> tuple:
     return True, "restored the Firefox system libraries"
 
 
+def _is_bundle_damage(exc: Exception) -> bool:
+    """A half-extracted or self-repairing browser install, not a page or script error.
+
+    Camoufox's launcher re-extracts its bundle when it believes the install is
+    incomplete, which can collide with an existing directory (``OSError [Errno 39]
+    Directory not empty .../fonts``) and then fails *every* later call. The only
+    correct recovery is to discard the bundle and fetch it again once.
+    """
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(marker in text for marker in (
+        "camoufoxnotinstalled", "directory not empty", "errno 39", "no space left",
+        "corrupted", "checksum", "not installed", "please run `camoufox fetch`",
+        "xpcomglueload",
+    ))
+
+
+def _repair_bundle(cache_root: str) -> bool:
+    """Delete a damaged bundle and download it once more. Returns True on success."""
+    import shutil as _shutil
+    browsers = pathlib.Path(cache_root) / "camoufox" / "browsers"
+    for target in (browsers, pathlib.Path(os.path.expanduser("~/.cache/camoufox/browsers"))):
+        try:
+            if target.exists():
+                _shutil.rmtree(target, ignore_errors=True)
+        except OSError:
+            pass
+    try:
+        proc = _run([sys.executable, "-m", "camoufox", "fetch"], 1800,
+                    env={"XDG_CACHE_HOME": cache_root})
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0 and _browser_present(cache_root)
+
+
+def _warm_browser(cache_root: str, notes: list) -> None:
+    """Complete the expensive one-time browser start-up *before* a user action needs it.
+
+    The first launch of a fresh bundle installs the fingerprint model and extracts the
+    bundled addons, which can take minutes on a small microVM. Paying that inside the
+    first ``open`` makes a normal tool call look like a timeout, so a stamped warm-up is
+    done here: launch, load a blank page, close. A warm bundle costs one cheap launch.
+    """
+    import importlib.util
+    stamp = pathlib.Path(cache_root) / "camoufox" / ".blackthorn-warm"
+    if stamp.exists():
+        return
+    if importlib.util.find_spec("camoufox") is None:
+        return
+    try:
+        from camoufox.sync_api import Camoufox
+    except Exception as exc:  # a broken import surfaces at launch with a real message
+        notes.append(f"browser warm-up skipped: {type(exc).__name__}")
+        return
+    for attempt in (1, 2):
+        try:
+            with Camoufox(headless=True, humanize=False) as browser:
+                context = browser.new_context()
+                page = context.new_page()
+                page.goto("about:blank")
+                context.close()
+            break
+        except Exception as exc:  # noqa: BLE001
+            if attempt == 1 and _is_bundle_damage(exc):
+                notes.append(f"damaged browser bundle detected ({type(exc).__name__}); refetching once")
+                if _repair_bundle(cache_root):
+                    notes.append("browser bundle refetched")
+                    continue
+            notes.append(f"browser warm-up failed: {type(exc).__name__}: {str(exc)[:120]}")
+            return
+    try:
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.write_text(str(int(time.time())))
+        notes.append("browser warmed once for this sandbox")
+    except OSError:
+        pass
+
+
 def _browser_present(cache_root: str) -> bool:
     roots = [pathlib.Path(cache_root) / "camoufox",
              pathlib.Path(os.path.expanduser("~/.cache/camoufox"))]
@@ -220,6 +297,7 @@ def _ensure_runtime(notes: list) -> None:
         if proc.returncode != 0:
             raise RuntimeError("camoufox browser download failed: " + ((proc.stderr or proc.stdout or "")[-300:]))
         notes.append("downloaded Camoufox browser after replacement")
+    _warm_browser(cache_root, notes)
     if sys.platform.startswith("linux"):
         binary = _browser_binary(cache_root)
         missing = _missing_libs(binary)
@@ -418,11 +496,23 @@ def run_session(req: dict, notes: list, started: float) -> dict:
                 result["accessibility"] = tree
                 result["accessibility_source"] = source
             elif action == "tabs":
+                if req.get("url"):
+                    # Open a second tab so tab handling is meaningful: a session may need the
+                    # original page kept open while a second one is inspected or scraped.
+                    extra = context.new_page()
+                    extra.set_default_timeout(timeout_ms)
+                    try:
+                        extra.goto(str(req["url"]), wait_until="domcontentloaded", timeout=timeout_ms)
+                    except Exception as exc:
+                        notes.append(f"secondary tab navigation failed: {type(exc).__name__}")
                 tabs = [{"index": i, "url": p.url, "title": _safe_title(p)} for i, p in enumerate(context.pages)]
                 if req.get("close_tab") is not None:
                     index = int(req["close_tab"])
                     if 0 <= index < len(context.pages) and len(context.pages) > 1:
-                        context.pages[index].close()
+                        try:
+                            context.pages[index].close()
+                        except Exception:
+                            pass
                         tabs = [{"index": i, "url": p.url, "title": _safe_title(p)} for i, p in enumerate(context.pages)]
                 result = {"ok": True, "action": "tabs", "tabs": tabs, "notes": notes,
                           "elapsed_s": round(time.monotonic() - started, 2)}
@@ -508,10 +598,19 @@ def main() -> None:
         except SystemExit:
             raise
         except Exception as exc:  # noqa: BLE001
+            damaged = _is_bundle_damage(exc)
             kind = ("timeout" if _is_timeout(exc) else
                     "browser_crashed" if _is_crash(exc) else
-                    "dependency" if type(exc).__name__ in ("ModuleNotFoundError", "ImportError", "FileNotFoundError")
+                    "dependency" if damaged or type(exc).__name__ in
+                    ("ModuleNotFoundError", "ImportError", "FileNotFoundError")
                     else "browser_error")
+            if damaged and not any("refetch" in note for note in notes):
+                cache_root = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+                notes.append(f"dependency failure ({type(exc).__name__}); refetching the browser bundle once")
+                if _repair_bundle(cache_root):
+                    notes.append("browser bundle refetched")
+                    attempts -= 1
+                    continue
             if attempts < 2 and kind in ("browser_crashed", "timeout"):
                 notes.append(f"{kind}: relaunched the browser once")
                 continue

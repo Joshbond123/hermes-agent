@@ -81,11 +81,21 @@ def build_services(settings: Settings, *, executor: Any = None, http: Any = None
         lifecycle = SandboxLifecycle(store, computer, window_s=window)
     else:
         computer = ComputerClient(resolver, http, store=store)
+    # The malware lab is a separate, on-demand microVM. It is constructed here but
+    # creates nothing until the agent asks for it.
+    lab = None
+    if panda_key:
+        from .malware_lab import from_env as _lab_from_env
+        try:
+            lab = _lab_from_env(http, store, key_pool or panda_key)
+        except Exception as exc:  # noqa: BLE001 - a bad lab config must not stop the app
+            log.error("malware lab unavailable: %s", type(exc).__name__)
+            lab = None
     return Services(settings=settings, store=store, resolver=resolver, registry=default_registry(), http=http,
                     tavily=TavilyKeys(store), computer=computer,
                     runs=RunManager(ttl=settings.run_ttl_s, max_active=settings.max_active_runs),
                     gpu=GpuService(store), static_dir=static_dir or STATIC_DIR, fleet=fleet,
-                    key_pool=key_pool, lifecycle=lifecycle)
+                    key_pool=key_pool, lifecycle=lifecycle, lab=lab)
 
 
 

@@ -153,6 +153,7 @@ class ToolContext:
     run_id: str = ""
     board: Any = None              # the run's TaskBoard (persistent task list); None outside a run
     user_message: str = ""         # latest real user request for the board's durable goal
+    lab: Any = None                # on-demand malware execution lab (None when PandaStack is unconfigured)
 
 
 Handler = Callable[[Dict[str, Any], ToolContext], Awaitable[ToolResult]]

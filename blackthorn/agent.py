@@ -110,6 +110,7 @@ class Deps:
     tavily: Any
     computer: Any
     activity: Any = None   # run_started() / run_touched() / run_finished(): keeps the GPU's inactivity clock honest
+    lab: Any = None        # on-demand malware execution lab (separate microVM)
 
 
 @dataclass
@@ -901,7 +902,8 @@ class AgentRun:
 
         ctx = ToolContext(settings=s, store=self.deps.store, computer=self.deps.computer, http=self.deps.http,
                           tavily=self.deps.tavily, session_id=self.run.session_id, run_id=self.run.id,
-                          board=self.board, user_message=self.user_message)
+                          board=self.board, user_message=self.user_message,
+                          lab=getattr(self.deps, "lab", None))
         # Every call the model asked for is executed — none are ever dropped or skipped.
         # max_calls_per_step bounds *concurrency* (protects the GPU computer from a stampede),
         # not how much work a step may do. Each call reports its result the moment it finishes

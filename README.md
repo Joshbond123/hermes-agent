@@ -162,6 +162,17 @@ For the full command lists, see the [CLI guide](https://hermes-agent.nousresearc
 
 ---
 
+
+## Malware lab (Blackthorn deployment)
+
+`lab_open` / `lab_detonate` / `lab_close` give the agent an on-demand, network-sealed
+PandaStack microVM for malware, ransomware and virus execution — created only when a
+sample must actually run, destroyed the moment the analysis ends (or after
+`BLACKTHORN_LAB_IDLE_S` idle, or the provider TTL). The sample executes inside an empty
+network namespace as an unprivileged user; the isolation is proven by probe before
+anything runs and the lab fails closed if it is not. Static triage needs no lab.
+See [blackthorn/COMPUTER_DRIVE.md](blackthorn/COMPUTER_DRIVE.md) for the full contract.
+
 ## Documentation
 
 All documentation lives at **[hermes-agent.nousresearch.com/docs](https://hermes-agent.nousresearch.com/docs/)**:

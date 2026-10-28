@@ -97,16 +97,34 @@ class PandaControl:
         """
         owned = await self._owned() if owned is None else owned
         stored = await self.store.get_setting(SANDBOX) if self.store is not None else ""
+        # Never release a sandbox an in-flight handover depends on: during an overlap both
+        # the source and its verified replacement are legitimate, and deleting the wrong
+        # one destroys a workspace that was just restored.
+        protected = set()
+        if self.store is not None and hasattr(self.store, "get_setting"):
+            try:
+                import json as _json
+                state = _json.loads(await self.store.get_setting("pandastack_lifecycle_state") or "{}")
+                protected = {str(state.get(key)) for key in ("source", "replacement") if state.get(key)}
+            except Exception:
+                protected = set()
+        if stored:
+            protected.add(stored)
         keep = next((x for x in owned if x.get("id") == stored), None)
+        if keep is None and protected:
+            # No stored ID, but a handover names a live sandbox: adopt that one.
+            keep = next((x for x in owned if x.get("id") in protected), None)
         if keep is None:
-            # No stored ID: keep the newest and release the rest.
+            # Nothing authoritative: keep the newest and release the rest.
             ordered = sorted(owned, key=lambda x: str(x.get("created_at") or ""))
             keep = ordered[-1] if ordered else None
-            if keep is not None:
-                await self.store.set_setting(SANDBOX, keep["id"])
+        if keep is not None and self.store is not None:
+            await self.store.set_setting(SANDBOX, keep["id"])
         released = []
         for item in owned:
             if keep is not None and item.get("id") == keep.get("id"):
+                continue
+            if item.get("id") in protected:
                 continue
             try:
                 await self.delete(item["id"])

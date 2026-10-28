@@ -45,12 +45,14 @@ class Services:
     fleet: Any = None
     key_pool: Any = None        # PandaStack API-key pool (rotation, quota projection)
     lifecycle: Any = None       # sandbox lifecycle manager (TTL handover)
+    lab: Any = None             # on-demand malware/ransomware execution lab
     _prompt_cache: tuple = field(default=(0.0, ""))
     _memory_cache: tuple = field(default=(0.0, ()))
 
     def deps(self) -> Deps:
         return Deps(settings=self.settings, store=self.store, resolver=self.resolver, registry=self.registry,
-                    http=self.http, tavily=self.tavily, computer=self.computer, activity=self.gpu)
+                    http=self.http, tavily=self.tavily, computer=self.computer, activity=self.gpu,
+                    lab=self.lab)
 
     async def user_prompt(self) -> str:
         ts, value = self._prompt_cache

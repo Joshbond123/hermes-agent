@@ -119,10 +119,19 @@ class WorkspaceMirror:
             if fingerprint == previous:
                 return bool(force and previous)
             excludes = " ".join(f"--exclude='./{name}'" for name in EXCLUDES)
-            await self._run(f"mkdir -p {SCRATCH} && rm -f {SCRATCH}/part-* {SCRATCH}/current.tar.gz && "
-                            f"tar --sort=name {excludes} -czf {SCRATCH}/current.tar.gz "
-                            f"-C /workspace . && split -b {CHUNK} -d -a 5 {SCRATCH}/current.tar.gz {SCRATCH}/part-",
-                            timeout=600)
+            # ``tar`` exits 1 with "file changed as we read it" whenever a background job,
+            # a package install or the browser writes into /workspace while the checkpoint
+            # is being taken. That is a *warning about a race*, not a failed backup: the
+            # archive is still complete enough to restore, and the digest recorded below
+            # describes exactly what was captured. Failing the user's tool call over it
+            # would make every long task uncheckpointable.
+            script = (f"mkdir -p {SCRATCH} && rm -f {SCRATCH}/part-* {SCRATCH}/current.tar.gz && "
+                      f"tar --sort=name --warning=no-file-changed {excludes} -czf {SCRATCH}/current.tar.gz "
+                      f"-C /workspace . ; rc=$? ; "
+                      f"[ -s {SCRATCH}/current.tar.gz ] && gzip -t {SCRATCH}/current.tar.gz || exit $rc ; "
+                      f"exit 0")
+            await self._run(script, timeout=600)
+            await self._run(f"split -b {CHUNK} -d -a 5 {SCRATCH}/current.tar.gz {SCRATCH}/part-", timeout=300)
             size = int((await self._run(f"stat -c %s {SCRATCH}/current.tar.gz", timeout=60)).strip() or 0)
             if size > MAX_ARCHIVE_BYTES:
                 raise ToolError("storage", f"Workspace checkpoint is {size} bytes, over the "

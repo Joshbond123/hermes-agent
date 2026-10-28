@@ -2,14 +2,15 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
-from . import computer, memory, security, task, web
+from . import computer, lab, memory, security, task, web
 from .base import ToolContext, ToolError, ToolRegistry, ToolResult, ToolSpec, clip, loads_args, redact, validate_args
 from .task import TaskBoard
 
 
 def default_registry() -> ToolRegistry:
     reg = ToolRegistry()
-    for spec in [*web.specs(), *computer.specs(), *memory.specs(), *security.specs(), *task.specs()]:
+    for spec in [*web.specs(), *computer.specs(), *memory.specs(), *security.specs(), *task.specs(),
+                 *lab.specs()]:
         reg.register(spec)
     # Hermes-style progressive disclosure: uncommon native tools remain discoverable and
     # callable without paying for all of their schemas on every ordinary computer task.

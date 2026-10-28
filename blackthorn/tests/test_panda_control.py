@@ -1,4 +1,6 @@
 """Controller invariants. These unit tests do not replace live provider probes."""
+import json
+
 import httpx
 import pytest
 
@@ -146,3 +148,25 @@ async def test_expired_vm_is_replaced_only_once_across_concurrent_workers():
         assert await store.get_setting(SANDBOX) == sid
     finally:
         await db.aclose()
+
+
+async def test_reconciliation_never_deletes_a_sandbox_a_handover_depends_on():
+    """During a handover two sandboxes legitimately exist: the source and its replacement."""
+    store = Settings()
+    state = {"source": "old-vm", "replacement": "new-vm"}
+    await store.set_setting("pandastack_lifecycle_state", json.dumps(state))
+    deleted = []
+
+    class Control(PandaControl):
+        async def _owned(self):
+            return [{"id": "old-vm", "status": "running", "metadata": {"purpose": PURPOSE, "role": "primary"}},
+                    {"id": "new-vm", "status": "running", "metadata": {"purpose": PURPOSE, "role": "replacement"}},
+                    {"id": "leaked-vm", "status": "running", "metadata": {"purpose": PURPOSE, "role": "primary"}}]
+
+        async def delete(self, sid):
+            deleted.append(sid)
+            return True
+
+    released = await Control(store, None, "test-key").reconcile_extras()
+    assert released == ["leaked-vm"], released
+    assert set(deleted) == {"leaked-vm"}

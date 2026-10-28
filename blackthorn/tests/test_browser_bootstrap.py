@@ -173,3 +173,36 @@ def test_unresolvable_libraries_raise_instead_of_a_mystery_crash(monkeypatch, tm
     with pytest.raises(RuntimeError) as err:
         browse._ensure_runtime([])
     assert "libgtk-3.so.0" in str(err.value)
+
+
+def test_damaged_bundle_is_detected_from_the_sdk_error():
+    """Observed live: the launcher's self-repair collides with an existing directory."""
+    live_error = OSError(39, "Directory not empty",
+                         "/workspace/.cache/camoufox/browsers/official/x/fonts")
+    assert browse._is_bundle_damage(live_error) is True
+    assert browse._is_bundle_damage(RuntimeError(
+        "camoufox.exceptions.CamoufoxNotInstalled: official 156.0.1-beta.36 is not installed")) is True
+    assert browse._is_bundle_damage(RuntimeError("XPCOMGlueLoad error for file camoufox-bin")) is True
+    # An ordinary page error must NOT trigger a 1.5 GB re-download.
+    assert browse._is_bundle_damage(TimeoutError("locator.click: Timeout 3000ms exceeded")) is False
+
+
+def test_repair_refetches_once_and_reports_success(tmp_path, monkeypatch):
+    cache = tmp_path / "cache"
+    browsers = cache / "camoufox" / "browsers" / "official" / "broken"
+    browsers.mkdir(parents=True)
+    (browsers / "camoufox-bin").write_text("partial")
+    calls = []
+
+    def run(cmd, timeout, env=None):
+        calls.append(cmd)
+        # simulate a successful refetch by materialising a fresh bundle
+        fresh = cache / "camoufox" / "browsers" / "official" / "fresh"
+        fresh.mkdir(parents=True, exist_ok=True)
+        (fresh / "camoufox-bin").write_text("binary")
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(browse, "_run", run)
+    assert browse._repair_bundle(str(cache)) is True
+    assert calls and calls[0][:3] == [__import__("sys").executable, "-m", "camoufox"]
+    assert not browsers.exists(), "the damaged bundle must be removed, not reused"
