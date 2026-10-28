@@ -96,8 +96,12 @@ async def test_common_computer_task_prefill_has_less_schema_without_losing_core_
     wire = stack.backend.requests[0]["tools"]
     names = {t["function"]["name"] for t in wire}
     assert {"read_file", "write_file", "run_command", "list_files", "web_search", "todo_list", "job_status"} <= names
-    full = [s for s in default_registry().schemas() if not s["function"]["name"].startswith("malware_analyzer_")]
-    assert prompts.schema_tokens(wire) <= 1700 < prompts.schema_tokens(full)
+    # Capability discovery + the lab are always disclosed so the agent can choose them
+    # itself; the schemas are compacted so that stays affordable on an 8k context.
+    assert {"skill_search", "tool_search", "cyber_run", "lab_detonate", "lab_exec"} <= names
+    full = default_registry().schemas()
+    assert prompts.schema_tokens(wire) < prompts.schema_tokens(full)
+    assert prompts.schema_tokens(wire) <= 3200
 
 
 async def test_deferred_capability_can_be_invoked_without_loading_all_schemas(stack):

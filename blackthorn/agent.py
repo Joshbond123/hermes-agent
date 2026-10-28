@@ -196,7 +196,10 @@ class AgentRun:
             r"(malware|analyzer).{0,120}(submit|upload|report|lookup)", context, re.I))
         if specific_remote:
             allowed = {"malware_analyzer_submit", "malware_analyzer_report", "sample_triage",
-                       "list_files", "read_file", "write_file", "web_search", "todo_list"}
+                       "list_files", "read_file", "write_file", "web_search", "todo_list",
+                       "skill_search", "skill_load", "skill_read", "tool_search", "cyber_run",
+                       "cyber_preflight", "lab_open", "lab_status", "lab_detonate", "lab_exec",
+                       "lab_os", "lab_close"}
             self._active_schemas = [schema for schema in self._schemas if schema["function"]["name"] in allowed]
         elif self._remote_analysis:
             self._active_schemas = self._schemas
@@ -211,8 +214,15 @@ class AgentRun:
             # Core tools are always offered: the computer primitives, web research and the
             # task list. Losing web_search/todo_list on a plain computer turn made the agent
             # unable to plan multi-step work or look anything up without a lucky keyword.
+            # Capability discovery and the lab are ALWAYS offered. Keyword gating here was
+            # the reason the agent could not decide for itself that a task needed a skill or
+            # a tool: when the words "skill"/"catalog"/"malware" were absent it never saw the
+            # discovery tools at all. Disclosure stays on-demand (search -> load -> run), so
+            # the schemas are small while the capability itself is always reachable.
             core = {"run_command", "list_files", "read_file", "write_file", "job_status",
-                    "web_search", "todo_list"}
+                    "web_search", "todo_list", "skill_search", "skill_load", "skill_read",
+                    "tool_search", "cyber_run", "cyber_preflight", "sample_triage",
+                    "lab_open", "lab_status", "lab_detonate", "lab_exec", "lab_os", "lab_close"}
             context_lower = (context + " " + " ".join(str(t.get("content") or "")[:300]
                             for t in self.turns[-4:] if t.get("role") == "user")).lower()
             def mentions(*words: str) -> bool:

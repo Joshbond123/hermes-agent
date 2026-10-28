@@ -44,6 +44,14 @@ SCHEMAS: Dict[str, Dict[str, Any]] = {
     "lab_close": {"type": "object", "properties": {
         "reason": {"type": "string", "maxLength": 200, "default": "analysis finished"}},
         "required": []},
+    "lab_exec": {"type": "object", "properties": {
+        "command": {"type": "string", "minLength": 1, "maxLength": 8000},
+        "os": {"type": "string", "enum": ["auto", "linux", "windows"], "default": "auto"},
+        "timeout_seconds": {"type": "integer", "minimum": 5, "maximum": 900, "default": 120},
+        "note": {"type": "string", "maxLength": 200, "default": ""}},
+        "required": ["command"]},
+    "lab_os": {"type": "object", "properties": {
+        "install_windows": {"type": "boolean", "default": False}}, "required": []},
 }
 
 
@@ -197,6 +205,55 @@ async def lab_close(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
     return ToolResult(ok=True, content=body, summary="lab closed · VM deleted", data=state)
 
 
+async def lab_os(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
+    """Report the lab guest OS, privileges and whether Windows binaries can run."""
+    lab = _lab(ctx)
+    if lab is None:
+        return _unconfigured()
+    if lab.session is None:
+        return ToolResult.failure("The malware lab is off. Call lab_open first (or run lab_exec, which opens it).")
+    lab.hold()
+    try:
+        if args.get("install_windows"):
+            installed = await lab.install_windows_support()
+            info = installed.get("os") or await lab.os_info()
+            body = (f"Windows (PE) support installed={installed.get('installed')} "
+                    f"verified={installed.get('verified')} wine={installed.get('wine') or 'absent'}")
+            return ToolResult(ok=bool(installed.get("verified")), content=body,
+                              summary="windows support prepared", data={**installed, **info})
+        info = await lab.os_info()
+        body = (f"Lab guest: {info.get('kernel')} · uid {info.get('uid')} "
+                f"(root={info.get('root')}) · arch {info.get('arch')}\n"
+                f"Linux execution: yes · Windows execution: "
+                f"{'yes via ' + str(info.get('wine')) if info.get('windows') else 'NOT READY — '
+                   + str(info.get('windows_note'))}")
+        return ToolResult(ok=True, content=body, summary=f"lab os {info.get('kernel')}", data=info)
+    finally:
+        lab.release()
+
+
+async def lab_exec(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
+    """Run an administrative or analysis command inside the dedicated lab as root."""
+    lab = _lab(ctx)
+    if lab is None:
+        return _unconfigured()
+    command = str(args.get("command") or "").strip()
+    if not command:
+        return ToolResult.failure("command is required")
+    timeout = int(args.get("timeout_seconds") or 120)
+    lab.hold()                       # the idle watchdog must not close the lab mid-command
+    try:
+        if lab.session is None:
+            await lab.open(reason=args.get("note") or "lab command")
+        result = await lab.run_os(command, os_name=args.get("os") or "auto", timeout=timeout)
+    finally:
+        lab.release()
+    body = (f"$ {command}\nexit={result.get('exit_code')} ({result.get('duration_ms')} ms)\n"
+            f"{clip((result.get('stdout') or '') + (result.get('stderr') or ''), 4000)[0]}")
+    return ToolResult(ok=result.get("exit_code") == 0, content=redact(body),
+                      summary=f"lab exec exit {result.get('exit_code')}", data=result)
+
+
 def specs() -> list[ToolSpec]:
     return [
         ToolSpec("lab_open",
@@ -218,6 +275,19 @@ def specs() -> list[ToolSpec]:
                  "The sample never runs on your working computer, and its bytes never leave the lab VM.",
                  SCHEMAS["lab_detonate"], lab_detonate, timeout=900.0, kind="exec",
                  describe=lambda a: str(a.get("filename") or a.get("sample_path") or "sample")),
+        ToolSpec("lab_os",
+                 "Report the lab guest OS, whether commands run as root, and whether Windows binaries can be "
+                 "executed. Set install_windows=true to install Wine and verify it by running a real Windows PE.",
+                 SCHEMAS["lab_os"], lab_os, timeout=1200.0, kind="exec",
+                 describe=lambda a: "install windows" if a.get("install_windows") else "os info"),
+        ToolSpec("lab_exec",
+                 "Run a command inside the dedicated malware lab VM as root — install tools and antivirus, "
+                 "manage processes, inspect files, analyse the OS. os='linux' runs natively; os='windows' runs a "
+                 "Windows PE/command through Wine after verifying it is available; os='auto' picks Windows for "
+                 ".exe/.bat/.cmd/.ps1. The lab starts automatically if it is off and is left running for you to "
+                 "finish the job (call lab_close when done).",
+                 SCHEMAS["lab_exec"], lab_exec, timeout=1200.0, kind="exec",
+                 describe=lambda a: str(a.get("command") or "")[:80]),
         ToolSpec("lab_close",
                  "Destroy the malware lab VM and verify the provider no longer lists it. Call this as soon as the "
                  "analysis is finished so nothing keeps running or billing.",

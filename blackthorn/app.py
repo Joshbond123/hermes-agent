@@ -63,6 +63,7 @@ def build_services(settings: Settings, *, executor: Any = None, http: Any = None
         raise ValueError("PandaStack computer requires both private provider and drive credentials")
     key_pool = None
     lifecycle = None
+    runs = RunManager(ttl=settings.run_ttl_s, max_active=settings.max_active_runs)
     if panda_key:
         from .panda_computer import PandaComputerClient
         from .panda_keys import PandaKeyPool
@@ -79,21 +80,39 @@ def build_services(settings: Settings, *, executor: Any = None, http: Any = None
         except ValueError:
             window = DEFAULT_WINDOW_S
         lifecycle = SandboxLifecycle(store, computer, window_s=window)
+        # The lifecycle must be able to see running agent turns, so it never rotates
+        # (or hibernates) the computer out from under an active task.
+        lifecycle.runs = runs
     else:
         computer = ComputerClient(resolver, http, store=store)
-    # The malware lab is a separate, on-demand microVM. It is constructed here but
-    # creates nothing until the agent asks for it.
+    # Skills + tools live in the GitHub drive and are restored onto every computer and
+    # lab VM, so a replaced microVM never loses its capability catalog.
+    capabilities = None
+    try:
+        from .capabilities import from_env as _capabilities_from_env
+        capabilities = _capabilities_from_env(http, store)
+    except Exception as exc:  # noqa: BLE001 - discovery must not stop the app
+        log.error("capability catalog unavailable: %s", type(exc).__name__)
+    if capabilities is not None and hasattr(computer, "capabilities"):
+        computer.capabilities = capabilities
+    # The malware lab is a separate, on-demand microVM with its OWN provider account.
+    # It is constructed here but creates nothing until the agent asks for it.
     lab = None
-    if panda_key:
+    try:
+        from .keys_role import lab_key as _lab_key
+        _dedicated = _lab_key(os.environ)
+    except Exception:  # noqa: BLE001
+        _dedicated = ""
+    if _dedicated:
         from .malware_lab import from_env as _lab_from_env
         try:
-            lab = _lab_from_env(http, store, key_pool or panda_key)
+            lab = _lab_from_env(http, store, _dedicated, capabilities=capabilities)
         except Exception as exc:  # noqa: BLE001 - a bad lab config must not stop the app
             log.error("malware lab unavailable: %s", type(exc).__name__)
             lab = None
     return Services(settings=settings, store=store, resolver=resolver, registry=default_registry(), http=http,
                     tavily=TavilyKeys(store), computer=computer,
-                    runs=RunManager(ttl=settings.run_ttl_s, max_active=settings.max_active_runs),
+                    runs=runs,
                     gpu=GpuService(store), static_dir=static_dir or STATIC_DIR, fleet=fleet,
                     key_pool=key_pool, lifecycle=lifecycle, lab=lab)
 

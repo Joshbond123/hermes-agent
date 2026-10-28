@@ -134,10 +134,10 @@ class PandaKeyPool:
     @classmethod
     def from_env(cls, http: httpx.AsyncClient, store: Any = None, environ: Optional[Dict[str, str]] = None) -> Optional["PandaKeyPool"]:
         env = environ if environ is not None else os.environ
-        raw = [env.get("PANDASTACK_API_KEY", "")]
-        raw += [env.get(f"PANDASTACK_API_KEY_{i}", "") for i in range(2, 10)]
-        raw += parse_keys(env.get("PANDASTACK_API_KEYS", ""))
-        keys = parse_keys(",".join(r for r in raw if r))
+        # General-purpose computers only: the dedicated lab credential is a
+        # separate account and must never be spent on ordinary computer work.
+        from .keys_role import computer_keys
+        keys = computer_keys(env)
         if not keys:
             return None
         threshold = env.get("PANDASTACK_ROTATE_BEFORE_SECONDS") or DEFAULT_THRESHOLD_S

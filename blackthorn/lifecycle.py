@@ -288,6 +288,23 @@ class SandboxLifecycle:
         return {"ok": True, "phase": "recovered", "sandbox_id": sid}
 
     # ------------------------------------------------------------------ periodic driver
+    def _runs_busy(self) -> bool:
+        """True while an agent turn is actually executing on this computer.
+
+        Rotating (or hibernating) a sandbox mid-turn is the commonest cause of an
+        interrupted task: the tool call in flight dies with the VM. The lifecycle
+        waits for the turn to finish instead, and the provider TTL is the backstop.
+        """
+        probe = getattr(self, "runs", None) or getattr(self.computer, "runs", None)
+        if probe is None:
+            return False
+        try:
+            if hasattr(probe, "active_count"):
+                return int(probe.active_count()) > 0
+        except Exception:  # noqa: BLE001
+            return False
+        return False
+
     async def tick(self, *, activity: bool = False) -> Dict[str, Any]:
         """One lifecycle step. Cheap when nothing is due; never raises."""
         now = self.clock()
@@ -309,6 +326,12 @@ class SandboxLifecycle:
                 return {"action": "recover_failed", "detail": f"{type(exc).__name__}: {str(exc)[:160]}"}
         if not snap.get("handover_due"):
             return {"action": "none", "seconds_left": snap.get("seconds_left")}
+        if self._runs_busy():
+            # A turn is running: keep it alive. Never trade a working task for a fresh VM.
+            await self._append_log({"at": self.clock(), "kind": "handover_deferred",
+                                    "reason": "active_run", "sandbox_id": snap.get("sandbox_id"),
+                                    "seconds_left": snap.get("seconds_left")})
+            return {"action": "deferred", "reason": "active_run", "seconds_left": snap.get("seconds_left")}
         result = await self.handover(reason="ttl" if activity else "ttl_idle")
         return {"action": "handover", **result}
 

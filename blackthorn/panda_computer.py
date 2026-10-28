@@ -44,6 +44,9 @@ class PandaComputerClient:
         self._awake_checked_at = 0.0
         self._awake_lock = asyncio.Lock()
         self._tool_lock = asyncio.Lock()
+        # Drive-hosted skills/tools restored onto every new VM (set by build_services).
+        self.capabilities = None
+        self.capability_status: Dict[str, Any] = {}
         if store is not None and mirror:
             from .workspace_mirror import WorkspaceMirror
             self.mirror = WorkspaceMirror(self)
@@ -73,6 +76,24 @@ class PandaComputerClient:
             except Exception:
                 pass
         self._awake_checked_at = 0.0
+
+    async def _ensure_capabilities(self) -> None:
+        """Restore skills/tools from the drive on this VM, once per VM.
+
+        Runs on the first real task of every VM (including a replacement created after
+        expiry or a handover) and is a fast no-op when the catalog version already
+        matches, so it can never be forgotten and never costs a turn.
+        """
+        if self.capabilities is None:
+            return
+        marker = f"{self.sandbox_id}:{getattr(self.capabilities, '_version', '')}"
+        if getattr(self, "_capabilities_for", "") == marker and self.capability_status.get("ok"):
+            return
+        try:
+            self.capability_status = await self.capabilities.ensure(self, kind="computer")
+            self._capabilities_for = marker
+        except Exception as exc:  # noqa: BLE001 - a catalog outage must not block the task
+            self.capability_status = {"ok": False, "error": type(exc).__name__ + ": " + str(exc)[:200]}
 
     async def _rotate_after(self, status_code: int, message: str = "") -> bool:
         """Switch to another authorized key after an auth/quota rejection."""
@@ -131,6 +152,7 @@ class PandaComputerClient:
                     self.sandbox_id = sid
                 self.base = "https://api.pandastack.ai/v1/sandboxes/" + sid
                 self._awake_checked_at = time.monotonic()
+                await self._ensure_capabilities()
             except ToolError:
                 raise
             except Exception as exc:

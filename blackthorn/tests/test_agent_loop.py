@@ -67,7 +67,10 @@ async def test_public_remote_analysis_uses_focused_schemas_for_faster_prefill(st
     names = {item['function']['name'] for item in stack.backend.requests[0]['tools']}
     assert {'malware_analyzer_submit', 'malware_analyzer_report', 'sample_triage'} <= names
     assert 'run_command' not in names and 'browse' not in names
-    assert len(names) == 8
+    # Autonomy: capability discovery and the dedicated lab stay offered on every turn,
+    # because the agent — not a keyword list — decides that a task needs them.
+    assert {'skill_search', 'tool_search', 'cyber_run', 'lab_detonate', 'lab_exec'} <= names
+    assert len(names) <= 22
 
 
 # ---------------------------------------------------------------------------------------------------- reasoning privacy

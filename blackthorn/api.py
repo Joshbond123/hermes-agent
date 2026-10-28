@@ -45,7 +45,8 @@ class Services:
     fleet: Any = None
     key_pool: Any = None        # PandaStack API-key pool (rotation, quota projection)
     lifecycle: Any = None       # sandbox lifecycle manager (TTL handover)
-    lab: Any = None             # on-demand malware/ransomware execution lab
+    lab: Any = None             # dedicated malware/ransomware execution lab (own provider account)
+    capabilities: Any = None    # drive-hosted skills/tools restored onto every VM
     _prompt_cache: tuple = field(default=(0.0, ""))
     _memory_cache: tuple = field(default=(0.0, ()))
 
@@ -105,17 +106,24 @@ async def health() -> Dict[str, Any]:
 @router.get("/api/lab")
 async def lab_state(request: Request) -> Dict[str, Any]:
     """Whether this deployment has the malware execution lab wired. No secrets, no provider call."""
+    from .keys_role import describe as _describe_keys
     lab = getattr(svc(request), "lab", None)
+    keys = _describe_keys()
     if lab is None:
-        return {"available": False, "open": False,
-                "detail": "not configured (no PandaStack key on this deployment)"}
+        return {"available": False, "open": False, "keys": keys,
+                "detail": "not configured (no dedicated PANDASTACK_LAB_API_KEY on this deployment)"}
     session = lab.session
     return {"available": True, "configured": lab.configured(),
             "open": session is not None,
             "sealed": bool(session.sealed) if session else False,
             "runs": len(session.runs) if session else 0,
             "ttl_s": lab.ttl_s, "idle_close_s": lab.idle_s,
-            "tools": ["lab_open", "lab_status", "lab_detonate", "lab_close"]}
+            "dedicated_key": bool(getattr(lab, "key_is_dedicated", False)),
+            "os": (session.os if session else {}),
+            "held": int(getattr(lab, "holds", 0) or 0),
+            "capabilities": getattr(lab, "capability_status", {}),
+            "keys": keys,
+            "tools": ["lab_open", "lab_status", "lab_detonate", "lab_exec", "lab_os", "lab_close"]}
 
 
 @router.get("/api/version")

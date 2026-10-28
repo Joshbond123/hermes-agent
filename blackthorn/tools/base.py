@@ -175,6 +175,42 @@ class ToolSpec:
                                                  "parameters": _slim(self.parameters)}}
 
 
+def compact_schema(schema: Dict[str, Any], desc_chars: int = 150, param_chars: int = 70) -> Dict[str, Any]:
+    """Trim prose in a function schema to keep the model's context for the task itself.
+
+    The live model renders every description into the prompt on every step, so a
+    300-character description costs context on each call. Tool *names* and typed
+    parameters do the routing; the long form stays in the registry for the UI and
+    for ``optional_tool``. Only the first sentence (or the first N characters) is sent.
+    """
+    function = schema.get("function") or {}
+    description = str(function.get("description") or "")
+
+    def shorten(text: str, limit: int) -> str:
+        text = " ".join(text.split())
+        if len(text) <= limit:
+            return text
+        cut = text[:limit]
+        for mark in (". ", "; ", ", "):
+            at = cut.rfind(mark)
+            if at > limit * 0.5:
+                return cut[:at + 1].rstrip() if mark == ". " else cut[:at].rstrip()
+        return cut.rstrip() + "…"
+
+    params = function.get("parameters") or {}
+    properties = params.get("properties") or {}
+    compact_props = {}
+    for name, spec in properties.items():
+        if isinstance(spec, dict) and spec.get("description"):
+            spec = {**spec, "description": shorten(str(spec["description"]), param_chars)}
+        compact_props[name] = spec
+    return {"type": "function", "function": {
+        **{k: v for k, v in function.items() if k not in ("description", "parameters")},
+        "description": shorten(description, desc_chars),
+        "parameters": {**params, "properties": compact_props},
+    }}
+
+
 class ToolRegistry:
     def __init__(self) -> None:
         self._tools: Dict[str, ToolSpec] = {}
@@ -189,6 +225,9 @@ class ToolRegistry:
         return self._tools.get(name)
 
     def schemas(self) -> List[Dict[str, Any]]:
+        return [compact_schema(t.schema()) for t in self._tools.values()]
+    def schemas_full(self) -> List[Dict[str, Any]]:
+        """Uncompressed schemas (documentation, tests, tooling) — never sent to the model."""
         return [t.schema() for t in self._tools.values()]
 
     def describe(self, name: str, args: Dict[str, Any]) -> str:
