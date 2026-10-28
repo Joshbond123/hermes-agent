@@ -4,7 +4,7 @@
   "blackthorn/README.md": "5e589407dd98d904c8cac38588ddf97079ea92b079df2f502e1a9988e42daac1",
   "blackthorn/__init__.py": "0bff9f17b60d2e4655f341e6ab4843bc0f472c807e811768bc04e6f60128f78e",
   "blackthorn/agent.py": "beb85f24859ffa734fa1c771925b2ef60a4ede93439a11aa9de583fd0f801a56",
-  "blackthorn/api.py": "c6522ebc566bf431c9a6a2b2a6971a980ec2455050c18b514bc950a56fc39c84",
+  "blackthorn/api.py": "1b7751bfa3835079d29d6f4f4c00d17a1d14c231f5b704c5878a8676e28755b5",
   "blackthorn/app.py": "2257f1baf1a7787440e1757673efc9a7061138d749f699c930da75941995b5f3",
   "blackthorn/auth.py": "daa51b4209187b523912b663bc793cb3fdf760603440cf3c971cc787d9bbea32",
   "blackthorn/computer_assets/bootstrap.sh": "b0a6230f33196b5aea73bf694ea6ec639ef54cce53f8c15454db93a16639383b",

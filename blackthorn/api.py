@@ -102,6 +102,22 @@ async def health() -> Dict[str, Any]:
             "started_at": STARTED_AT, "uptime_seconds": int(time.time() - STARTED_AT)}
 
 
+@router.get("/api/lab")
+async def lab_state(request: Request) -> Dict[str, Any]:
+    """Whether this deployment has the malware execution lab wired. No secrets, no provider call."""
+    lab = getattr(svc(request), "lab", None)
+    if lab is None:
+        return {"available": False, "open": False,
+                "detail": "not configured (no PandaStack key on this deployment)"}
+    session = lab.session
+    return {"available": True, "configured": lab.configured(),
+            "open": session is not None,
+            "sealed": bool(session.sealed) if session else False,
+            "runs": len(session.runs) if session else 0,
+            "ttl_s": lab.ttl_s, "idle_close_s": lab.idle_s,
+            "tools": ["lab_open", "lab_status", "lab_detonate", "lab_close"]}
+
+
 @router.get("/api/version")
 async def version(request: Request) -> Dict[str, Any]:
     from .version import build_info
