@@ -454,6 +454,10 @@ class PandaControl:
             if not allow_lab_fallback:
                 raise RuntimeError(primary_error) from exc
             # Lab-style stand-in: same provider, base template, internet, but tagged as the computer.
+            try:
+                await self.store.set_setting(INTENT, "on")
+            except Exception:
+                pass
             sid = ""
             try:
                 sid = await self.create(role="lab-fallback", templates=("base",),
