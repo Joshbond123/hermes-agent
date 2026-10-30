@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import shlex
 import json
 import re
 from typing import Any, Dict, List, Optional
@@ -325,11 +326,25 @@ async def lab_file(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
                 data = raw.encode("utf-8")
             if len(data) > MAX_INLINE:
                 return ToolResult.failure("content is larger than 1 MB; download it inside the lab instead")
-            await lab._put(path, data)
-            check = await lab.root_exec(f"ls -l {path}; sha256sum {path} | cut -c1-16", timeout=60)
-            return ToolResult(ok=check.get("exit_code") == 0,
-                              content=redact(f"wrote {len(data)} bytes to {path}\n" + str(check.get("stdout") or "")),
-                              summary=f"lab write {path}", data={"path": path, "bytes": len(data)})
+            # The directory is created here, not left to a parallel mkdir: the model routinely
+            # writes a file in the same step as the command that creates its parent (both tools
+            # are issued together), and a write that loses that race must still land.
+            parent = path.rsplit("/", 1)[0] or "/"
+            await lab.root_exec(f"mkdir -p {shlex.quote(parent)}", timeout=60)
+            try:
+                await lab._put(path, data)
+            except Exception as exc:  # noqa: BLE001 - report the provider's reason, never a blank error
+                return ToolResult.failure(f"lab write failed ({type(exc).__name__}: {str(exc)[:240]})",
+                                          hint="Check the path and that the lab VM is still open.")
+            check = await lab.root_exec(f"ls -l {shlex.quote(path)}; sha256sum {shlex.quote(path)} | cut -c1-16",
+                                        timeout=60)
+            listing = str(check.get("stdout") or check.get("output") or "")
+            size_ok = str(len(data)) in listing or "rw" in listing
+            return ToolResult(ok=bool(size_ok),
+                              content=redact(f"wrote {len(data)} bytes to {path}\n{listing}"),
+                              summary=f"lab write {path}",
+                              error=None if size_ok else f"the file could not be read back after writing: {listing[:200]}",
+                              data={"path": path, "bytes": len(data)})
         if op == "list":
             result = await lab.root_exec(f"ls -la {path} 2>&1 | head -120", timeout=60)
             return ToolResult(ok=result.get("exit_code") == 0, content=redact(str(result.get("stdout") or "")),

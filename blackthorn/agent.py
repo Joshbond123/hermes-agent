@@ -78,6 +78,9 @@ MAX_RECOVERY_ROUNDS = int(__import__("os").environ.get("BLACKTHORN_MAX_RECOVERY_
 # step is reported as a real auth failure. One refresh was too few: the notebook publishes its
 # rotated key a few seconds after the old one starts being refused.
 AUTH_REFRESH_ROUNDS = int(__import__("os").environ.get("BLACKTHORN_AUTH_REFRESH_ROUNDS", "3") or 3)
+# First wait before re-reading the control plane. The notebook publishes its rotated key on a
+# heartbeat, so an immediate re-read usually returns the same (already refused) key.
+AUTH_REFRESH_BACKOFF_S = float(__import__("os").environ.get("BLACKTHORN_AUTH_BACKOFF_S", "4") or 4)
 # How many times a stalled loop may be answered with "change your approach" before the run
 # falls back to a final answer. Two rounds fixed the observed failure (the agent gave up on a
 # task it could still finish) without letting a genuinely impossible step run for ever.
@@ -928,57 +931,48 @@ class AgentRun:
                 continue
             except LLMError as exc:
                 if exc.code == "gpu_auth":
-                    # A notebook may rotate its per-boot key while a long task is
-                    # running. Retry only the rejected model step after an uncached D1
-                    # read; the completed tool ledger is NOT replayed. An unchanged
-                    # route/key (or a second rejection after refresh) is a real auth
-                    # problem and must remain visible instead of looping indefinitely.
+                    # A notebook publishes its per-boot key to the control plane on its own
+                    # clock; a rejection therefore means "the published key is behind", not
+                    # necessarily "the credential is wrong". The same key that was refused
+                    # mid-run authenticated again a minute later in live testing, so the
+                    # refresh is patient (4s, 8s, 15s of backoff) and re-reads D1 each round,
+                    # instead of spending the whole budget in six seconds. Tools are never
+                    # replayed: only the rejected model step is retried, so this costs time
+                    # on failure and nothing on success.
+                    if auth_refreshes:
+                        await asyncio.sleep(min(AUTH_REFRESH_BACKOFF_S * (2 ** (auth_refreshes - 1)), 15.0))
                     self.deps.resolver.invalidate()
                     try:
                         fresh = await self.deps.resolver.get(force=True)
                     except Exception:
                         raise exc
                     if auth_refreshes >= AUTH_REFRESH_ROUNDS:
-                        # Bounded, but retryable: the turn's tools already ran and the task
-                        # board is saved, so a retry resumes rather than restarts. A 12-step
-                        # live run died here for want of one more attempt after the notebook
-                        # published its rotated key.
-                        raise LLMError("gpu_auth", "The GPU gateway still rejects the refreshed route after "
-                                       f"{AUTH_REFRESH_ROUNDS} refreshes. The task is saved; retry when the GPU "
+                        raise LLMError("gpu_auth", "The GPU gateway kept rejecting the refreshed credential after "
+                                       f"{AUTH_REFRESH_ROUNDS} refresh rounds. The task is saved; retry when the GPU "
                                        "connection is healthy and it will continue where it stopped.",
                                        retryable=True, status=exc.status) from exc
-                    if auth_refreshes:
-                        # The D1 row is written by the notebook when it rotates its per-boot key;
-                        # that publication can lag a rejection by a few seconds. Re-reading the
-                        # same row immediately just burns the budget, so back off first.
-                        await asyncio.sleep(min(1.0 * auth_refreshes, 5.0))
-                        self.deps.resolver.invalidate()
-                        try:
-                            fresh = await self.deps.resolver.get(force=True)
-                        except Exception:
-                            raise exc
-                    if fresh.api_key == route.api_key and fresh.url == route.url:
-                        # An edge can reject a single stream request even when the
-                        # current key is valid. Only retry unchanged credentials
-                        # when a cheap authenticated endpoint actually accepts them.
+                    changed = fresh.api_key != route.api_key or fresh.url != route.url
+                    if not changed:
+                        # Same published credential: it is either genuinely wrong or the edge
+                        # refused one stream. A cheap authenticated call decides which, and a
+                        # fresh key may still land before the next round.
                         try:
                             check = await self.deps.http.get(
                                 f"{fresh.url}/v1/models",
-                                headers={"Authorization": f"Bearer {fresh.api_key}"}, timeout=5.0)
+                                headers={"Authorization": f"Bearer {fresh.api_key}"}, timeout=8.0)
                             accepted = check.status_code == 200
                         except (OSError, httpx.HTTPError):
                             accepted = False
-                        if not accepted:
-                            raise LLMError("gpu_auth", "The GPU gateway rejected this request and the refresh "
-                                           "returned the same credential, which does not authenticate either. "
-                                           "The task is saved; retry once the GPU connection is healthy.",
+                        if not accepted and auth_refreshes + 1 >= AUTH_REFRESH_ROUNDS:
+                            raise LLMError("gpu_auth", "The GPU gateway rejects the credential published in the "
+                                           "control plane and the probe does not authenticate either. The task is "
+                                           "saved; retry once the GPU connection is healthy.",
                                            retryable=True, status=exc.status) from exc
                     auth_refreshes += 1
                     self.run.emit("notice", level="info",
-                                  text="GPU connection refreshed — resuming this model step…"
-                                       if auth_refreshes == 1 else
-                                       f"GPU connection refreshed again (attempt {auth_refreshes}) — "
-                                       "resuming this model step…")
+                                  text=("GPU connection refreshed — resuming this model step…" if auth_refreshes == 1
+                                        else f"GPU connection refreshed again (attempt {auth_refreshes}) — "
+                                             "waiting for the updated access key, then resuming…"))
                     continue
                 # Some engines truncate the conversation *before* applying Qwen3.8's template.
                 # When their SSE error says the latest user query vanished, perform ONE bounded
