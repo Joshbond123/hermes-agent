@@ -111,6 +111,30 @@ class PandaComputerClient:
                 pass
         self._awake_checked_at = 0.0
 
+    async def _prepare_home(self) -> None:
+        """One durable name for the workspace: /home/user IS /workspace.
+
+        The checkpoint publishes /workspace only, so a file an agent wrote to /home/user/work
+        (a completely natural path) used to exist on this VM and nowhere else: the provider
+        replaced the VM and the work was gone. Both names now point at the same directory, so
+        every path the model invents is durable, and ``write_file`` accepts either form.
+        Runs once per VM, idempotent, and never destructive beyond moving pre-existing files
+        into the workspace first.
+        """
+        if getattr(self, "_home_for", "") == self.sandbox_id:
+            return
+        script = ("mkdir -p /workspace; if [ ! -L /home/user ]; then "
+                  "if [ -d /home/user ] && [ -n \"$(ls -A /home/user 2>/dev/null | head -c 1)\" ]; then "
+                  "cp -an /home/user/. /workspace/ 2>/dev/null || true; fi; "
+                  "rm -rf /home/user 2>/dev/null || true; ln -sfn /workspace /home/user; fi; "
+                  "readlink -f /home/user")
+        try:
+            result = await self._exec(script, timeout=90)
+        except Exception:  # noqa: BLE001 - a path convenience must never block the task
+            return
+        if "/workspace" in str(result.get("output") or ""):
+            self._home_for = self.sandbox_id
+
     async def _ensure_capabilities(self) -> None:
         """Restore skills/tools from the drive on this VM, once per VM.
 
@@ -187,6 +211,7 @@ class PandaComputerClient:
                     self.sandbox_id = sid
                 self.base = "https://api.pandastack.ai/v1/sandboxes/" + sid
                 self._awake_checked_at = time.monotonic()
+                await self._prepare_home()
                 await self._ensure_capabilities()
             except ToolError:
                 raise
@@ -285,8 +310,21 @@ class PandaComputerClient:
         return response
 
     @staticmethod
+    # Every name the agent plausibly uses for the durable workspace. ``_prepare_home`` makes
+    # /home/user a symlink to /workspace, so an absolute path is the same file as its logical
+    # path; accepting it here is what stops ``write_file`` failing with "unsafe logical path"
+    # on the perfectly reasonable /home/user/work/x.py the model just wrote a command for.
     def _relative(value: str) -> str:
-        return _safe_path(value.removeprefix("/workspace/") if value.startswith("/workspace/") else value)
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError("a file path is required")
+        if text.rstrip("/") in ("/workspace", "/home/user", "/home", ""):
+            raise ValueError("that is the workspace root; give a file path")
+        for root in ("/workspace/", "/home/user/", "/home/"):
+            if text.startswith(root):
+                text = text[len(root):]
+                break
+        return _safe_path(text)
 
     async def _exec(self, command: str, *, timeout: float = 60, retries: int = 2) -> dict:
         # The guest is bounded by ``timeout`` itself: an HTTP timeout does not kill a

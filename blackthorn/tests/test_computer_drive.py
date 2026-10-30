@@ -45,3 +45,21 @@ def test_newest_published_release_wins_even_if_list_order_is_stale(monkeypatch):
     assert files["validation/proof.txt"]["size"] == 43
     with pytest.raises(FileNotFoundError):
         drive._find("missing/file.txt")
+
+
+def test_absolute_workspace_paths_are_the_same_file_as_logical_ones():
+    """The agent writes /home/user/work/x.py; the checkpoint publishes /workspace.
+
+    ``_prepare_home`` makes the two names one directory, so write_file may accept either and the
+    file is still in the durable checkpoint. Rejecting it (\"unsafe logical path\") only taught the
+    model to work around the tool with a heredoc and left the file outside the mirror.
+    """
+    from blackthorn.panda_computer import PandaComputerClient as C
+    for given, expected in (("/home/user/work/audit2/x.py", "work/audit2/x.py"),
+                            ("/workspace/work/audit2/x.py", "work/audit2/x.py"),
+                            ("work/audit2/x.py", "work/audit2/x.py")):
+        assert C._relative(given) == expected
+    import pytest
+    for bad in ("/etc/passwd", "../../escape", "", "/workspace", "/home/user"):
+        with pytest.raises(ValueError):
+            C._relative(bad)

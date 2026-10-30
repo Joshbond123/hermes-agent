@@ -44,6 +44,7 @@ async def test_auth_stays_bounded_when_d1_key_is_still_wrong(stack):
     stack.backend.key = "different-test-key"  # D1 retains the old key
     out = await stack.stream({"message": "answer briefly"})
     assert out.end["status"] == "error" and out.of("error")[0]["code"] == "gpu_auth"
+    assert out.of("error")[0]["retryable"] is True, "the task is saved; a retry must be offered"
     assert not stack.backend.requests and not stack.backend.computer_calls
 
 
@@ -59,13 +60,17 @@ async def test_transient_auth_rejection_with_still_valid_key_retries_once(stack)
 
 
 @pytest.mark.asyncio
-async def test_persistent_auth_rejection_is_not_an_infinite_retry(stack):
-    stack.backend.queue({"http_error": 403, "message": "gateway denied"},
-                        {"http_error": 403, "message": "gateway denied"})
+async def test_persistent_auth_rejection_is_bounded_but_not_immediate(stack):
+    """Three refreshes, not one: the notebook publishes its rotated key seconds later.
+
+    Still bounded - a gateway that keeps denying must fail, not loop - and the failure is
+    retryable with the task saved, so the operator resumes instead of losing 12 finished steps.
+    """
+    stack.backend.queue(*[{"http_error": 403, "message": "gateway denied"}] * 6)
     out = await stack.stream({"message": "a gateway that repeatedly denies the stream"})
     assert out.end["status"] == "error"
     assert out.of("error")[0]["code"] == "gpu_auth"
-    assert len(stack.backend.requests) == 2
+    assert 2 <= len(stack.backend.requests) <= 5, len(stack.backend.requests)
 
 
 @pytest.mark.asyncio
