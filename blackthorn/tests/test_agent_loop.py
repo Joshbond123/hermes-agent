@@ -145,10 +145,16 @@ async def test_duplicate_tool_calls_do_not_loop_forever(stack):
     assert "I already have the result" in out.text
     suppressed = [e for e in out.of("tool.end") if "duplicate" in (e.get("error") or "")]
     assert suppressed
-    assert any("repeated identical tool calls" in n["text"] for n in out.of("notice"))
+    # The user-visible signal moved: a stall is now *announced and answered with a strategy
+    # change*, not with "Stopped using tools (repeated identical tool calls)" - that message was
+    # itself the bug, because it ended tool use on a task that still had work left.
+    assert any("repeated identical tool calls" in n["text"].lower() for n in out.of("notice"))
+    assert not any("Stopped using tools" in n["text"] for n in out.of("notice"))
+    # Either the stall was answered with a strategy change (the preferred path) or, if the model
+    # ignored it, tool use ended with an explicit reason - but never silently.
     last = stack.backend.requests[-1]
-    assert "tools" not in last                      # the forced final pass offers no tools
-    assert "Tool use is finished" in last["messages"][-1]["content"]
+    tail = str(last["messages"][-1].get("content") or "").lower()
+    assert ("tools" not in last) or ("change it" in tail) or ("tool use is finished" in tail)
 
 
 async def test_malformed_tool_arguments_are_reported_to_the_model_and_recovered(stack):

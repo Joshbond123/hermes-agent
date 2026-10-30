@@ -34,7 +34,11 @@ class Settings:
     # (llama.cpp budgets n_ctx = prompt + prediction). 4096 (the old default) left only ~2k tokens
     # for tool schemas + system + history, which silently truncated the conversation after a couple
     # of turns; 2048 doubles the usable history and a hit-the-limit answer is continued seamlessly.
-    context_tokens: int = field(default_factory=lambda: _int("BLACKTHORN_CONTEXT_TOKENS", 8192))
+    # The agent budget follows the engine's window (BLACKTHORN_CONTEXT_TOKENS, falling back to
+    # QWEN38_NUM_CTX), and the run additionally clamps it to whatever the server reports on
+    # /props. The default therefore tracks the engine rather than a hardcoded guess.
+    context_tokens: int = field(default_factory=lambda: _int(
+        "BLACKTHORN_CONTEXT_TOKENS", _int("QWEN38_NUM_CTX", 16384)))
     completion_reserve_tokens: int = field(default_factory=lambda: _int("BLACKTHORN_COMPLETION_RESERVE", 2048))
     chars_per_token: float = 3.2  # conservative for English + code
 

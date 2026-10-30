@@ -123,7 +123,7 @@ async def lab_state(request: Request) -> Dict[str, Any]:
             "held": int(getattr(lab, "holds", 0) or 0),
             "capabilities": getattr(lab, "capability_status", {}),
             "keys": keys,
-            "tools": ["lab_open", "lab_status", "lab_detonate", "lab_exec", "lab_os", "lab_close"]}
+            "tools": ["lab_open", "lab_status", "lab_detonate", "lab_exec", "lab_os", "lab_close", "lab_file"]}
 
 
 @router.get("/api/version")

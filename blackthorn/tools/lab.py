@@ -54,6 +54,13 @@ SCHEMAS: Dict[str, Dict[str, Any]] = {
         "required": ["command"]},
     "lab_os": {"type": "object", "properties": {
         "install_windows": {"type": "boolean", "default": False}}, "required": []},
+    "lab_file": {"type": "object", "properties": {
+        "op": {"type": "string", "enum": ["write", "read", "list", "stat"], "default": "read"},
+        "path": {"type": "string", "maxLength": 300},
+        "content": {"type": "string", "maxLength": 1000000},
+        "encoding": {"type": "string", "enum": ["text", "base64"], "default": "text"},
+        "max_chars": {"type": "integer", "minimum": 200, "maximum": 200000, "default": 20000}},
+        "required": []},
 }
 
 
@@ -276,6 +283,70 @@ async def lab_exec(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
                       summary=f"lab exec exit {result.get('exit_code')}", data=result)
 
 
+LAB_PATH = re.compile(r"^(?:/lab/[A-Za-z0-9._/-]{0,280}|/tmp/[A-Za-z0-9._/-]{0,280}|/workspace/[A-Za-z0-9._/-]{0,280})$")
+
+
+def _lab_path(raw: Any) -> str:
+    path = str(raw or "").strip()
+    if not LAB_PATH.match(path) or ".." in path.split("/"):
+        raise ValueError("path must be an absolute path under /lab, /tmp or /workspace")
+    return path
+
+
+async def lab_file(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
+    """File management inside the lab VM: write, read, list or stat any path under /lab, /tmp, /workspace.
+
+    One schema with an op keeps the fast-path tool budget (and therefore prefill latency) unchanged
+    while giving the lab a complete filesystem: build scripts, drop payloads, collect artefacts,
+    inspect what an installer or a sample left behind.
+    """
+    lab = _lab(ctx)
+    if lab is None:
+        return _unconfigured()
+    op = str(args.get("op") or "read").strip().lower()
+    default_path = "/lab" if op == "list" else ""
+    try:
+        path = _lab_path(args.get("path") or default_path)
+    except ValueError as exc:
+        return ToolResult.failure(str(exc))
+    limit = max(200, min(200000, int(args.get("max_chars") or 20000)))
+    lab.hold()
+    try:
+        if lab.session is None:
+            await lab.open(reason=f"lab file {op}")
+        if op == "write":
+            raw = str(args.get("content") or "")
+            if str(args.get("encoding") or "text") == "base64":
+                try:
+                    data = base64.b64decode(raw, validate=True)
+                except (binascii.Error, ValueError):
+                    return ToolResult.failure("content is not valid base64")
+            else:
+                data = raw.encode("utf-8")
+            if len(data) > MAX_INLINE:
+                return ToolResult.failure("content is larger than 1 MB; download it inside the lab instead")
+            await lab._put(path, data)
+            check = await lab.root_exec(f"ls -l {path}; sha256sum {path} | cut -c1-16", timeout=60)
+            return ToolResult(ok=check.get("exit_code") == 0,
+                              content=redact(f"wrote {len(data)} bytes to {path}\n" + str(check.get("stdout") or "")),
+                              summary=f"lab write {path}", data={"path": path, "bytes": len(data)})
+        if op == "list":
+            result = await lab.root_exec(f"ls -la {path} 2>&1 | head -120", timeout=60)
+            return ToolResult(ok=result.get("exit_code") == 0, content=redact(str(result.get("stdout") or "")),
+                              summary=f"lab ls {path}", data={"path": path})
+        if op == "stat":
+            result = await lab.root_exec(f"stat -c '%n %s %a %U %y' {path} 2>&1; file {path} 2>&1", timeout=60)
+            return ToolResult(ok=result.get("exit_code") == 0, content=redact(str(result.get("stdout") or "")),
+                              summary=f"lab stat {path}", data={"path": path})
+        body = await lab._get(path, limit=limit)
+    finally:
+        lab.release()
+    text = body.decode("utf-8", "replace")
+    out, cut = clip(redact(text), min(limit, 20000), "ends")
+    return ToolResult(ok=True, content=out or "(empty file)", summary=f"lab read {path}",
+                      truncated=cut or len(body) >= limit, data={"path": path, "bytes": len(body)})
+
+
 def specs() -> list[ToolSpec]:
     return [
         ToolSpec("lab_open",
@@ -310,6 +381,13 @@ def specs() -> list[ToolSpec]:
                  "finish the job (call lab_close when done).",
                  SCHEMAS["lab_exec"], lab_exec, timeout=1200.0, kind="exec",
                  describe=lambda a: str(a.get("command") or "")[:80]),
+        ToolSpec("lab_file",
+                 "Full file management inside the lab VM: op=write saves a file (under /lab, /tmp or /workspace; "
+                 "text or base64), op=read returns its contents, op=list shows a directory, op=stat shows "
+                 "size/permissions/type. Use it to build scripts, drop payloads, collect reports and inspect "
+                 "what an installer or a sample left behind.",
+                 SCHEMAS["lab_file"], lab_file, timeout=600.0,
+                 kind="write", describe=lambda a: f"{a.get('op') or 'read'} {a.get('path') or '/lab'}"),
         ToolSpec("lab_close",
                  "Destroy the malware lab VM and verify the provider no longer lists it. Call this as soon as the "
                  "analysis is finished so nothing keeps running or billing.",

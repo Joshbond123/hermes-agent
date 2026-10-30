@@ -46,12 +46,25 @@ def test_tool_pairs_are_unique_and_fit_after_sanitization():
     render(msgs)
 
 
-def test_protected_user_cannot_fit_reports_failure_instead_of_sending_invalid_history():
-    current = {"role": "user", "content": "MUST NOT DELETE: " + "x" * 2100}
+def test_an_oversized_protected_request_is_elided_not_refused():
+    """A request too large for the window must be shrunk, never rejected.
+
+    Refusing here is what surfaced as "This single message is too large for the model window even
+    after compaction" and aborted the run. The message is now kept in place, head and tail intact
+    around an explicit elision marker, so the instruction and the goal survive and the request is
+    still answered.
+    """
+    current = {"role": "user", "content": "MUST NOT DELETE: " + "x" * 2100 + " FINAL INSTRUCTION"}
     msgs = [{"role": "system", "content": "s" * 100}, current,
             {"role": "assistant", "content": "unprotected"}]
-    assert not prompts.shrink_tool_messages(msgs, 250, protect=[0, 1])
-    assert current in msgs
+    assert prompts.shrink_tool_messages(msgs, 250, protect=[0, 1])
+    assert current in msgs, "the real request must stay in place, not be dropped"
+    body = current["content"]
+    assert body.startswith("MUST NOT DELETE: "), "the head of the instruction must survive"
+    assert "FINAL INSTRUCTION" in body[-40:], "the tail of the instruction must survive"
+    assert "elided" in body.lower() and len(body) < 2100
+    assert prompts.estimate_messages(msgs) <= 250
+    render(msgs)
 
 
 def test_many_tool_steps_keep_exactly_one_result_per_call_and_the_real_request():

@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -19,7 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 
 from . import prompts, recovery
-from .llm import ContextOverflow, LLMError, stream_chat
+from .llm import ContextOverflow, LLMError, server_context, stream_chat
 from .route import RouteError, RouteResolver
 from .runs import Run
 from .tools import ToolContext, ToolRegistry, ToolResult, loads_args, redact
@@ -42,10 +43,25 @@ CONTINUE_NOTE = ("Your previous reply was cut off by a network error before it f
 GATE_NOTE = ("[server] Some items on your task list are still open. Continue with the next one now, using tools. "
              "Do not repeat a step already marked completed. If you really cannot continue, say exactly what is "
              "blocking you instead of reporting success.")
+STRATEGY_NOTE = ("[server] You have now sent the same call with identical arguments more than once and it "
+                 "returned the same result. That approach is not working: change it. Use different arguments, a "
+                 "different tool, break the step into smaller pieces, or verify the environment first. Do not "
+                 "repeat the identical call; if it is genuinely impossible, say exactly what blocks you.")
+
+PLAN_ONLY_NOTE = ("[server] Your reply described what you intend to do but you ran no tool in this turn, so "
+                  "nothing was actually done. Execute the work now with tools, one step at a time, and only "
+                  "then report the result. Do not present a plan as if it were the outcome.")
+
+CLAIM_NOTE = ("[server] This turn executed NO tool successfully, yet the reply states that work was done. "
+              "The record shows nothing ran. Either perform the work with tools now and report only what the "
+              "tool results show, or state plainly that it was not done and why. Never describe an action you "
+              "did not perform.")
+
 RESUME_NOTE = ("[server] The earliest part of this turn was compacted to fit the model's context window. "
                "Keep working from the tool results above until the user's request is genuinely complete, then "
                "report only what the recorded results show.")
 NOTE_PREFIXES = (FINALIZE_NOTE[:40], LENGTH_CONTINUE_NOTE[:40], CONTINUE_NOTE[:40], GATE_NOTE[:40], RESUME_NOTE[:40],
+                 STRATEGY_NOTE[:40], PLAN_ONLY_NOTE[:40], CLAIM_NOTE[:40],
                  prompts.COMPACT_HEADER[:40])
 GATE_STEPS = 6                      # extra steps a run may spend on the completion gate
 # Strikes: an identical *completed* call repeated this many times is a genuine stall. Infrastructure
@@ -53,6 +69,10 @@ GATE_STEPS = 6                      # extra steps a run may spend on the complet
 # without letting a real loop run longer.
 MAX_STRIKES = int(__import__("os").environ.get("BLACKTHORN_MAX_STRIKES", "3") or 3)
 MAX_RECOVERY_ROUNDS = int(__import__("os").environ.get("BLACKTHORN_MAX_RECOVERY_ROUNDS", "3") or 3)
+# How many times a stalled loop may be answered with "change your approach" before the run
+# falls back to a final answer. Two rounds fixed the observed failure (the agent gave up on a
+# task it could still finish) without letting a genuinely impossible step run for ever.
+MAX_STRATEGY_ROUNDS = int(__import__("os").environ.get("BLACKTHORN_MAX_STRATEGY_ROUNDS", "2") or 2)
 # Total attempts (including the first) for a tool call that fails for infrastructure reasons.
 COMPUTER_MAX_ATTEMPTS = int(__import__("os").environ.get("BLACKTHORN_TOOL_ATTEMPTS", "3") or 3)
 
@@ -148,6 +168,15 @@ class AgentRun:
         # command and calling each attempt "new work".
         self._repeat_total_cap = max(4, int(deps.settings.max_repeat_calls) * 4)
         self._nudges = 0
+        self._exec_nudges = 0            # plan-only / unevidenced-claim corrections (bounded)
+        self.strategy_rounds = 0         # times the loop was broken by forcing a strategy change
+        self._stalled_signature = ""     # the call that keeps returning the same result
+        self._stalled_key: tuple = ()
+        self._repeat_announced: set = set()   # stalled steps already reported to the user
+        self._last_output: Dict[str, str] = {}   # signature -> last successful output (progress detector)
+        self._ctx_retries = 0            # bounded retries when a request will not fit the window
+        self._server_ctx = 0             # context window the runtime actually reports, not what we assume
+        self._ctx_probed = False
         self._state_cache = ""
         self._messages: List[Dict[str, Any]] = []
         self.tool_calls_total = 0
@@ -199,7 +228,7 @@ class AgentRun:
                        "list_files", "read_file", "write_file", "web_search", "todo_list",
                        "skill_search", "skill_load", "skill_read", "tool_search", "cyber_run",
                        "cyber_preflight", "lab_open", "lab_status", "lab_detonate", "lab_exec",
-                       "lab_os", "lab_close"}
+                       "lab_os", "lab_close", "lab_file"}
             self._active_schemas = [schema for schema in self._schemas if schema["function"]["name"] in allowed]
         elif self._remote_analysis:
             self._active_schemas = self._schemas
@@ -222,7 +251,8 @@ class AgentRun:
             core = {"run_command", "list_files", "read_file", "write_file", "job_status",
                     "web_search", "todo_list", "skill_search", "skill_load", "skill_read",
                     "tool_search", "cyber_run", "cyber_preflight", "sample_triage",
-                    "lab_open", "lab_status", "lab_detonate", "lab_exec", "lab_os", "lab_close"}
+                    "lab_open", "lab_status", "lab_detonate", "lab_exec", "lab_os", "lab_close",
+                    "lab_file"}
             context_lower = (context + " " + " ".join(str(t.get("content") or "")[:300]
                             for t in self.turns[-4:] if t.get("role") == "user")).lower()
             def mentions(*words: str) -> bool:
@@ -412,6 +442,44 @@ class AgentRun:
         listing = "\n".join(f"- {i['id']}: {prompts.one_line(i.get('content') or '', 90)} [{i.get('status')}]"
                             for i in pending[:8])
         return f"{GATE_NOTE}\nStill open:\n{listing}\nUpdate the list with todo_list as each one finishes."
+
+    # ------------------------------------------------------------------ execution gates
+    PLAN_LANGUAGE = re.compile(
+        r"(\bi will (?:now )?(?:start|begin|create|write|install|run|set up|build|check|open|download)\b"
+        r"|\blet me (?:start|begin|first|now)\b"
+        r"|\bhere(?:'s| is) (?:the|my) plan\b"
+        r"|^\s*(?:step\s*1|1\.)\s+\w+.*\n\s*(?:step\s*2|2\.))", re.I | re.M)
+    CLAIM_LANGUAGE = re.compile(
+        r"\b(i (?:have )?(?:successfully )?(?:installed|created|written|built|deployed|ran|executed|tested|"
+        r"cloned|downloaded|configured|set up|completed|finished the|verified))\b", re.I)
+
+    def _execution_note(self, result: StepResult) -> Optional[str]:
+        """Catch a reply that describes work instead of doing it, or claims work that never ran.
+
+        Two failures the operator reported directly: the agent "lists what it intends to do without
+        executing anything", and it "claims to have completed actions it has not performed". Both are
+        detectable from this turn's own record - zero successful tool calls - so the correction costs
+        nothing on a normal answer and one extra model call only when the failure already happened.
+        """
+        if self._exec_nudges >= 1:
+            return None
+        text = (result.text or "").strip()
+        if len(text) < 40 or len(self.user_message.strip()) < 24:
+            return None                      # a short conversational answer is not a task turn
+        executed = sum(1 for entry in self.ledger if entry.get("ok"))
+        if executed:
+            return None                      # real work happened: trust the ledger, not prose
+        if self.PLAN_LANGUAGE.search(text):
+            self._exec_nudges += 1
+            self.run.emit("notice", level="info",
+                          text="The reply was a plan with no execution; asking the agent to do the work now.")
+            return PLAN_ONLY_NOTE
+        if self.CLAIM_LANGUAGE.search(text):
+            self._exec_nudges += 1
+            self.run.emit("notice", level="warn",
+                          text="The reply claimed work that no tool actually performed; asking for the real result.")
+            return CLAIM_NOTE
+        return None
 
     def _finalize_note(self) -> str:
         pending = self.board.pending() if self.board is not None else []
@@ -653,6 +721,23 @@ class AgentRun:
                     self.strikes = 0
                     self._messages.append({"role": "user", "content": self._recovery_note(healed)})
                     continue
+                # A repeated call is a stalled *approach*, not necessarily a stalled task. Before
+                # ending tool use - which is what made the agent announce "stopped using tools" and
+                # answer from half-finished work - give the model a bounded chance to change strategy:
+                # forget the stalled signature so a genuinely different attempt can run, and tell it
+                # in plain words that the identical call is not the way forward.
+                if (self.strikes >= MAX_STRIKES and self.strategy_rounds < MAX_STRATEGY_ROUNDS):
+                    self.strategy_rounds += 1
+                    self.seen.clear()
+                    if self._stalled_key:
+                        self.seen_total.pop(self._stalled_key, None)   # let that one step be retried once more
+                    self._epoch += 1
+                    self.strikes = 0
+                    self.run.emit("notice", level="info",
+                                  text="The same step kept returning the same result; asking the agent to change approach "
+                                       "instead of stopping.")
+                    self._messages.append({"role": "user", "content": STRATEGY_NOTE})
+                    continue
                 force_final = True
                 self.run.emit("notice", level="warn", text=f"Stopped using tools ({reason}); writing the answer from what was gathered.")
                 self._messages.append({"role": "user", "content": self._finalize_note()})
@@ -685,6 +770,16 @@ class AgentRun:
                 self._messages.append({"role": "user", "content": note})
                 self.steps += 1
                 continue
+            # …and a stop that only *describes* the work, or reports work with no evidence behind it,
+            # is not a finished task either. Bounded to one correction so a genuinely chatty answer
+            # is never repeated back and forth.
+            exec_note = self._execution_note(result)
+            if exec_note is not None and self.steps < s.max_steps + GATE_STEPS:
+                if result.text.strip():
+                    self._messages.append({"role": "assistant", "content": result.text})
+                self._messages.append({"role": "user", "content": exec_note})
+                self.steps += 1
+                continue
             self.finish_reason = result.finish or "stop"
             self._last_step_text = result.text
             break
@@ -695,6 +790,33 @@ class AgentRun:
             raise RunFailure("empty_response", "The model returned an empty response (it produced only reasoning). Retry to ask again.", True)
 
     # ------------------------------------------------------------------ one model call (with recovery)
+    async def _adopt_server_context(self) -> None:
+        """Size the budget to the window the engine really has, once per run.
+
+        The configured number and the engine's ``n_ctx`` must agree. When they did not, every
+        long step was rejected (ContextOverflow) and the run thrashed on trimming - one of the
+        real causes of mid-task interruptions. This reads the runtime's own reported window
+        and lowers the budget to it if it is smaller. It never raises the budget on its own:
+        configuration alone does not create capacity. One cheap request per run, cached.
+        """
+        if self._ctx_probed:
+            return
+        self._ctx_probed = True
+        try:
+            route = await self.deps.resolver.get()
+        except Exception:  # noqa: BLE001 - the next step will surface a real route error
+            return
+        try:
+            reported = await server_context(self.deps.http, route)
+        except Exception:  # noqa: BLE001 - never fail a run over a probe
+            reported = 0
+        if reported > 0:
+            self._server_ctx = reported
+            limit = max(1024, reported - self.deps.settings.completion_reserve_tokens)
+            if limit < self._budget:
+                self._budget = limit
+                self.run.emit("internal.context", window=reported, budget=limit)
+
     async def _model_step(self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]]) -> StepResult:
         s = self.deps.settings
         attempt = 0
@@ -702,17 +824,28 @@ class AgentRun:
         while True:
             attempt += 1
             self._check()
+            await self._adopt_server_context()
             budget = self._budget - (self._schema_cost if tools else 0)
             self._sync_state()
             before = len(messages)
             if not prompts.shrink_tool_messages(messages, budget, s.chars_per_token,
                                                 protect=self._protected_indices()):
-                raise RunFailure(
-                    "context_full",
-                    "This single message is too large for the model window even after compaction. "
-                    "Shorten the message or clear attachments and try again.",
-                    True,
-                )
+                # Unreachable while the request itself can be elided, but kept as a hard guard:
+                # a context problem must degrade the step, never end the task with an error the
+                # user can only answer by starting over.
+                self._ctx_retries += 1
+                if self._ctx_retries > 3:
+                    raise RunFailure(
+                        "context_full",
+                        "The conversation could not be made to fit the model window. "
+                        "Start a new chat and continue from the checkpoint.",
+                        True,
+                    )
+                self._force_compact()
+                self.run.emit("internal.compaction", stage="request_too_large")
+                if len(messages) < 2:
+                    raise RunFailure("context_full", "The request could not be reduced to fit the model window.", True)
+                continue
             if len(messages) < before:
                 self.run.emit("internal.compaction", stage="mid_task")
                 # Mid-task resume after compaction (Hermes-style): the model must not answer from a hole.
@@ -947,6 +1080,15 @@ class AgentRun:
                 count = self.seen.get(key, 0)
                 total = self.seen_total.get(key[:2], 0)
                 if count >= s.max_repeat_calls or total >= self._repeat_total_cap:
+                    self._stalled_signature = signature
+                    self._stalled_key = key[:2]
+                    if signature not in self._repeat_announced:
+                        # Say it out loud, once per stalled step. Silence here is what made the old
+                        # behaviour confusing: the task simply stopped using tools with no reason.
+                        self._repeat_announced.add(signature)
+                        self.run.emit("notice", level="info",
+                                      text="Repeated identical tool calls were suppressed; the agent is being asked "
+                                           "to change approach instead of stopping.")
                     return ToolResult.failure(
                         f"duplicate call suppressed: {name} was already run with these exact arguments "
                         f"{max(count, total)} times",
@@ -1082,12 +1224,24 @@ class AgentRun:
                 "e": redact(str(result.error or ""))[:300],
                 "o": redact(str((result.data or {}).get("output") or ""))[:200] if result.ok else "",
             })
-            # Only a write advances the epoch. A shell command that fails the same way five times is the
-            # classic stuck loop, so exec does not refill the repeat budget on its own; re-running a
-            # command after a *file change* is verification, and that stays allowed.
+            # Progress, not the tool's category, decides whether a repeat is meaningful.
+            #
+            # The old rule only advanced the epoch on a write, so a long task that legitimately ran
+            # the same *exec* more than once (install, then verify; ls after creating files; a test
+            # suite re-run after a fix) burned its duplicate budget and was then suppressed - and
+            # three suppressed calls ended tool use entirely ("Stopped using tools (repeated
+            # identical tool calls)"). That is the mechanism behind tasks that stopped mid-way.
+            # Now a successful call whose output is *different* from last time is evidence the world
+            # changed, so it refills the budget; an identical output is a stall and does not.
             spec = self.deps.registry.get(call["name"])
-            if result.ok and spec is not None and spec.kind == "write":
-                self._epoch += 1      # the world changed: re-running the same call is now meaningful
+            if result.ok:
+                out = str(result.content or "")[:2000]
+                previous = self._last_output.get(signature)
+                if spec is not None and spec.kind == "write":
+                    self._epoch += 1          # a file changed: re-running the same call is meaningful
+                elif previous is not None and previous != out:
+                    self._epoch += 1          # a *repeat* returned something new: real progress
+                self._last_output[signature] = out
             err = str(result.error or "")
             verdict = recovery.classify(result)
             if verdict == "invalid":

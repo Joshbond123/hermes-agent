@@ -70,7 +70,11 @@ LLAMA_PORT = 11435  # separate from the Ollama daemon installed in parallel
 OLLAMA_NUM_PARALLEL = int(os.environ.get("OLLAMA_NUM_PARALLEL", "1"))
 OLLAMA_MAX_LOADED_MODELS = "1"
 OLLAMA_FLASH_ATTENTION = "1"
-DEFAULT_NUM_CTX = int(os.environ.get("QWEN38_NUM_CTX", "8192"))
+# Context window the engine asks llama.cpp for. This is a *request*: llama.cpp clamps it to
+# what it can allocate, and the fallback path retries with fewer GPU layers if the KV cache
+# does not fit. The agent reads the window the server actually reports (/props) and sizes its
+# own budget to it, so raising this never desynchronises the two.
+DEFAULT_NUM_CTX = int(os.environ.get("QWEN38_NUM_CTX", "16384"))
 DEFAULT_NUM_GPU_LAYERS = int(os.environ.get("QWEN38_NUM_GPU_LAYERS", "999"))  # offload all layers to GPU
 TELEMETRY_TOPIC = "qwen38_kaggle_blackthorn_8492"
 MAX_RUNTIME_SECONDS = int(os.environ.get("MAX_RUNTIME_SECONDS", str(11 * 3600)))
@@ -1148,9 +1152,10 @@ def start_llama_server(gguf_path: str) -> None:
     binary = ensure_llama_server_bin()
     # Context window: prefer env, default 8192 to match the agent's context budget.
     try:
-        n_ctx = int(os.environ.get("QWEN38_NUM_CTX") or os.environ.get("BLACKTHORN_CONTEXT_TOKENS") or "8192")
+        n_ctx = int(os.environ.get("QWEN38_NUM_CTX") or os.environ.get("BLACKTHORN_CONTEXT_TOKENS")
+                    or DEFAULT_NUM_CTX)
     except ValueError:
-        n_ctx = 8192
+        n_ctx = DEFAULT_NUM_CTX
     n_ctx = max(4096, min(n_ctx, 32768))
     log(f"Starting CUDA llama-server on :{LLAMA_PORT} with {gguf_path} (all GPUs, ctx={n_ctx})")
     logf_path = "/tmp/llama_server.log"

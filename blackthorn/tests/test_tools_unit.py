@@ -85,7 +85,8 @@ def test_default_registry_has_the_expected_native_tools():
     reg = default_registry()
     assert set(reg.names()) == {"web_search", "run_command", "list_files", "read_file", "write_file", "fetch_url", "computer_info", "job_status", "remember",
                           "skill_search", "skill_load", "skill_read", "tool_search", "browse", "sample_triage", "cyber_run", "cyber_preflight", "malware_analyzer_submit", "malware_analyzer_report", "todo_list", "session_search", "optional_tool",
-                          "lab_open", "lab_status", "lab_detonate", "lab_close", "lab_exec", "lab_os"}
+                          "lab_open", "lab_status", "lab_detonate", "lab_close", "lab_exec", "lab_os",
+                          "lab_file"}
     for tool in reg.schemas():
         assert tool["type"] == "function" and tool["function"]["description"] and tool["function"]["parameters"]["type"] == "object"
 

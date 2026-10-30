@@ -186,14 +186,41 @@ def shrink_tool_messages(messages: List[Dict[str, Any]], budget_tokens: int, cha
                 return True
 
     # Last resort: keep both the opening request and the current real request where
-    # feasible. If the server state alone is too large, fail honestly instead of
-    # manufacturing a user turn while discarding the actual request.
+    # feasible.
     protected = [m for m in messages[1:] if id(m) in pinned]
     minimal = _alternate([messages[0], *protected])
     if estimate_messages(minimal, chars_per_token) <= budget_tokens:
         messages[:] = minimal
         return True
-    return False
+
+    # The user's own request (or an attachment inside it) is larger than the whole window.
+    # Refusing to run is what produced "This single message is too large for the model window
+    # even after compaction" and left the user with nothing to do but start over. A single
+    # message cannot be dropped — it *is* the task — so keep its head and tail, mark the gap
+    # explicitly, and let the run proceed: the model can always ask for a specific part, and
+    # the elided text is still in the stored turn for a later, smaller request.
+    # Room is whatever the window actually has left after the system prompt - a fixed floor here
+    # would silently declare "fits" while the request was still far too big.
+    room = budget_tokens - estimate_messages([messages[0]], chars_per_token) - 32
+    budget_chars = max(600, int(room * chars_per_token))
+    oversized = sorted(((m for m in protected if len(str(m.get("content") or "")) > budget_chars)),
+                       key=lambda m: -len(str(m.get("content") or "")))
+    for m in oversized:
+        text = str(m.get("content") or "")
+        note = (ELISION_NOTE % (len(text), len(text) - budget_chars + 240))
+        keep = max(240, budget_chars - len(note) - 40)
+        head = int(keep * 0.7)
+        tail = keep - head
+        m["content"] = text[:head] + note + (text[-tail:] if tail > 0 else "")
+    messages[:] = _alternate([messages[0], *protected]) or messages[:]
+    return True
+
+
+# Verbatim middle removed from a request or attachment that is bigger than the whole window.
+# It must be unmistakable: the model has to know it is seeing an excerpt, not the full text.
+ELISION_NOTE = ("\n\n[… %d characters of this request were elided to fit the model's context "
+                "window; the omitted middle is about %d characters long. Ask for a specific "
+                "section, or work from a file on the computer, if you need that part …]\n\n")
 
 
 # ==================================================================================================

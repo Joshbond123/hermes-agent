@@ -62,16 +62,34 @@ async def test_recovery_attempts_are_bounded_and_reported_honestly(stack):
     assert out.text.strip(), "the run must still produce an answer"
 
 
-async def test_a_genuine_repeat_after_success_is_still_stopped(stack):
-    """The stall detector keeps working: identical successful calls are not free work."""
+async def test_a_genuine_repeat_after_success_is_surfaced_and_bounded(stack):
+    """The stall detector keeps working: identical successful calls are not free work.
+
+    Two things must hold now that the old "Stopped using tools" path is gone:
+      * real executions stay capped (a loop cannot burn the budget),
+      * the stall is visible to the user and answered with a strategy change.
+    """
     # One identical call per model step, seven steps in a row: a stalled loop.
     stack.backend.queue(*[[run_command("uname -a", cid=f"c{i}")] for i in range(1, 8)],
                         [*say("Done with what I have."), finish("stop")])
     out = await stack.stream({"message": "run it repeatedly"})
-    notices = [e for e in out.of("notice") if STOP_NOTICE in str(e.get("text", ""))]
-    assert notices, "an unchanged repeated call must still be stopped"
+    noticed = [e["text"] for e in out.of("notice")]
+    assert any("repeated identical tool calls" in t.lower() for t in noticed), \
+        "a stalled step must be reported, not silently swallowed"
     exec_calls = [c for c in stack.backend.computer_calls if c["name"] == "exec"]
     assert len(exec_calls) <= 4, "the duplicate budget must cap real executions"
+    assert out.text.strip(), "the run must still answer"
+
+
+async def test_a_relentless_loop_still_ends_tool_use_after_the_strategy_rounds(stack):
+    """Strategy change is bounded: a loop that ignores every hint is stopped, with a reason."""
+    stack.backend.queue(*[[run_command("uname -a", cid=f"r{i}")] for i in range(1, 26)],
+                        [*say("Blocked: the same call keeps returning the same thing."), finish("stop")])
+    out = await stack.stream({"message": "loop forever"})
+    notices = [e["text"] for e in out.of("notice")]
+    assert any(STOP_NOTICE in t for t in notices), "an unbreakable loop must end tool use"
+    exec_calls = [c for c in stack.backend.computer_calls if c["name"] == "exec"]
+    assert len(exec_calls) <= 8, "strategy rounds must not turn into unlimited retries"
 
 
 async def test_tool_results_after_recovery_are_marked_ok_in_the_ledger(stack):

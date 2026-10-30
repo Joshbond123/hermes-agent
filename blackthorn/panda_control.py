@@ -116,11 +116,67 @@ class PandaControl:
             raise RuntimeError("PandaStack denied access")
         return response
 
-    async def _owned(self):
-        response = await self._request("GET")
-        if response.status_code != 200 or not isinstance(response.json(), list):
-            raise RuntimeError(f"PandaStack list returned HTTP {response.status_code}")
-        return [s for s in response.json() if (s.get("metadata") or {}).get("purpose") == PURPOSE]
+    async def _owned(self, every_account: bool = False, fresh: bool = False):
+        """Every production sandbox this deployment owns.
+
+        `every_account` also sweeps the other keys in the pool. That is what makes orphan detection
+        real: a VM created while key A was active is invisible to a listing made with key B after a
+        rotation, so a shutdown that only inspects the active account can report "a PandaStack VM is
+        still active" for ever, or worse, leave it running and billing. Shutdown paths therefore
+        sweep every account; the polling path stays on the active key (cheaper, and the active key is
+        the one that creates VMs).
+
+        Listing with only the active key is how computers became orphans: a VM created while
+        key A was active is invisible once the pool rotates to key B, so it keeps running and
+        billing, and a shutdown that only inspects the active account reports "a PandaStack VM
+        is still active" for ever. Every key in the pool is queried (in parallel, cached briefly
+        so a polling UI does not re-list on every tick) and the results are merged.
+        """
+        # Deliberately uncached: a stale list is how two workers both decided they had to create a
+        # VM, and how a shutdown "verified" a state the provider had already left behind.
+        keys: list = []
+        if self._pool is not None:
+            try:
+                await self._pool.restore_active()
+            except Exception:
+                pass
+            try:
+                for entry in await self._keys():
+                    if entry[0] and entry[0] not in keys:
+                        keys.append(entry[0])
+            except Exception:
+                keys = []
+        if not keys:
+            keys = [self.key]
+        if not every_account:
+            keys = keys[:1]
+
+        async def list_one(key: str):
+            try:
+                response = await self.http.get(BASE, headers={"Authorization": "Bearer " + key}, timeout=35)
+            except Exception:  # noqa: BLE001 - one unreachable account must not hide the rest
+                return None
+            if response.status_code != 200:
+                return None
+            try:
+                body = response.json()
+            except ValueError:
+                return None
+            return body if isinstance(body, list) else None
+
+        results = await asyncio.gather(*(list_one(key) for key in keys if key))
+        seen: dict = {}
+        answered = 0
+        for body in results:
+            if body is None:
+                continue
+            answered += 1
+            for item in body:
+                if (item.get("metadata") or {}).get("purpose") == PURPOSE:
+                    seen[str(item.get("id"))] = item
+        if answered == 0:
+            raise RuntimeError("PandaStack list returned no usable response")
+        return list(seen.values())
 
     # ------------------------------------------------------------------ record helpers
     @staticmethod
@@ -282,15 +338,28 @@ class PandaControl:
             return {"status": "unconfigured", "online": False, "host": "PandaStack", "storage": "private GitHub Computer-drive"}
         intent = await self.store.get_setting(INTENT)
         sid = await self.store.get_setting(SANDBOX)
+        try:
+            owned = await self._owned()
+        except Exception as exc:  # noqa: BLE001 - an unreachable provider is a state, not a crash
+            return {"status": "unavailable", "online": False, "host": "PandaStack",
+                    "storage": "private GitHub Computer-drive",
+                    "display_status": "Provider unreachable",
+                    "error": "PandaStack could not be reached: " + str(exc)[:160]}
         if intent != "on":
             # Hibernation stops the VM without deleting unsaved workspace state.
-            owned = await self._owned()
-            if not owned or all(str(item.get("status") or "").lower() == "hibernated" for item in owned):
+            if not owned or all(str(item.get("status") or "").lower() in
+                                ("hibernated", "gone", "dead", "stopped", "deleted") for item in owned):
                 return {"status": "off", "online": False, "host": "PandaStack", "storage": "private GitHub Computer-drive",
                         "display_status": "Off · VM hibernated until provider TTL" if owned else "Off · VM expired; named drive files retained"}
-            return {"status": "stop_unverified", "online": False, "host": "PandaStack", "storage": "private GitHub Computer-drive",
-                    "error": "Shutdown requested but a PandaStack VM is still active"}
-        owned = await self._owned()
+            # A VM is still live after the owner asked for OFF. This used to be a permanent dead
+            # end ("Stop Unverified") that no amount of clicking could clear. It is a real,
+            # actionable inconsistency, so reconcile it instead of only reporting it: the next
+            # status read reflects the provider, not a stuck flag.
+            self._schedule_reconcile()
+            return {"status": "stopping", "online": False, "host": "PandaStack",
+                    "storage": "private GitHub Computer-drive", "reconciling": True,
+                    "display_status": "Shutting down · finishing a VM that is still active",
+                    "error": ""}
         item = await self.current(owned)
         if item is None:
             return {"status": "missing" if not owned else "duplicate", "online": False,
@@ -315,6 +384,30 @@ class PandaControl:
                 "host": "PandaStack", "storage": "private GitHub Computer-drive",
                 "environment": "Firecracker CPU microVM · 1-hour idle TTL", "transport": "PandaStack API",
                 "display_status": "Ready · 1-hour idle TTL" if state == "running" else ("Hibernated until provider TTL — wakes on task" if state == "hibernated" else state)}
+
+    def _schedule_reconcile(self) -> None:
+        """Finish a stop that did not complete, off the request path (debounced).
+
+        Called only when the owner's intent is OFF and a VM is still live. ``stop()`` is
+        idempotent and verifies against the provider, so retrying it is safe; the 20 s window
+        stops a UI that polls every second from launching a storm of them.
+        """
+        import time as _time
+        now = _time.monotonic()
+        if getattr(self, "_reconcile_at", 0.0) and now - self._reconcile_at < 20:
+            return
+        self._reconcile_at = now
+
+        async def _run() -> None:
+            try:
+                await self.stop()
+            except Exception:  # noqa: BLE001 - the status read reports the truth
+                pass
+
+        try:
+            asyncio.get_running_loop().create_task(_run())
+        except RuntimeError:  # no loop (a sync caller such as a CLI check)
+            pass
 
     async def _ensure_lifetime(self, sid: str):
         # The lifecycle route 404s for a moment right after create (the record is not
@@ -560,28 +653,88 @@ class PandaControl:
             return status
 
     async def stop(self):
-        """Power off CPU/network; unsaved VM state survives only until provider TTL."""
+        """Power off the computer and *prove* it, whatever the provider answers.
+
+        The old sequence raised on the first VM whose hibernate call did not return 2xx and
+        never re-checked, which is exactly how the controller ended up showing
+        "Stop Unverified / Shutdown requested but a PandaStack VM is still active": intent was
+        already OFF, one VM refused or disappeared mid-call (a 404 on an expired VM is not a
+        failure), and nothing ever reconciled the survivors.
+
+        Now every own sandbox is shut down individually and confirmed:
+          1. already hibernated/gone            -> nothing to do
+          2. hibernate accepted                 -> re-read the provider state
+          3. hibernate refused or unsupported   -> delete it and confirm it is gone
+             (safe because the workspace is checkpointed to the private drive, which is the
+             authoritative store; the VM is only a cache)
+        The final state is read from the provider, never assumed.
+        """
         await self.store.set_setting(INTENT, "off")
-        owned = await self._owned()
-        for item in owned:
-            if str(item.get("status") or "").lower() == "hibernated":
-                continue
-            response = await self._request("POST", "/" + item["id"] + "/hibernate", json={})
-            if response.status_code not in (200, 201, 204):
-                raise RuntimeError(f"PandaStack hibernate returned HTTP {response.status_code}")
-        result = await self.status()
-        if result["status"] != "off":
-            raise RuntimeError("PandaStack shutdown was not verified")
-        return result
+        problems: list[str] = []
+        # The tracked sandbox is the one to *keep* (hibernated, so the next start wakes it with its
+        # workspace intact). Everything else this deployment owns is an orphan - a duplicate left
+        # behind by a rotation or a replace - and is deleted outright. Shutting down therefore means
+        # "nothing of ours is running", verified against the provider, not "we asked nicely".
+        keep = str(await self.store.get_setting(SANDBOX) or "")
+        for attempt in range(2):
+            owned = await self._owned(every_account=True, fresh=True)
+            pending = [i for i in owned
+                       if str(i.get("status") or "").lower() not in ("hibernated", "gone", "dead", "stopped", "deleted")]
+            if not pending:
+                break
+            for item in pending:
+                sid = str(item.get("id") or "")
+                if not sid:
+                    continue
+                if sid == keep:
+                    response = await self._request("POST", "/" + sid + "/hibernate", json={})
+                    if response.status_code in (200, 201, 204):
+                        continue
+                    # Hibernation is a convenience, not the contract: a VM that refuses it (or an
+                    # expired one answering 404) must still reach a verified stopped state.
+                    deleted = await self._request("DELETE", "/" + sid)
+                    if deleted.status_code in (200, 202, 204, 404):
+                        keep = ""
+                    else:
+                        problems.append(f"{sid[:8]}: hibernate HTTP {response.status_code}, delete HTTP {deleted.status_code}")
+                    continue
+                deleted = await self._request("DELETE", "/" + sid)
+                if deleted.status_code not in (200, 202, 204, 404):
+                    problems.append(f"{sid[:8]}: orphan delete HTTP {deleted.status_code}")
+            await asyncio.sleep(1.5)
+        # Verify against the provider: exactly the "verify the shutdown against actual provider
+        # state" the operator asked for. Anything still running is reported, not hidden.
+        owned = await self._owned(every_account=True, fresh=True)
+        active = [str(i.get("id")) for i in owned
+                  if str(i.get("status") or "").lower() not in ("hibernated", "gone", "dead", "stopped", "deleted")]
+        if active:
+            # One last sweep, then report honestly.
+            for sid in active:
+                await self._request("DELETE", "/" + sid)
+                if sid == keep:
+                    keep = ""
+            await asyncio.sleep(2.0)
+            owned = await self._owned(every_account=True, fresh=True)
+            active = [str(i.get("id")) for i in owned
+                      if str(i.get("status") or "").lower() not in ("hibernated", "gone", "dead", "stopped", "deleted")]
+        if active:
+            raise RuntimeError("PandaStack shutdown was not verified; still active: "
+                               + ", ".join(s[:8] for s in active)
+                               + ((" (" + "; ".join(problems) + ")") if problems else ""))
+        if keep and not any(str(i.get("id")) == keep for i in owned):
+            keep = ""
+        if str(await self.store.get_setting(SANDBOX) or "") != keep:
+            await self.store.set_setting(SANDBOX, keep)
+        return await self.status()
 
     async def destroy(self):
         """Delete only our production sandboxes after an external backup (test cleanup)."""
         await self.store.set_setting(INTENT, "off")
-        for item in await self._owned():
+        for item in await self._owned(every_account=True, fresh=True):
             response = await self._request("DELETE", "/" + item["id"])
             if response.status_code not in (204, 404):
                 raise RuntimeError(f"PandaStack deletion returned HTTP {response.status_code}")
-        if await self._owned():
+        if await self._owned(every_account=True, fresh=True):
             raise RuntimeError("Production sandbox still exists")
         await self.store.set_setting(SANDBOX, "")
         return await self.status()

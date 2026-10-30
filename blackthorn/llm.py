@@ -54,6 +54,38 @@ def _is_overflow(message: str) -> bool:
 INROK_HOST_SUFFIX = ".share.inrok.in"
 
 
+async def server_context(client: httpx.AsyncClient, route: Route, timeout: float = 2.5) -> int:
+    """The context window the runtime *actually* serves, or 0 when it cannot be read.
+
+    Raising a number in a config file does not give the engine more capacity, and guessing the
+    other way (assuming more than the engine has) turns every long step into a ContextOverflow
+    retry. llama.cpp reports the real window on /props; a gateway that does not implement it is
+    simply unknown, and the caller keeps its configured budget.
+    """
+    headers = {**tunnel_headers(route.url), "Authorization": f"Bearer {route.api_key}"}
+    for path in ("/props", "/v1/props"):
+        try:
+            resp = await client.get(f"{route.url}{path}", headers=headers, timeout=timeout)
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+        except (httpx.HTTPError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        for key in ("default_generation_settings", "generation_settings"):
+            settings = data.get(key) or {}
+            if isinstance(settings, dict):
+                value = settings.get("n_ctx") or settings.get("context_length")
+                if isinstance(value, int) and value > 0:
+                    return value
+        for key in ("n_ctx", "context_length", "max_context_length", "n_ctx_train"):
+            value = data.get(key)
+            if isinstance(value, int) and value > 0:
+                return value
+    return 0
+
+
 async def route_alive(client: httpx.AsyncClient, route: Route) -> bool:
     """Cheap liveness probe of the GPU route, used only to label a silent stream (dead vs slow)."""
     try:
