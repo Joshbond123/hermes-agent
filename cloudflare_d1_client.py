@@ -2328,6 +2328,55 @@ def _retire_verified_old_slots(fleet) -> None:
             logger.warning("old slot retirement not verified: %s", type(exc).__name__)
 
 
+def _model_session_still_up(grace_s: float = 120.0) -> tuple[bool, str]:
+    """Is the model session genuinely gone? Ask the record the notebook itself writes.
+
+    Kaggle's control plane is not authoritative for a *running* notebook: a live turn-off
+    returned ``stopped`` from ``kernels.delete`` (and the row was rewritten GPU_STOPPED) while
+    the session went on heartbeating and answering requests - a false confirmation of exactly
+    the kind the operator reported. A notebook that is still alive keeps refreshing its row
+    every few seconds, so a fresh heartbeat is direct evidence that the session is still up,
+    whatever the delete call said.
+    """
+    try:
+        found = d1_query("SELECT status, tunnel_url, updated_at, kaggle_kernel FROM kaggle_gpu_state "
+                         "WHERE id = 'primary' LIMIT 1;")
+    except Exception:
+        return False, "state unreadable"
+    if not found:
+        return False, "no state row"
+    row = found[0] or {}
+    status = str(row.get("status") or "").upper()
+    live_states = ("HEARTBEAT_ONLINE", "ONLINE", "MODEL_READY", "MODEL_READY_AND_WARMED", "LOADING_MODEL",
+                   "STARTING_GATEWAY", "BOOTING_KAGGLE_GPU", "STARTING_KAGGLE", "ONLINE_WARMING")
+    age = time.time() - float(row.get("updated_at") or 0)
+    if status in live_states and age < grace_s:
+        return True, f"the session row is {status} ({int(age)}s ago, kernel {row.get('kaggle_kernel') or 'unknown'})"
+    return False, ""
+
+
+def _stop_kernel_named_by_heartbeat(accounts) -> str:
+    """Last-resort stop aimed at the kernel the *heartbeat* names, not the fleet's guess."""
+    try:
+        found = d1_query("SELECT kaggle_kernel FROM kaggle_gpu_state WHERE id = 'primary' LIMIT 1;")
+    except Exception:
+        return ""
+    ref = str((found[0] if found else {}).get("kaggle_kernel") or "").strip()
+    if "/" not in ref:
+        return ""
+    user, _, name = ref.partition("/")
+    account = next((a for a in accounts if a.user == user.strip()), None)
+    if account is None:
+        return f"{ref}: no credential for that account"
+    from blackthorn.fleet import FleetError, FleetManager
+    try:
+        fleet = FleetManager(accounts)
+        result = fleet.stop_kernel_result(account, ref.strip())
+    except Exception as exc:  # noqa: BLE001 - reported, never hidden
+        return f"{ref}: {type(exc).__name__}: {str(exc)[:140]}"
+    return f"{ref}: {result.get('state')}" + (f" ({result.get('error')})" if result.get("error") else "")
+
+
 def turn_off_fleet(blocking: bool = True, source: str = "", roles: tuple = ("model", "computer"),
                    force: bool = False) -> Dict[str, Any]:
     """Stop requested roles' kernels. Honest per-role result: a row is written GPU_STOPPED only
@@ -2491,6 +2540,27 @@ def turn_off_fleet(blocking: bool = True, source: str = "", roles: tuple = ("mod
     out["computer_checkpoint"] = checkpoint
     if blocking:
         _stops()
+        # The delete call is a request, not a proof. Verify against the record the notebook
+        # writes while it is still alive; if it is still up, aim a second stop at the kernel the
+        # heartbeat names and verify again. Reporting "stopped" over a live session is the
+        # failure this whole path is supposed to prevent.
+        if "model" in roles and out.get("model", {}).get("status") in ("stopped", "not_running", "stopped_control_plane"):
+            still_up, why = _model_session_still_up()
+            if still_up:
+                detail = _stop_kernel_named_by_heartbeat(accounts)
+                try:
+                    _write_fleet_row("primary", "STOPPING_KAGGLE_GPU", gpu_info="")
+                except Exception:
+                    pass
+                time.sleep(6)
+                still_up, why = _model_session_still_up(grace_s=90.0)
+                if still_up:
+                    out["model"] = {"account": out["model"].get("account", ""), "status": "stop_unverified",
+                                    "error": f"the model session is still running: {why}" +
+                                             (f"; second stop attempt: {detail}" if detail else "")}
+                else:
+                    out["model"].update({"status": "stopped", "note":
+                                         f"stopped after a second attempt against the heartbeat's kernel ({detail})"})
     else:
         threading.Thread(target=_stops, daemon=True, name="blackthorn-fleet-off").start()
     return out

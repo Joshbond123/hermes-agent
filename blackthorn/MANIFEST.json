@@ -2,7 +2,7 @@
  "files": {
   "blackthorn/COMPUTER_DRIVE.md": "0402762e400231c963d1532defc0c0ff6fd08e25733239934a157a6d406bdd28",
   "blackthorn/README.md": "5e589407dd98d904c8cac38588ddf97079ea92b079df2f502e1a9988e42daac1",
-  "blackthorn/__init__.py": "0a0ea9a1077b6e7141b2ea4039d5ef067227e93f11c5fc112ce4bd4617eaf38a",
+  "blackthorn/__init__.py": "0c0e65698a0f5e778b4c9514692cb18eb46de313fb6349724d40bf0b96307749",
   "blackthorn/agent.py": "4864e8a7d3bf0a10c16d6a05a9ade50020da65b74d6fc9227c350f7d942fe48b",
   "blackthorn/api.py": "5579c3935ee7e4adc20c4ca4cc73e7df0bded4766e5c74980ba65e12712a987b",
   "blackthorn/app.py": "0aad44884216cf175a2211f2c35c8ee72b65230f96afa765ad83172aa37d2e90",
@@ -69,8 +69,8 @@
   "blackthorn/version.py": "5d43f6378622c4ddeeec627755c2e98152f6077be9334b2770c3a8199018bf37",
   "blackthorn/workspace_mirror.py": "abbf0b1a080a6d893d8922e02a4715ddbccc1c3f55cca54ee3296382ecbdc773",
   "blackthorn_start.py": "d8189febd25f393cc6b41cd17f7cc88d73ecaa44942fa52f51dd310602b108df",
-  "cloudflare_d1_client.py": "2e861f10c90ac3a48297b1f19bf9a6447cb44eab078e84703c6e1a69dc8dcf1d",
+  "cloudflare_d1_client.py": "3c21a33f4a59d11664e494cd690a4bbd348677f6040c18127c089fe04ef6d4f1",
   "kaggle_cyber_ornith/cyber_ornith_server.py": "894d6257f09bfa98d9713dfb7e7797e21e17d6c0b3a6ecba8cdc004c0a566c44"
  },
- "version": "5.4.4"
+ "version": "5.4.5"
 }

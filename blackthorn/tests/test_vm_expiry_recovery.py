@@ -102,3 +102,26 @@ async def test_tool_results_after_recovery_are_marked_ok_in_the_ledger(stack):
     ends = out.of("tool.end")
     assert ends and all(e.get("status") == "ok" for e in ends), ends
     assert out.text.strip()
+
+
+def test_a_live_model_row_is_never_reported_as_a_verified_stop(monkeypatch):
+    """Kaggle's delete can be accepted while the notebook keeps heartbeating.
+
+    A real turn-off did exactly that: the API answered 'stopped', the row was rewritten
+    GPU_STOPPED, and the session went on answering requests. The verifier must read the
+    notebook's own heartbeat instead of trusting the delete call.
+    """
+    import time as _time
+    import cloudflare_d1_client as ctl
+
+    fresh = {"status": "HEARTBEAT_ONLINE", "updated_at": _time.time() - 5, "kaggle_kernel": "black797/qwen"}
+    monkeypatch.setattr(ctl, "d1_query", lambda *_a, **_k: [fresh])
+    assert ctl._model_session_still_up() == (
+        True, "the session row is HEARTBEAT_ONLINE (5s ago, kernel black797/qwen)")
+
+    stale = dict(fresh, updated_at=_time.time() - 900)
+    monkeypatch.setattr(ctl, "d1_query", lambda *_a, **_k: [stale])
+    assert ctl._model_session_still_up()[0] is False, "an old heartbeat is not a live session"
+
+    monkeypatch.setattr(ctl, "d1_query", lambda *_a, **_k: [dict(fresh, status="GPU_STOPPED_SAVING_QUOTA")])
+    assert ctl._model_session_still_up()[0] is False
