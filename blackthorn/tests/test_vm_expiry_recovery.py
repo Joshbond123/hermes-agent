@@ -125,3 +125,33 @@ def test_a_live_model_row_is_never_reported_as_a_verified_stop(monkeypatch):
 
     monkeypatch.setattr(ctl, "d1_query", lambda *_a, **_k: [dict(fresh, status="GPU_STOPPED_SAVING_QUOTA")])
     assert ctl._model_session_still_up()[0] is False
+
+
+@pytest.mark.asyncio
+async def test_turn_off_retries_a_transient_upstream_timeout(stack):
+    """A ReadTimeout took a whole power-off down with 'gpu_control_failed' in live testing.
+
+    Stopping is idempotent, so it is retried; a genuine refusal is still reported at once.
+    """
+    import httpx
+
+    calls = {"n": 0}
+
+    class Gpu:
+        async def turn_off(self, role="all"):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise TimeoutError("ReadTimeout: ")
+            return {"turn_off_ok": True, "status": "GPU_STOPPED_SAVING_QUOTA", "turn_off_roles": [role], "fleet": {}}
+
+    original = stack.services.gpu
+    stack.services.gpu = Gpu()
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(f"{stack.url}/api/kaggle-gpu/turn-off",
+                                         json={"role": "all", "confirm": True})
+    finally:
+        stack.services.gpu = original
+    assert response.status_code == 200, response.text
+    assert response.json()["turn_off_ok"] is True
+    assert calls["n"] == 2, "the timeout must be retried, not surfaced as a failure"

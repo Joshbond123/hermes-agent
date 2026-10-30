@@ -4,4 +4,4 @@ Everything the live site runs is in this repository: the API (this package), the
 (``blackthorn/ui``) and its hashed build output (``blackthorn/static``).
 """
 
-__version__ = "5.4.6"
+__version__ = "5.4.7"

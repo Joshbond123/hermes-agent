@@ -486,10 +486,29 @@ async def gpu_off(body: OffBody, request: Request):
     if not body.confirm:
         raise _err(422, "confirm_required", "Turning the GPU off stops the model session. Send {\"confirm\": true} to proceed.")
     live = s.runs.active_count()
-    try:
-        out = await s.gpu.turn_off() if body.role == "all" else await s.gpu.turn_off(role=body.role)
-    except Exception as exc:
-        raise _gpu_error(exc)
+
+    async def stop_once():
+        return await s.gpu.turn_off() if body.role == "all" else await s.gpu.turn_off(role=body.role)
+
+    # A power-off is idempotent, so a transient upstream failure (a Kaggle API ReadTimeout was
+    # observed taking the whole turn-off down with 'gpu_control_failed') must be retried here
+    # rather than handed to the operator as a refusal. Two attempts, then an honest error.
+    out = None
+    last: Exception | None = None
+    for attempt in range(2):
+        try:
+            out = await stop_once()
+            break
+        except Exception as exc:  # noqa: BLE001 - retried, then reported with its reason
+            last = exc
+            kind = type(exc).__name__.lower()
+            transient = any(word in kind for word in ("timeout", "connect", "readerror", "remotedisconnected")) \
+                or "timed out" in str(exc).lower()
+            if not transient:
+                raise _gpu_error(exc)
+            await asyncio.sleep(2.0 + 2.0 * attempt)
+    if out is None:
+        raise _gpu_error(last if last is not None else RuntimeError("turn-off failed"))
     s.resolver.invalidate()
     out["interrupted_runs"] = live if out.get("turn_off_ok") else 0
     return out
