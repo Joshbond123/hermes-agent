@@ -388,6 +388,28 @@ async def relay_proxy(request: Request, path: str = ""):
     body = await request.body()
     headers = {k.lower(): v for k, v in request.headers.items()
                if k.lower() not in DROP_HEADERS and not k.lower().startswith("x-relay-")}
+    if channel == "model":
+        # The relay is the authority for the model credential.
+        #
+        # The notebook only accepts the key it published for this boot. Forwarding the caller's
+        # own copy let a stale (cached) credential reach the notebook and come back as a 401 the
+        # agent could only answer by refreshing - which returns the same stale key whenever the
+        # notebook could not republish, producing the endless "GPU gateway kept rejecting the
+        # refreshed credential" loop. Instead: authenticate the caller against the published key
+        # here, and forward the authoritative one.
+        authoritative = await _row_keys(request, "model", force=True)
+        if not authoritative:
+            raise HTTPException(status_code=503,
+                                detail={"code": "gpu_key_unavailable",
+                                        "message": "The model has not published an access key yet."})
+        presented = (request.headers.get("authorization") or "")
+        presented = presented[7:].strip() if presented.lower().startswith("bearer ") else presented.strip()
+        if presented and presented not in set(authoritative):
+            # Distinct, retryable code: the caller's route is stale, nothing ran, no work was lost.
+            raise HTTPException(status_code=401,
+                                detail={"code": "stale_key",
+                                        "message": "This request used an out-of-date model key. Refresh the route and retry."})
+        headers["authorization"] = "Bearer " + authoritative[0]
     job = hub.submit(request.method.upper(), path, headers, body)
 
     # Between long-polls waiting_pulls can be 0 while the notebook is healthy; use alive().

@@ -142,6 +142,41 @@ LINUX_LIBS = (
 )
 
 
+def _ensure_temp_roots(cache_root: str, notes: list) -> str:
+    """Create (and prove usable) the temp root Playwright will use for this launch.
+
+    Playwright creates its profile and artefact directories with ``mkdtemp`` inside ``TMPDIR``.
+    After a sandbox replacement ``/workspace/.cache`` is rehydrated lazily, and if the launch
+    wins that race the browser dies with::
+
+        BrowserType.launch: ENOENT: no such file or directory,
+        mkdtemp '/workspace/.cache/tmp/playwright-artifacts-...'
+
+    which is exactly what the operator saw. Verified with a real mkdtemp, not just a mkdir, and
+    it falls back to a directory that genuinely works rather than one that merely exists.
+    """
+    import tempfile
+    candidates = [os.environ.get("BLACKTHORN_BROWSER_TMP") or "",
+                  os.path.join(cache_root, "tmp"),
+                  "/var/tmp", "/tmp"]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            os.makedirs(candidate, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix="bt-probe-", dir=candidate):
+                pass
+        except OSError:
+            continue
+        os.environ["TMPDIR"] = candidate
+        os.environ["XDG_CACHE_HOME"] = cache_root
+        if candidate != os.path.join(cache_root, "tmp"):
+            notes.append(f"browser temp root fell back to {candidate}")
+        return candidate
+    raise RuntimeError("no writable temporary directory for the browser (tried the workspace cache, "
+                       "/var/tmp and /tmp)")
+
+
 def _browser_binary(cache_root: str) -> str:
     for root in (pathlib.Path(cache_root) / "camoufox",
                  pathlib.Path(os.path.expanduser("~/.cache/camoufox"))):
@@ -152,20 +187,46 @@ def _browser_binary(cache_root: str) -> str:
     return ""
 
 
+def _elf_files(root: str, limit: int = 40) -> list:
+    """The executables and shared objects inside the browser bundle."""
+    out = []
+    for path in pathlib.Path(root).rglob("*"):
+        if len(out) >= limit:
+            break
+        try:
+            if path.is_file() and path.stat().st_size > 4096 and os.access(path, os.X_OK):
+                with path.open("rb") as fh:
+                    if fh.read(4) == b"\x7fELF":
+                        out.append(str(path))
+        except OSError:
+            continue
+    return out
+
+
 def _missing_libs(binary: str) -> list:
-    """Shared objects the browser binary cannot resolve (precise, unlike a name guess)."""
+    """Shared objects the browser needs but cannot resolve.
+
+    Checking only ``camoufox-bin`` misses the libraries its child processes and plugins
+    (libnss3, libnspr4, GTK, ALSA) load when the browser actually starts, which is why a
+    "launch failed" could survive an install that reported success. Every ELF in the bundle
+    is inspected instead, plus the system library set Firefox requires.
+    """
     if not binary:
         return []
-    try:
-        proc = _run(["ldd", binary], 60)
-    except (OSError, subprocess.SubprocessError):
-        return []
+    targets = [binary]
+    root = str(pathlib.Path(binary).parent)
+    targets.extend(t for t in _elf_files(root) if t != binary)
     missing = []
-    for line in (proc.stdout or "").splitlines():
-        if "not found" in line:
-            name = line.split("=>")[0].strip()
-            if name and name not in missing:
-                missing.append(name)
+    for target in targets:
+        try:
+            proc = _run(["ldd", target], 60)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        for line in (proc.stdout or "").splitlines():
+            if "not found" in line:
+                name = line.split("=>")[0].strip()
+                if name and name not in missing:
+                    missing.append(name)
     return missing
 
 
@@ -297,7 +358,11 @@ def _ensure_runtime(notes: list) -> None:
         if proc.returncode != 0:
             raise RuntimeError("camoufox browser download failed: " + ((proc.stderr or proc.stdout or "")[-300:]))
         notes.append("downloaded Camoufox browser after replacement")
-    _warm_browser(cache_root, notes)
+    # Libraries and temp roots are made good *before* anything is launched. The old order warmed
+    # the browser first, so on a fresh VM the first launch failed on missing GTK/NSS libraries,
+    # the failure was recorded as a note, and the tool call then failed with a bare
+    # "BrowserType.launch: Failed to launch the browser process".
+    _ensure_temp_roots(cache_root, notes)
     if sys.platform.startswith("linux"):
         binary = _browser_binary(cache_root)
         missing = _missing_libs(binary)
@@ -306,6 +371,8 @@ def _ensure_runtime(notes: list) -> None:
             notes.append(detail)
             if not ok:
                 raise RuntimeError("Camoufox cannot start: " + detail)
+            _ensure_temp_roots(cache_root, notes)
+    _warm_browser(cache_root, notes)
 
 
 # Backwards-compatible name used by older callers/tests.
@@ -425,14 +492,64 @@ def _save_screenshot(page, req: dict, result: dict) -> None:
 
 
 # ------------------------------------------------------------------ session
+LAUNCH_HINTS = {
+    "temp": ("mkdtemp", "enoent", "no such file or directory"),
+    "libs": ("error while loading shared libraries", "xpcomglueload", "cannot open shared object",
+             "libgtk", "libnss", "libnspr", "failed to launch the browser process"),
+    "bundle": ("camoufoxnotinstalled", "directory not empty", "errno 39", "corrupted", "checksum",
+               "not installed", "please run `camoufox fetch`"),
+}
+
+
+def _classify_launch_error(exc: Exception) -> str:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    for kind in ("bundle", "temp", "libs"):
+        if any(marker in text for marker in LAUNCH_HINTS[kind]):
+            return kind
+    return "other"
+
+
+def _launch(cache_root: str, options: dict, notes: list):
+    """Open the browser, repairing the one thing that failed and retrying exactly once.
+
+    A launch failure used to end the tool call with the raw Playwright exception. Each of the
+    three observed causes has one correct, cheap repair; anything else is reported as-is.
+    """
+    from camoufox.sync_api import Camoufox
+    _ensure_temp_roots(cache_root, notes)
+    try:
+        return Camoufox(**options)
+    except Exception as exc:  # noqa: BLE001 - classified below
+        kind = _classify_launch_error(exc)
+        notes.append(f"browser launch failed ({kind}): {str(exc)[:180]}")
+        if kind == "temp":
+            _ensure_temp_roots(cache_root, notes)
+        elif kind == "libs":
+            binary = _browser_binary(cache_root)
+            ok, detail = _install_linux_libs(binary)
+            notes.append(detail)
+            if not ok:
+                raise RuntimeError("the computer is missing browser system libraries: " + detail) from exc
+        elif kind == "bundle":
+            if not _repair_bundle(cache_root):
+                raise RuntimeError("the browser bundle could not be repaired: " + str(exc)[:200]) from exc
+            notes.append("browser bundle refetched")
+        else:
+            raise
+        _ensure_temp_roots(cache_root, notes)
+        return Camoufox(**options)
+
+
 def run_session(req: dict, notes: list, started: float) -> dict:
     _ensure_runtime(notes)
-    from camoufox.sync_api import Camoufox
+    cache_root = os.environ.get("XDG_CACHE_HOME") or _prepare_disk([])
+    from camoufox.sync_api import Camoufox  # noqa: F401 - imported for the error path below
     action = str(req.get("action") or "open").lower()
     timeout_ms = max(3000, min(90000, int(req.get("timeout_ms") or 25000)))
     storage = str(req.get("storage") or DEFAULT_STORAGE)
     cookies = storage if os.path.exists(storage) else None
-    with Camoufox(headless=bool(req.get("headless", True)), humanize=False) as browser:
+    launch_options = {"headless": bool(req.get("headless", True)), "humanize": False}
+    with _launch(cache_root, launch_options, notes) as browser:
         context = browser.new_context(storage_state=cookies,
                                       accept_downloads=True,
                                       viewport={"width": int(req.get("width") or 1280),

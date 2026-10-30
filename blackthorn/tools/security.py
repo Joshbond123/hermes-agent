@@ -194,9 +194,19 @@ async def browse(args: Dict[str, Any], ctx: ToolContext) -> ToolResult:
     if result is None:
         return _fail("browser produced no result", {"kind": "browser", "output": "\n".join(raw)[-300:]})
     if not result.get("ok"):
-        return _fail(f"browse {result.get('error_kind', 'error')}: {str(result.get('error', ''))[:300]}",
-                     data={"kind": "browser_" + str(result.get("error_kind", "error")),
-                           "attempts": result.get("attempts")})
+        kind = str(result.get("error_kind", "error"))
+        detail = str(result.get("error", ""))[:300]
+        notes = "; ".join(result.get("notes") or [])
+        if kind in ("dependency", "error") and ("launch" in detail.lower() or "browser process" in detail.lower()):
+            # The browser repairs itself (temp roots, system libraries, bundle refetch) and retries
+            # before this point, so a launch error here means the repair did not hold. Say what is
+            # wrong in terms the next step can act on, instead of pasting a driver traceback.
+            kind = "dependency"
+            detail = ("the browser could not start on the computer after automatic repair "
+                      f"({detail[:180]}). Notes: {notes[:200] or 'none'}")
+        return _fail(f"browse {kind}: {detail}",
+                     data={"kind": "browser_" + kind, "attempts": result.get("attempts"),
+                           "notes": notes[:400]})
     notes = "; ".join(result.get("notes") or [])
     if action in ("tabs", "download", "close"):
         return ToolResult(ok=True, content=json.dumps({k: v for k, v in result.items() if k != "notes"},

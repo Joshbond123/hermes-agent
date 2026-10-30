@@ -470,6 +470,26 @@ class ChatStore:
             "SELECT status, tunnel_url, api_key, model, gpu_info, updated_at FROM kaggle_gpu_state WHERE id = 'primary' LIMIT 1")
         return dict(res.rows[0]) if res.rows else {}
 
+    async def unblock_gpu_row(self) -> bool:
+        """Re-open a row that a stop left closed, keeping the published link.
+
+        The notebook refuses to publish while its row says GPU_STOPPED/OFF/STOPPING (so a late
+        heartbeat cannot resurrect a role). If the session is in fact alive - it is answering, so
+        its credential was rejected for another reason - that guard strands it: it can never
+        republish and the agent refreshes against a key that will never change. Moving the row to
+        a neutral state lets the next heartbeat publish the real credential. The link is preserved
+        because it is still the live session's link.
+        """
+        try:
+            await self.db.query(
+                "UPDATE kaggle_gpu_state SET status = 'RECOVERING_KEY', updated_at = ? "
+                "WHERE id = 'primary' AND status IN ('GPU_STOPPED_SAVING_QUOTA','OFF','STOPPING_KAGGLE_GPU')",
+                [__import__("time").time()])
+            row = await self.gpu_row()
+            return str(row.get("status") or "").upper() == "RECOVERING_KEY"
+        except Exception:
+            return False
+
     async def computer_row(self) -> Dict[str, Any]:
         """The agent's personal computer (id='computer'); empty until one is enrolled."""
         res = await self.db.query(

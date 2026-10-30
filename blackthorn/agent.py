@@ -78,6 +78,10 @@ MAX_RECOVERY_ROUNDS = int(__import__("os").environ.get("BLACKTHORN_MAX_RECOVERY_
 # step is reported as a real auth failure. One refresh was too few: the notebook publishes its
 # rotated key a few seconds after the old one starts being refused.
 AUTH_REFRESH_ROUNDS = int(__import__("os").environ.get("BLACKTHORN_AUTH_REFRESH_ROUNDS", "3") or 3)
+# A notebook publishes on its own heartbeat; after its row is re-opened it needs a beat to
+# republish the key it is actually serving. Long enough for one heartbeat, short enough that a
+# repair never looks like a hang.
+GPU_REPUBLISH_WAIT_S = float(__import__("os").environ.get("BLACKTHORN_GPU_REPUBLISH_WAIT_S", "6") or 6)
 # First wait before re-reading the control plane. The notebook publishes its rotated key on a
 # heartbeat, so an immediate re-read usually returns the same (already refused) key.
 AUTH_REFRESH_BACKOFF_S = float(__import__("os").environ.get("BLACKTHORN_AUTH_BACKOFF_S", "4") or 4)
@@ -900,6 +904,40 @@ class AgentRun:
             raise RunFailure("empty_response", "The model returned an empty response (it produced only reasoning). Retry to ask again.", True)
 
     # ------------------------------------------------------------------ one model call (with recovery)
+    async def _reopen_closed_row(self, route) -> bool:
+        """Re-open a control-plane row that a stop closed while this session is still serving.
+
+        A notebook may not publish its key over a row marked stopped - that guard is correct, it
+        stops a late heartbeat resurrecting a role. It becomes a deadlock only when the host is
+        demonstrably alive: the published key then stays the previous boot's (or empty) for ever,
+        every refresh returns the same rejected credential, and the task dies with "the GPU
+        gateway kept rejecting the refreshed credential".
+
+        So: prove the host answers (any HTTP status counts - a 401 still proves a live endpoint),
+        and only then re-open a row that is actually closed. A genuinely stopped GPU answers
+        nothing and is left alone, so a real shutdown is never undone.
+        """
+        url = str(getattr(route, "url", "") or "").rstrip("/")
+        if not url:
+            return False
+        try:
+            probe = await self.deps.http.get(f"{url}/v1/models", timeout=8.0)
+            alive = probe.status_code in (200, 401, 403, 404)
+        except (OSError, httpx.HTTPError):
+            return False
+        if not alive:
+            return False
+        try:
+            reopened = bool(await self.deps.store.unblock_gpu_row())
+        except Exception:  # noqa: BLE001 - a repair attempt must never fail the run
+            return False
+        if reopened:
+            self.run.emit("notice", level="info",
+                          text="The published model key was stale because a stop had closed its record while "
+                               "the GPU was still serving; re-opened it so the live session can publish the "
+                               "key it actually uses.")
+        return reopened
+
     async def _adopt_server_context(self) -> None:
         """Size the budget to the window the engine really has, once per run.
 
@@ -1006,17 +1044,39 @@ class AgentRun:
                     if auth_refreshes:
                         await asyncio.sleep(min(AUTH_REFRESH_BACKOFF_S * (2 ** (auth_refreshes - 1)), 15.0))
                     self.deps.resolver.invalidate()
+                    fresh, failure = None, None
                     try:
                         fresh = await self.deps.resolver.get(force=True)
-                    except Exception:
-                        raise exc
+                    except Exception as refresh_exc:  # noqa: BLE001 - repaired below
+                        failure = refresh_exc
+                    changed = fresh is not None and (fresh.api_key != route.api_key or fresh.url != route.url)
+                    if not changed:
+                        # The refresh did not produce a different credential (or could not read one
+                        # at all). The one cause that repeating can never fix: a stop closed the
+                        # control-plane row while the session is still serving, which forbids the
+                        # notebook from publishing the key it actually uses - so the same rejected
+                        # credential comes back for ever. Re-open the row and let it republish.
+                        if await self._reopen_closed_row(route):
+                            await asyncio.sleep(GPU_REPUBLISH_WAIT_S)
+                            self.deps.resolver.invalidate()
+                            try:
+                                fresh = await self.deps.resolver.get(force=True)
+                                failure = None
+                                changed = (fresh.api_key != route.api_key or fresh.url != route.url)
+                            except Exception as refresh_exc:  # noqa: BLE001 - handled below
+                                failure = refresh_exc
                     if auth_refreshes >= AUTH_REFRESH_ROUNDS:
+                        if fresh is None:
+                            raise LLMError("gpu_auth", "The GPU connection dropped while the task was running "
+                                           f"({getattr(failure, 'code', 'unavailable')}). The task is saved; retry "
+                                           "when the GPU connection is healthy and it will continue where it "
+                                           "stopped.", retryable=True,
+                                           status=getattr(failure, "status", exc.status)) from (failure or exc)
                         raise LLMError("gpu_auth", "The GPU gateway kept rejecting the refreshed credential after "
                                        f"{AUTH_REFRESH_ROUNDS} refresh rounds. The task is saved; retry when the GPU "
                                        "connection is healthy and it will continue where it stopped.",
                                        retryable=True, status=exc.status) from exc
-                    changed = fresh.api_key != route.api_key or fresh.url != route.url
-                    if not changed:
+                    if not changed and fresh is not None:
                         # Same published credential: it is either genuinely wrong or the edge
                         # refused one stream. A cheap authenticated call decides which, and a
                         # fresh key may still land before the next round.

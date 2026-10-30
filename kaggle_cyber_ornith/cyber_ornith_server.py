@@ -38,6 +38,9 @@ import secrets as _secrets
 # Gateway bearer key: injected, or generated per boot and published to D1 (never a constant in source).
 API_KEY = (os.environ.get("QWEN38_API_KEY") or os.environ.get("CYBER_ORNITH_API_KEY")
            or ("bt-" + _secrets.token_urlsafe(32)))
+# When this process started. Used to tell a *new* session apart from a late heartbeat of an old
+# one: a row written before this boot belongs to a previous session, so this one may take it over.
+BOOT_EPOCH = time.time()
 MODEL_QUANT = os.environ.get("QWEN38_QUANT", os.environ.get("CYBER_ORNITH_QUANT", "Q4_K_M"))
 MODEL_ALIAS = "Qwen3.8-27B-Uncensored"
 OLLAMA_MODEL_NAME = "qwen38:uncensored"
@@ -305,8 +308,12 @@ def notify_workspace(status: str, tunnel_url: str = "", extra: dict = None) -> N
             f"https://api.cloudflare.com/client/v4/accounts/{_cf_acct}"
             f"/d1/database/{_cf_db}/query"
         )
-        # A late notebook heartbeat must never resurrect a role after the
-        # controller has stopped it. The next authorised ON writes BOOTING first.
+        # A late heartbeat must never resurrect a role the controller stopped - but a *new*
+        # session must always be able to publish its own key. Without the second half of this
+        # guard a restarted notebook could never register: the row stays GPU_STOPPED/STOPPING,
+        # every heartbeat is silently dropped, and the agent refreshes for ever against a key
+        # that no longer exists ("the GPU gateway kept rejecting the refreshed credential").
+        # The row is only protected while it was written *after* this process started.
         cf_sql = (
             "INSERT INTO kaggle_gpu_state (id, status, tunnel_url, api_key, model, gpu_info, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?) "
@@ -314,7 +321,8 @@ def notify_workspace(status: str, tunnel_url: str = "", extra: dict = None) -> N
             "api_key=excluded.api_key, model=excluded.model, gpu_info=excluded.gpu_info, "
             "updated_at=excluded.updated_at "
             "WHERE kaggle_gpu_state.status NOT IN "
-            "('GPU_STOPPED_SAVING_QUOTA','OFF','STOPPING_KAGGLE_GPU');"
+            "('GPU_STOPPED_SAVING_QUOTA','OFF','STOPPING_KAGGLE_GPU') "
+            "   OR kaggle_gpu_state.updated_at < ?;"
         )
         cf_params = [
             "computer" if ROLE == "computer" else "primary",
@@ -324,6 +332,7 @@ def notify_workspace(status: str, tunnel_url: str = "", extra: dict = None) -> N
             MODEL_ALIAS,
             (extra or {}).get("gpu") or (extra or {}).get("gpu_info") or ((extra or {}).get("error") and ("FAILED: " + str((extra or {}).get("error"))[:150])) or "2x NVIDIA Tesla T4",
             time.time(),
+            BOOT_EPOCH,
         ]
         cf_req = urllib.request.Request(
             cf_url,
