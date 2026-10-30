@@ -52,6 +52,11 @@ PLAN_ONLY_NOTE = ("[server] Your reply described what you intend to do but you r
                   "nothing was actually done. Execute the work now with tools, one step at a time, and only "
                   "then report the result. Do not present a plan as if it were the outcome.")
 
+EVIDENCE_NOTE = ("[server] Before this answer is sent, check every specific value in it - sizes, counts, versions, "
+                 "paths, exit codes - against the tool results below. They are the authoritative record. If a value "
+                 "in your answer does not appear in one of them, either re-run the command and quote the new result, "
+                 "or say plainly that it is unverified. Do not fill gaps from memory.")
+
 CLAIM_NOTE = ("[server] This turn executed NO tool successfully, yet the reply states that work was done. "
               "The record shows nothing ran. Either perform the work with tools now and report only what the "
               "tool results show, or state plainly that it was not done and why. Never describe an action you "
@@ -61,7 +66,7 @@ RESUME_NOTE = ("[server] The earliest part of this turn was compacted to fit the
                "Keep working from the tool results above until the user's request is genuinely complete, then "
                "report only what the recorded results show.")
 NOTE_PREFIXES = (FINALIZE_NOTE[:40], LENGTH_CONTINUE_NOTE[:40], CONTINUE_NOTE[:40], GATE_NOTE[:40], RESUME_NOTE[:40],
-                 STRATEGY_NOTE[:40], PLAN_ONLY_NOTE[:40], CLAIM_NOTE[:40],
+                 STRATEGY_NOTE[:40], PLAN_ONLY_NOTE[:40], CLAIM_NOTE[:40], EVIDENCE_NOTE[:40],
                  prompts.COMPACT_HEADER[:40])
 GATE_STEPS = 6                      # extra steps a run may spend on the completion gate
 # Strikes: an identical *completed* call repeated this many times is a genuine stall. Infrastructure
@@ -169,6 +174,7 @@ class AgentRun:
         self._repeat_total_cap = max(4, int(deps.settings.max_repeat_calls) * 4)
         self._nudges = 0
         self._exec_nudges = 0            # plan-only / unevidenced-claim corrections (bounded)
+        self._evidence_rounds = 0        # one figure-check pass before a numeric answer is sent
         self.strategy_rounds = 0         # times the loop was broken by forcing a strategy change
         self._stalled_signature = ""     # the call that keeps returning the same result
         self._stalled_key: tuple = ()
@@ -481,6 +487,27 @@ class AgentRun:
             return CLAIM_NOTE
         return None
 
+    NUMBER = re.compile(r"\b\d[\d,.]{1,}\b")
+
+    def _evidence_digest(self) -> str:
+        """The run's own record, quoted back before the answer is accepted.
+
+        A 27B model reported file sizes and a top-five list that did not match the report.txt it had
+        just written - it filled the gaps from memory. Nothing in the architecture caught it, because
+        the earlier gates only look for *work that never happened*; this one looks at work that did
+        happen but was described wrongly. The digest is free (the outputs are already in the ledger)
+        and the correction runs once, only for a run that actually produced numbers.
+        """
+        lines = []
+        for entry in self.ledger[-6:]:
+            out = str(entry.get("o") or "").replace("\r", "")
+            if not out:
+                continue
+            tool = entry.get("n")
+            args = str(entry.get("a") or "").replace("\n", " ")[:120]
+            lines.append(f"- {tool}({args}) -> {out[:300]}")
+        return EVIDENCE_NOTE + ("\nTool results from this run:\n" + "\n".join(lines) if lines else "")
+
     def _finalize_note(self) -> str:
         pending = self.board.pending() if self.board is not None else []
         if not pending:
@@ -779,6 +806,18 @@ class AgentRun:
                     self._messages.append({"role": "assistant", "content": result.text})
                 self._messages.append({"role": "user", "content": exec_note})
                 self.steps += 1
+                continue
+            # Last gate: an answer that quotes numbers from a run that produced results is
+            # checked against those results once, before it is sent.
+            if (getattr(self, "_evidence_rounds", 0) < 1 and self.tool_calls_total >= 3
+                    and result.text.strip() and len(self.NUMBER.findall(result.text)) >= 3
+                    and self.steps < s.max_steps + GATE_STEPS):
+                self._evidence_rounds = 1
+                self._messages.append({"role": "assistant", "content": result.text})
+                self._messages.append({"role": "user", "content": self._evidence_digest()})
+                self.steps += 1
+                self.run.emit("notice", level="info",
+                              text="Checking the answer's figures against the tool results before sending it.")
                 continue
             self.finish_reason = result.finish or "stop"
             self._last_step_text = result.text
@@ -1222,7 +1261,7 @@ class AgentRun:
                 "n": part["name"], "a": redact(preview)[:400], "ok": bool(result.ok),
                 "s": "ok" if result.ok else "error",
                 "e": redact(str(result.error or ""))[:300],
-                "o": redact(str((result.data or {}).get("output") or ""))[:200] if result.ok else "",
+                "o": redact(str((result.data or {}).get("output") or result.content or ""))[:400] if result.ok else "",
             })
             # Progress, not the tool's category, decides whether a repeat is meaningful.
             #

@@ -650,3 +650,27 @@ async def test_dropped_stream_mid_answer_is_continued_not_killed(stack):
     # first recovery is intentionally quiet; any notices must be about reconnecting
     assert all(("dropped" in t) or ("Reconnect" in t) or ("hiccup" in t) or ("GPU" in t) for t in notices)
     assert out.end["duration_ms"] > 0
+
+
+async def test_a_numeric_answer_is_checked_against_the_run_record(stack):
+    """Work that happened but was described wrongly is caught, exactly like work that never ran.
+
+    The live failure: the agent wrote report.txt, then quoted *different* sizes for the same files.
+    """
+    stack.backend.queue(
+        [sh("wc -c report.txt", cid="e1"), finish("tool_calls")],
+        [sh("head -3 report.txt", cid="e2"), finish("tool_calls")],
+        [sh("ls -l report.txt", cid="e3"), finish("tool_calls")],
+        [*say("report.txt is 320 bytes, tar is 269 bytes, jq is 1.7 and 777 files were found."), finish("stop")],
+        [*say("Corrected from the record: report.txt is 320 bytes, the archive is 269 bytes, jq-1.7 is installed "
+              "and 777 files were found under /etc."), finish("stop")],
+    )
+    out = await stack.stream({"message": "summarise the audit run with exact figures"})
+    notices = [e["text"] for e in out.of("notice")]
+    assert any("figures against the tool results" in t for t in notices), "the figures must be checked"
+    last = stack.backend.requests[-1]
+    digest = str(last["messages"][-1].get("content") or "")
+    assert "Tool results from this run" in digest
+    assert "wc -c report.txt" in digest and "hello from the remote computer" in digest
+    assert "Corrected from the record" in out.text
+    assert out.end["steps"] >= 5
