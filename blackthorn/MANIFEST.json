@@ -2,8 +2,8 @@
  "files": {
   "blackthorn/COMPUTER_DRIVE.md": "0402762e400231c963d1532defc0c0ff6fd08e25733239934a157a6d406bdd28",
   "blackthorn/README.md": "5e589407dd98d904c8cac38588ddf97079ea92b079df2f502e1a9988e42daac1",
-  "blackthorn/__init__.py": "0c0e65698a0f5e778b4c9514692cb18eb46de313fb6349724d40bf0b96307749",
-  "blackthorn/agent.py": "4864e8a7d3bf0a10c16d6a05a9ade50020da65b74d6fc9227c350f7d942fe48b",
+  "blackthorn/__init__.py": "700045800017035008b780f423c4623b16aafe8a16464c3e6456617afb72fdd1",
+  "blackthorn/agent.py": "ac39a03a1b3a04cd17263a6e61d41c99354ca67fa349c71ee584cb19c79d2812",
   "blackthorn/api.py": "5579c3935ee7e4adc20c4ca4cc73e7df0bded4766e5c74980ba65e12712a987b",
   "blackthorn/app.py": "0aad44884216cf175a2211f2c35c8ee72b65230f96afa765ad83172aa37d2e90",
   "blackthorn/auth.py": "de0c9c3f56b2315dc9d107112284e59c5250355ffef598ae01e4a8c3e305c371",
@@ -23,7 +23,7 @@
   "blackthorn/llm.py": "82f37cdd48c9020678d74475a0a74c0477a05b7cba9bc33f158ed28db4d05982",
   "blackthorn/malware_analyzer.py": "83187436a3a5fa9a6537120bc4e8c35213367e7b4245d909b38d04161c7e3fb4",
   "blackthorn/malware_lab.py": "34a8e41848033dcef01045bb5987fce76f85bedfbf7f157ed4574694db2c52ca",
-  "blackthorn/panda_computer.py": "c19756c3f6435b0ecd9b3caf1c49f0ade8c2caf7e1f04e3ce1146f526a288b06",
+  "blackthorn/panda_computer.py": "86b2fe43388731119182bb73d8929bd40bb395f48ebde69cb545a2a116e4d9da",
   "blackthorn/panda_control.py": "cf65621c885c307d5d08bf3983586e2483bc0bbcc91f744566e53eb8a1ba5b79",
   "blackthorn/panda_keys.py": "fde441578a087a31a151a0e9696a03f540f984bef489e0350102cc405d78a4d1",
   "blackthorn/prompts.py": "bfe89af109b0eb951f624babc195ba04b1ae322d6018f484410171f247c7db48",
@@ -72,5 +72,5 @@
   "cloudflare_d1_client.py": "3c21a33f4a59d11664e494cd690a4bbd348677f6040c18127c089fe04ef6d4f1",
   "kaggle_cyber_ornith/cyber_ornith_server.py": "894d6257f09bfa98d9713dfb7e7797e21e17d6c0b3a6ecba8cdc004c0a566c44"
  },
- "version": "5.4.5"
+ "version": "5.4.6"
 }

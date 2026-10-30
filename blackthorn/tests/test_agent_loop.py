@@ -708,3 +708,31 @@ async def test_values_the_tools_really_printed_are_not_flagged(stack):
     out = await stack.stream({"message": "report the lab operating system and kernel version"})
     assert "Not verified against this run's tool output" not in out.text
     assert not any("figures against the tool results" in e["text"] for e in out.of("notice"))
+
+
+async def test_a_measured_quantity_is_verified_by_its_number(stack):
+    """'151 lines' is supported when wc printed 151 - the unit is the model's own wording."""
+    stack.backend.exec_output = "151 data/iris.csv\n{'row_count': 150}\n"
+    stack.backend.queue(
+        [sh("wc -l data/iris.csv", cid="q1"), finish("tool_calls")],
+        [sh("cat out/summary.json", cid="q2"), finish("tool_calls")],
+        [sh("ls out", cid="q3"), finish("tool_calls")],
+        [*say("The CSV is 151 lines and the JSON reports 150 rows."), finish("stop")],
+    )
+    out = await stack.stream({"message": "report the CSV line count and the row count"})
+    assert "Not verified against this run's tool output" not in out.text
+    assert not any("figures against the tool results" in e["text"] for e in out.of("notice"))
+
+
+async def test_a_number_the_tools_never_printed_is_still_flagged(stack):
+    stack.backend.exec_output = "151 data/iris.csv\n"
+    stack.backend.queue(
+        [sh("wc -l data/iris.csv", cid="z1"), finish("tool_calls")],
+        [sh("ls data", cid="z2"), finish("tool_calls")],
+        [sh("id -u", cid="z3"), finish("tool_calls")],
+        [*say("The CSV is 4096 lines and the file is 88 MB."), finish("stop")],
+        [*say("The CSV is 4096 lines and the file is 88 MB."), finish("stop")],
+    )
+    out = await stack.stream({"message": "report the CSV line count and size"})
+    assert "Not verified against this run's tool output" in out.text
+    assert "4096 lines" in out.text.split("Not verified against this run's tool output")[-1]

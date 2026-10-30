@@ -516,7 +516,7 @@ class AgentRun:
             return []
         found: List[str] = []
         seen = set()
-        for pattern in (self.VERSION_CLAIM, self.UNIT_CLAIM, self.DISTRO_CLAIM):
+        for pattern in (self.VERSION_CLAIM, self.DISTRO_CLAIM):
             for match in pattern.finditer(text or ""):
                 claim = match.group(0)
                 probe = claim.lower().replace(",", "").strip()
@@ -525,6 +525,20 @@ class AgentRun:
                 seen.add(probe)
                 if probe not in haystack:
                     found.append(claim)
+        # A measured quantity ("151 lines", "4.73 GiB") is verified by its number: the tool may
+        # have printed "151 data/iris.csv" or "4.7G", and the unit in the prose is the model's
+        # wording, not a separate claim. Only a number the tools never produced is unsupported.
+        for match in self.UNIT_CLAIM.finditer(text or ""):
+            claim = match.group(0)
+            number = re.match(r"[\d,]+(?:\.\d+)?", claim)
+            if not number:
+                continue
+            probe = number.group(0).replace(",", "")
+            if not probe or probe in seen:
+                continue
+            seen.add(probe)
+            if probe not in haystack.replace(",", ""):
+                found.append(claim)
         return found[:12]
 
     def _evidence_trailer(self, claims: List[str]) -> str:

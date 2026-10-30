@@ -330,7 +330,12 @@ class PandaComputerClient:
         # The guest is bounded by ``timeout`` itself: an HTTP timeout does not kill a
         # process inside the VM, so a runaway command would otherwise keep burning CPU.
         seconds = min(3600, max(1, int(timeout)))
-        bounded = f"timeout -k 5 {seconds} sh -c {shlex.quote(command)}"
+        # bash, not sh: the guest image ships bash, and `sh` silently breaks the everyday shell
+        # syntax an agent writes - `{a,b,c}` brace expansion became a literal directory named
+        # "{data,src,tests,out}" in a live run, costing several steps and a confusing answer.
+        # Commands are still bounded by `timeout`; a guest without bash falls back to sh.
+        bounded = (f"if [ -x /bin/bash ]; then timeout -k 5 {seconds} bash -c {shlex.quote(command)}; "
+                   f"else timeout -k 5 {seconds} sh -c {shlex.quote(command)}; fi")
         response = await self._request("POST", "/exec", timeout=seconds + 15, retries=retries,
             payload={"cmd": bounded, "timeout_seconds": seconds})
         if response.status_code != 200:
