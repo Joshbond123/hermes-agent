@@ -135,6 +135,19 @@ class PandaComputerClient:
         if "/workspace" in str(result.get("output") or ""):
             self._home_for = self.sandbox_id
 
+    async def prepare_and_checkpoint(self):
+        """Ensure one durable workspace name, then publish it (used by the checkpoint endpoint).
+
+        A checkpoint publishes /workspace. On a VM where the agent has not run yet /home/user is
+        still a separate directory, so a user who put files there and hit "checkpoint" would have
+        been told the work was durable while those files were outside the published archive.
+        """
+        await self._prepare_home()
+        mirror = getattr(self, "mirror", None)
+        if mirror is not None:
+            return await mirror.sync(force=True)
+        return False
+
     async def _ensure_capabilities(self) -> None:
         """Restore skills/tools from the drive on this VM, once per VM.
 
@@ -461,6 +474,14 @@ class PandaComputerClient:
             # report success when the upload was actually confirmed.
             if self.mirror is None:
                 raise ToolError("unsupported", "No workspace mirror is configured, so a checkpoint cannot be published")
+            # One durable name first: a checkpoint publishes /workspace, so files sitting in a
+            # plain /home/user (a VM that has not run a task yet) must be moved inside it before
+            # the archive is taken - otherwise "checkpointed" would be said about files that
+            # were never captured.
+            try:
+                await self._prepare_home()
+            except Exception:  # noqa: BLE001 - the sync below still reports a real failure
+                pass
             try:
                 published = bool(await self.mirror.sync(force=True))
             except Exception as exc:

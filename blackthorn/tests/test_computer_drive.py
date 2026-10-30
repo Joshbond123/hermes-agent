@@ -63,3 +63,29 @@ def test_absolute_workspace_paths_are_the_same_file_as_logical_ones():
     for bad in ("/etc/passwd", "../../escape", "", "/workspace", "/home/user"):
         with pytest.raises(ValueError):
             C._relative(bad)
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_prepares_the_durable_name_before_publishing():
+    """A checkpoint publishes /workspace; files in a plain /home/user must be inside it first."""
+    from blackthorn.panda_computer import PandaComputerClient as C
+
+    computer = object.__new__(C)
+    order = []
+
+    async def prepare():
+        order.append("prepare")
+
+    class Mirror:
+        async def sync(self, force=False):
+            order.append("sync")
+            return True
+
+    computer.mirror = Mirror()
+    computer._prepare_home = prepare
+    import contextlib
+    computer.store = None
+    computer.sandbox_id = "abc"
+    result = await C._call(computer, "/computer/checkpoint", {}, method="POST", timeout=60)
+    assert result["published"] is True
+    assert order == ["prepare", "sync"], order
