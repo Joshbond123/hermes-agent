@@ -187,6 +187,67 @@ def _browser_binary(cache_root: str) -> str:
     return ""
 
 
+def _libs_stamp(cache_root: str) -> pathlib.Path:
+    return pathlib.Path(cache_root) / "camoufox" / ".blackthorn-libs-ok"
+
+
+def _libs_verified(cache_root: str, binary: str) -> bool:
+    """True when this bundle has already launched once, so the sweep can be skipped.
+
+    Inspecting every ELF in the bundle costs a couple of seconds; a browse call must not pay
+    that each time. A stamp is only written after a launch that actually worked, and it is
+    deleted the moment a launch fails on libraries, so it can never hide a real breakage.
+    """
+    try:
+        data = json.loads(_libs_stamp(cache_root).read_text() or "{}")
+    except (OSError, ValueError):
+        return False
+    return bool(binary) and data.get("binary") == binary
+
+
+def _mark_libs_verified(cache_root: str, binary: str) -> None:
+    try:
+        stamp = _libs_stamp(cache_root)
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.write_text(json.dumps({"binary": binary, "at": int(time.time())}))
+    except OSError:
+        pass
+
+
+def _forget_libs_verified(cache_root: str) -> None:
+    try:
+        _libs_stamp(cache_root).unlink()
+    except OSError:
+        pass
+
+
+def _bundle_lib_dir(binary: str) -> str:
+    return str(pathlib.Path(binary).parent) if binary else ""
+
+
+def _prefer_bundle_libraries(binary: str, notes: list) -> str:
+    """Put the browser's own shared objects ahead of the system's.
+
+    Firefox ships the NSS/NSPR/GTK-support libraries it was built against. Ubuntu's system NSS
+    can be older (3.110 on the live computer) than the version the bundle needs (NSS_3.117), and
+    the loader then resolves symbols against the system copy and refuses to start - which surfaces
+    as "browser libraries still missing" even though every file is present, and cannot be fixed by
+    installing more packages. The bundle's directory therefore goes first on the search path, once
+    per process, before anything is launched.
+    """
+    directory = _bundle_lib_dir(binary)
+    if not directory or not os.path.isdir(directory):
+        return ""
+    current = os.environ.get("LD_LIBRARY_PATH", "")
+    parts = [p for p in current.split(":") if p]
+    if parts[:1] == [directory]:
+        return current
+    os.environ["LD_LIBRARY_PATH"] = ":".join([directory] + [p for p in parts if p != directory])
+    if notes is not None:
+        notes.append("browser libraries are taken from the bundle before the system ones")
+    return os.environ["LD_LIBRARY_PATH"]
+
+
 def _elf_files(root: str, limit: int = 40) -> list:
     """The executables and shared objects inside the browser bundle."""
     out = []
@@ -227,7 +288,11 @@ def _missing_libs(binary: str) -> list:
                 name = line.split("=>")[0].strip()
                 if name and name not in missing:
                     missing.append(name)
-    return missing
+    # A library the bundle ships is never "missing" from the system's point of view; it is a
+    # resolution-order problem, fixed by _prefer_bundle_libraries. Only the rest needs apt.
+    bundle = _bundle_lib_dir(binary)
+    return [name for name in missing
+            if not (bundle and os.path.exists(os.path.join(bundle, name)))]
 
 
 def _install_linux_libs(binary: str) -> tuple:
@@ -365,7 +430,8 @@ def _ensure_runtime(notes: list) -> None:
     _ensure_temp_roots(cache_root, notes)
     if sys.platform.startswith("linux"):
         binary = _browser_binary(cache_root)
-        missing = _missing_libs(binary)
+        _prefer_bundle_libraries(binary, notes)
+        missing = [] if _libs_verified(cache_root, binary) else _missing_libs(binary)
         if missing:
             ok, detail = _install_linux_libs(binary)
             notes.append(detail)
@@ -495,7 +561,8 @@ def _save_screenshot(page, req: dict, result: dict) -> None:
 LAUNCH_HINTS = {
     "temp": ("mkdtemp", "enoent", "no such file or directory"),
     "libs": ("error while loading shared libraries", "xpcomglueload", "cannot open shared object",
-             "libgtk", "libnss", "libnspr", "failed to launch the browser process"),
+             "libgtk", "libnss", "libnspr", "failed to launch the browser process",
+             "version `nss_", "version `nspr_", "version not found"),
     "bundle": ("camoufoxnotinstalled", "directory not empty", "errno 39", "corrupted", "checksum",
                "not installed", "please run `camoufox fetch`"),
 }
@@ -517,14 +584,17 @@ def _launch(cache_root: str, options: dict, notes: list):
     """
     from camoufox.sync_api import Camoufox
     _ensure_temp_roots(cache_root, notes)
+    if sys.platform.startswith("linux"):
+        _prefer_bundle_libraries(_browser_binary(cache_root), notes)
     try:
-        return Camoufox(**options)
+        browser = Camoufox(**options)
     except Exception as exc:  # noqa: BLE001 - classified below
         kind = _classify_launch_error(exc)
         notes.append(f"browser launch failed ({kind}): {str(exc)[:180]}")
         if kind == "temp":
             _ensure_temp_roots(cache_root, notes)
         elif kind == "libs":
+            _forget_libs_verified(cache_root)
             binary = _browser_binary(cache_root)
             ok, detail = _install_linux_libs(binary)
             notes.append(detail)
@@ -537,7 +607,9 @@ def _launch(cache_root: str, options: dict, notes: list):
         else:
             raise
         _ensure_temp_roots(cache_root, notes)
-        return Camoufox(**options)
+        browser = Camoufox(**options)
+    _mark_libs_verified(cache_root, _browser_binary(cache_root))
+    return browser
 
 
 def run_session(req: dict, notes: list, started: float) -> dict:

@@ -169,3 +169,52 @@ def test_launch_errors_are_classified(browse):
     assert browse._classify_launch_error(
         RuntimeError("CamoufoxNotInstalled: run camoufox fetch")) == "bundle"
     assert browse._classify_launch_error(RuntimeError("Profile is in use")) == "other"
+
+
+def test_bundle_libraries_are_preferred_over_the_system_ones(browse, monkeypatch, tmp_path):
+    """Ubuntu's NSS (3.110) is older than the bundle's (3.117): the loader must use the bundle's."""
+    bundle = tmp_path / "camoufox"
+    bundle.mkdir()
+    (bundle / "libnss3.so").write_text("x")
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/usr/lib/x86_64-linux-gnu")
+    notes: list = []
+    browse._prefer_bundle_libraries(str(bundle / "camoufox-bin"), notes)
+    parts = os.environ["LD_LIBRARY_PATH"].split(":")
+    assert parts[0] == str(bundle), "the bundle must come first on the search path"
+    assert "/usr/lib/x86_64-linux-gnu" in parts
+    # idempotent: a second call must not accumulate entries
+    browse._prefer_bundle_libraries(str(bundle / "camoufox-bin"), notes)
+    assert os.environ["LD_LIBRARY_PATH"].count(str(bundle)) == 1
+
+
+def test_a_library_the_bundle_ships_is_not_reported_as_missing(browse, monkeypatch, tmp_path):
+    """libnspr4.so inside the bundle is a path problem, not an apt problem."""
+    root = tmp_path / "bundle"
+    root.mkdir()
+    main = root / "camoufox-bin"
+    main.write_text("#!/bin/false\n")
+    (root / "libnspr4.so").write_text("x" * 8192)
+    (root / "libnss3.so").write_text("x" * 8192)
+
+    def fake_run(cmd, timeout=0, env=None):
+        return types.SimpleNamespace(stdout="\tlibnspr4.so => not found\n\tlibgtk-3.so.0 => not found\n",
+                                     returncode=0, stderr="")
+
+    monkeypatch.setattr(browse, "_run", fake_run)
+    monkeypatch.setattr(browse, "_elf_files", lambda root, limit=40: [])
+    assert browse._missing_libs(str(main)) == ["libgtk-3.so.0"]
+
+
+def test_the_library_sweep_is_skipped_once_a_launch_has_been_proven(browse, tmp_path):
+    cache, binary = str(tmp_path / "cache"), "/b/camoufox-bin"
+    assert not browse._libs_verified(cache, binary)
+    browse._mark_libs_verified(cache, binary)
+    assert browse._libs_verified(cache, binary)
+    assert not browse._libs_verified(cache, "/other/camoufox-bin"), "a different bundle must re-check"
+    browse._forget_libs_verified(cache)
+    assert not browse._libs_verified(cache, binary), "a library failure must invalidate the stamp"
+
+
+def test_a_symbol_version_error_is_classified_as_a_library_problem(browse):
+    exc = RuntimeError("/x/camoufox-bin: /x/libsmime3.so: version `NSS_3.117' not found")
+    assert browse._classify_launch_error(exc) == "libs"

@@ -2,14 +2,14 @@
  "files": {
   "blackthorn/COMPUTER_DRIVE.md": "0402762e400231c963d1532defc0c0ff6fd08e25733239934a157a6d406bdd28",
   "blackthorn/README.md": "5e589407dd98d904c8cac38588ddf97079ea92b079df2f502e1a9988e42daac1",
-  "blackthorn/__init__.py": "0a51e4059823147bb3e767a54f920ba513cc213cfb7e9c2b6012a867346107e5",
+  "blackthorn/__init__.py": "ca6d934f5c5daf81b67cd743d59bdfbc88578e05b9243faa970f273479dbc91a",
   "blackthorn/agent.py": "a31efd1c082657d01be839f10ea8a7571ca5d21beeda13f4740264f5a31e25f1",
   "blackthorn/api.py": "31e81ef762cc14d52c951bd2413cb24ba40b70d156a19f4f7c008dca64bcd925",
   "blackthorn/app.py": "0aad44884216cf175a2211f2c35c8ee72b65230f96afa765ad83172aa37d2e90",
   "blackthorn/auth.py": "de0c9c3f56b2315dc9d107112284e59c5250355ffef598ae01e4a8c3e305c371",
   "blackthorn/capabilities.py": "7ca56158ec052ff44da95357c5f88590f532491a3621b06b347c269e632b2abd",
   "blackthorn/computer_assets/bootstrap.sh": "b0a6230f33196b5aea73bf694ea6ec639ef54cce53f8c15454db93a16639383b",
-  "blackthorn/computer_assets/browse.py": "e2a38d67559108edfc875d69aba8f7c0416c7fb741faea2f12a58fab994c97bb",
+  "blackthorn/computer_assets/browse.py": "bc7fa572a780448e692dda378bad0914e8ea28eb633e447b8e2bae5638addd2b",
   "blackthorn/computer_assets/install_stack.py": "b9f01d0a471ca5e9bd0ebda3823fcee9ede7a8e30d1f005ecf6ef44382445203",
   "blackthorn/computer_assets/sample_triage.py": "fccb4097b40f7bd0a31adf089c24171482e57df468456f107771dc15a6c30a8b",
   "blackthorn/computer_assets/skillctl.py": "d78acce73408ff63c048bfe1ae8f90ae24b8c6e31e4748b266efb1f00c6df108",
@@ -72,5 +72,5 @@
   "cloudflare_d1_client.py": "3c21a33f4a59d11664e494cd690a4bbd348677f6040c18127c089fe04ef6d4f1",
   "kaggle_cyber_ornith/cyber_ornith_server.py": "ae31f506142315b59833a8e23d18664b8374849f9d6e358867cbfa8887e82c60"
  },
- "version": "5.4.9"
+ "version": "5.4.10"
 }
