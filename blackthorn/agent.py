@@ -182,6 +182,7 @@ class AgentRun:
         self._nudges = 0
         self._exec_nudges = 0            # plan-only / unevidenced-claim corrections (bounded)
         self._evidence_rounds = 0        # one figure-check pass before a numeric answer is sent
+        self._evidence_parts: List[str] = []   # every successful tool output of this run
         self.strategy_rounds = 0         # times the loop was broken by forcing a strategy change
         self._stalled_signature = ""     # the call that keeps returning the same result
         self._stalled_key: tuple = ()
@@ -495,6 +496,41 @@ class AgentRun:
         return None
 
     NUMBER = re.compile(r"\b\d[\d,.]{1,}\b")
+    # Claims that can be checked mechanically against this run's own tool output.
+    VERSION_CLAIM = re.compile(r"\b\d+\.\d+(?:\.\d+)*(?:[-~+][A-Za-z0-9._-]+)?\b")
+    UNIT_CLAIM = re.compile(r"\b\d[\d,]*(?:\.\d+)?\s?(?:bytes|byte|KB|MB|GB|MiB|GiB|kB|files|lines|entries|"
+                            r"seconds|packages|ports)\b")
+    DISTRO_CLAIM = re.compile(r"\b(Ubuntu|Debian|Alpine|Fedora|CentOS|RHEL|Rocky|AlmaLinux|Arch|openSUSE|"
+                              r"SUSE|Kali|Windows|macOS)\b")
+
+    def _unsupported_claims(self, text: str) -> List[str]:
+        """Values in the answer that appear nowhere in this run's tool output or the request.
+
+        A prompt-only check was not enough: a live lab run was told to verify its figures, was
+        shown the exact tool output, and still reported "Debian 13 ... kernel 6.19.9-602.fc43"
+        for a VM that is Ubuntu 24.04.4 with kernel 5.10.239 (confirmed directly on the
+        provider). Anything a tool actually printed is accepted; anything it did not is named.
+        """
+        haystack = (" ".join(self._evidence_parts) + " " + self.user_message).lower().replace(",", "")
+        if not haystack.strip():
+            return []
+        found: List[str] = []
+        seen = set()
+        for pattern in (self.VERSION_CLAIM, self.UNIT_CLAIM, self.DISTRO_CLAIM):
+            for match in pattern.finditer(text or ""):
+                claim = match.group(0)
+                probe = claim.lower().replace(",", "").strip()
+                if probe in seen or not probe:
+                    continue
+                seen.add(probe)
+                if probe not in haystack:
+                    found.append(claim)
+        return found[:12]
+
+    def _evidence_trailer(self, claims: List[str]) -> str:
+        listing = ", ".join(claims[:8])
+        return ("\n\n_Not verified against this run's tool output: " + listing +
+                ". Treat accordingly before relying on those figures._")
 
     def _evidence_digest(self) -> str:
         """The run's own record, quoted back before the answer is accepted.
@@ -814,18 +850,32 @@ class AgentRun:
                 self._messages.append({"role": "user", "content": exec_note})
                 self.steps += 1
                 continue
-            # Last gate: an answer that quotes numbers from a run that produced results is
-            # checked against those results once, before it is sent.
-            if (getattr(self, "_evidence_rounds", 0) < 1 and self.tool_calls_total >= 3
-                    and result.text.strip() and len(self.NUMBER.findall(result.text)) >= 3
-                    and self.steps < s.max_steps + GATE_STEPS):
-                self._evidence_rounds = 1
-                self._messages.append({"role": "assistant", "content": result.text})
-                self._messages.append({"role": "user", "content": self._evidence_digest()})
-                self.steps += 1
-                self.run.emit("notice", level="info",
-                              text="Checking the answer's figures against the tool results before sending it.")
-                continue
+            # Last gate: an answer that quotes figures from a run that produced results is checked
+            # against those results before it is sent - mechanically for values that can be
+            # compared (versions, sizes, counts, distributions), and once by the model for the rest.
+            if self.tool_calls_total >= 3 and result.text.strip():
+                unsupported = self._unsupported_claims(result.text)
+                if unsupported and self._evidence_rounds < 1 and self.steps < s.max_steps + GATE_STEPS:
+                    self._evidence_rounds = 1
+                    note = (self._evidence_digest() +
+                            "\nThese values in your answer do not appear in any tool output from this run: " +
+                            ", ".join(unsupported) +
+                            ". Correct each one from the record, or state plainly that it is unverified.")
+                    self._messages.append({"role": "assistant", "content": result.text})
+                    self._messages.append({"role": "user", "content": note})
+                    self.steps += 1
+                    self.run.emit("notice", level="info",
+                                  text="Checking the answer's figures against the tool results before sending it.")
+                    continue
+                if unsupported:
+                    # Still unsupported after the correction round: say so in the answer itself
+                    # instead of presenting an invented value as fact.
+                    trailer = self._evidence_trailer(unsupported)
+                    self.parts.append({"type": "text", "text": trailer})
+                    self.run.emit("text.delta", text=trailer)
+                    self.run.emit("notice", level="warn",
+                                  text="Some figures in this answer could not be matched to any tool output; "
+                                       "they are marked at the end of the answer.")
             self.finish_reason = result.finish or "stop"
             self._last_step_text = result.text
             break
@@ -1278,6 +1328,10 @@ class AgentRun:
             except ValueError:
                 parsed_args, preview = {}, str(call.get("args") or "")
             signature = recovery.signature(call["name"], parsed_args)
+            if result.ok:
+                observed = str((result.data or {}).get("output") or result.content or "")
+                if observed and sum(len(x) for x in self._evidence_parts) < 60000:
+                    self._evidence_parts.append(redact(observed)[:6000])
             self.ledger.append({
                 "n": part["name"], "a": redact(preview)[:400], "ok": bool(result.ok),
                 "s": "ok" if result.ok else "error",

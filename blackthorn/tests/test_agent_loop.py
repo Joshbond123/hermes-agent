@@ -674,3 +674,37 @@ async def test_a_numeric_answer_is_checked_against_the_run_record(stack):
     assert "wc -c report.txt" in digest and "hello from the remote computer" in digest
     assert "Corrected from the record" in out.text
     assert out.end["steps"] >= 5
+
+
+async def test_invented_values_are_named_and_marked_when_the_model_ignores_the_record(stack):
+    """Live failure: the lab VM is Ubuntu 24.04.4 / kernel 5.10.239, but the answer said
+    "Debian 13 ... kernel 6.19.9-602.fc43.x86_64" even after being shown the tool output."""
+    stack.backend.queue(
+        [sh("cat /etc/os-release; uname -r", cid="o1"), finish("tool_calls")],
+        [sh("uname -a", cid="o2"), finish("tool_calls")],
+        [sh("id -u", cid="o3"), finish("tool_calls")],
+        [*say("The lab runs Debian 13 with kernel 6.19.9-602.fc43.x86_64 and 4.73 GiB free."), finish("stop")],
+        [*say("The lab runs Debian 13 with kernel 6.19.9-602.fc43.x86_64 and 4.73 GiB free."), finish("stop")],
+    )
+    out = await stack.stream({"message": "report the lab operating system and kernel version"})
+    notices = [e["text"] for e in out.of("notice")]
+    assert any("figures against the tool results" in t for t in notices)
+    correction = str(stack.backend.requests[4]["messages"][-1].get("content") or "")
+    assert "6.19.9-602.fc43.x86_64" in correction and "do not appear in any tool output" in correction
+    # The model ignored the record twice: the answer must not present the value as fact.
+    assert "Not verified against this run's tool output" in out.text
+    assert "6.19.9-602.fc43.x86_64" in out.text.split("Not verified against this run's tool output")[-1]
+    assert any("could not be matched" in t for t in notices)
+
+
+async def test_values_the_tools_really_printed_are_not_flagged(stack):
+    stack.backend.exec_output = ("PRETTY_NAME=\"Ubuntu 24.04.4 LTS\"\n5.10.239\nuid=0\n")
+    stack.backend.queue(
+        [sh("cat /etc/os-release; uname -r", cid="v1"), finish("tool_calls")],
+        [sh("df -h /", cid="v2"), finish("tool_calls")],
+        [sh("id -u", cid="v3"), finish("tool_calls")],
+        [*say("Ubuntu 24.04.4 LTS, kernel 5.10.239, uid 0."), finish("stop")],
+    )
+    out = await stack.stream({"message": "report the lab operating system and kernel version"})
+    assert "Not verified against this run's tool output" not in out.text
+    assert not any("figures against the tool results" in e["text"] for e in out.of("notice"))
