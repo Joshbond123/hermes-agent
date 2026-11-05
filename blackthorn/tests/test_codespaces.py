@@ -261,3 +261,39 @@ async def test_adoption_leaves_a_stopped_codespace_off_and_does_not_invent_usage
     out = await computer.adopt()
     assert out["adopted"] is False and out["reason"] == "not_running"
     assert (await computer.status())["state"] == "OFF"
+
+
+async def test_a_container_token_alone_never_means_the_machine_is_up():
+    """After a stop the registration token survives while the agent does not.
+
+    Trusting that token reported the computer as ON (and idle-counted it) for a machine that could
+    not run a command, which is how a live run failed its first tool call. Liveness is now proved
+    with an answer from the container, so a stale token waits instead of pretending.
+    """
+    api = FakeCodespaceAPI(name="blackthorn-test-abc123", state="Available")
+    channel = CodespaceChannel(None)
+    await channel.accept_registration("blackthorn-test-abc123", "stale-token")   # token, no presence
+    calls = {"n": 0}
+
+    async def no_answer(path, body, *, timeout=0, name=""):
+        calls["n"] += 1
+        raise TimeoutError("the codespace did not answer /computer/info within 1s")
+
+    channel.call = no_answer
+    computer = CodespaceComputer(httpx.AsyncClient(), api, channel=channel, store=None)
+    computer._name = "blackthorn-test-abc123"
+    with pytest.raises(CodespaceError) as err:
+        await computer._ensure_agent(timeout=3)
+    assert err.value.code == "agent_unreachable"
+    assert calls["n"] >= 1, "the staleness must be tested against the container, not assumed"
+    assert computer.agent_connected() is False
+
+
+async def test_a_polling_agent_is_accepted_without_an_extra_probe():
+    api = FakeCodespaceAPI(name="blackthorn-test-abc123", state="Available")
+    channel = CodespaceChannel(None)
+    channel.touch("blackthorn-test-abc123", version="1.1")        # presence: it is dialling in
+    computer = CodespaceComputer(httpx.AsyncClient(), api, channel=channel, store=None)
+    computer._name = "blackthorn-test-abc123"
+    await computer._ensure_agent(timeout=3)                        # returns immediately
+    assert computer.agent_connected() is True

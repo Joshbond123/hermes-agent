@@ -38,6 +38,12 @@ STATE_KEY = "codespace_state"
 SESSION_KEY = "codespace_session"
 
 
+# A first boot (or any boot after the devcontainer changed) rebuilds the image: minutes, not seconds.
+START_TIMEOUT_S = float(__import__("os").environ.get("CODESPACE_START_TIMEOUT_SECONDS", "900") or 900)
+# How long to wait for the container's own agent to answer once the machine is up.
+AGENT_WAIT_S = float(__import__("os").environ.get("CODESPACE_AGENT_WAIT_SECONDS", "300") or 300)
+
+
 def _int_env(name: str, default: int) -> int:
     raw = (os.environ.get(name) or "").strip()
     try:
@@ -226,7 +232,7 @@ class CodespaceComputer:
             log.warning("duplicate cleanup failed: %s", type(exc).__name__)
         return created
 
-    async def ensure_running(self, *, timeout: float = 420.0) -> Dict[str, Any]:
+    async def ensure_running(self, *, timeout: float = START_TIMEOUT_S) -> Dict[str, Any]:
         """Start the codespace if needed and wait until its agent answers."""
         self.note_activity()
         async with self._lock:
@@ -238,11 +244,9 @@ class CodespaceComputer:
                 cs = await self._wait_available(timeout=timeout)
             if self._session is None:
                 self._session = await self._load_session()
-            if not (self.channel.present(self._name) or self.channel.known(self._name)):
-                # A fresh container announces itself; on a warm one the agent is already attached.
-                await self._wait_registration(timeout=min(240.0, timeout))
-            else:
-                await self._ensure_agent(timeout=min(180.0, timeout))
+            # "known" only means we hold a token from an earlier life of that container: after a
+            # stop the token survives while the agent does not, so it is never proof of life.
+            await self._ensure_agent(timeout=min(timeout, AGENT_WAIT_S))
             self._state = "ON"
             self._error = ""
             await self.ledger.open_interval(self._name)
@@ -300,46 +304,60 @@ class CodespaceComputer:
             return {"ok": True, "adopted": True, "name": name, "idle_seconds": int(self.idle_seconds())}
 
     async def _wait_available(self, timeout: float) -> Dict[str, Any]:
+        """Wait for GitHub to hand over an Available container.
+
+        A first boot — or any boot after the devcontainer changed — rebuilds the image and stays in
+        Provisioning for many minutes (10+ observed). That is not a failure: it is reported as
+        STARTING and waited for, and only a terminal state fails. The last state GitHub reported is
+        carried in the error, so a timeout says what the machine was actually doing.
+        """
         deadline = time.time() + timeout
         delay = 2.0
+        last = "unknown"
         while time.time() < deadline:
             await asyncio.sleep(delay)
             delay = min(delay * 1.4, 10.0)
             try:
                 cs = await self.api.get(self._name)
-            except CodespaceError:
+            except CodespaceError as exc:
+                last = exc.code
                 continue
             state = str(cs.get("state") or "")
+            last = state or last
             if state == "Available":
                 return cs
             if state in ("Failed", "Unavailable", "Deleted"):
                 raise CodespaceError("start_failed", f"The codespace reported state {state}")
-        raise CodespaceError("start_timeout", f"The codespace did not become available within {int(timeout)}s")
-
-    async def _wait_registration(self, timeout: float) -> None:
-        """Wait for the container's agent to appear on the channel (it registers itself)."""
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            await asyncio.sleep(2.0)
-            if self._name and (self.channel.known(self._name) or self.channel.present(self._name)):
-                self._session = {"token": await self.channel.token_for(self._name), "port": self.port}
-                await self._ensure_agent(timeout=max(20.0, deadline - time.time()))
-                return
-        raise CodespaceError("agent_unavailable",
-                             "The codespace started but its Blackthorn agent did not register in time")
+            self._state = "STARTING"
+        raise CodespaceError("start_timeout",
+                             f"The codespace was still {last} after {int(timeout)}s; it is being built and "
+                             "will be adopted as soon as it is available")
 
     # ------------------------------------------------------------ exec channel
     async def _ensure_agent(self, *, timeout: float = 60.0) -> None:
-        """Make sure the container's agent is attached to the channel."""
+        """Prove the container's agent is really answering, not merely that we hold a token.
+
+        A live agent polls the channel, so presence is proof. A token without presence belongs to
+        an earlier life of the container (or a container still booting), so it is verified with a
+        cheap authenticated call; if that does not answer, the wait continues. This is what keeps
+        the panel from reporting ON for a machine that cannot yet run a command.
+        """
         if not self._name:
             raise CodespaceError("agent_unavailable", "No codespace is attached to this computer")
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if self.channel.present(self._name) or self.channel.known(self._name):
+            if self.channel.present(self._name):
                 return
+            try:
+                probe = await self.channel.call("/computer/info", {}, timeout=min(20.0, max(5.0, deadline - time.time())),
+                                                name=self._name)
+                if isinstance(probe, dict) and probe.get("ok") is not False:
+                    return
+            except Exception:  # noqa: BLE001 - not answering yet is the expected case while booting
+                pass
             await asyncio.sleep(2.0)
         raise CodespaceError("agent_unreachable",
-                             "The codespace is running but its agent is not attached to the channel")
+                             "The codespace is running but its agent is not answering on the channel yet")
 
     def agent_connected(self) -> bool:
         if not self._name:
