@@ -39,6 +39,9 @@ SESSION_KEY = "codespace_session"
 
 
 # A first boot (or any boot after the devcontainer changed) rebuilds the image: minutes, not seconds.
+# A start that GitHub accepted but did not act on is re-issued this many times, this far apart.
+START_RETRIES = int(__import__("os").environ.get("CODESPACE_START_RETRIES", "3") or 3)
+START_RETRY_AFTER_S = float(__import__("os").environ.get("CODESPACE_START_RETRY_AFTER_SECONDS", "60") or 60)
 START_TIMEOUT_S = float(__import__("os").environ.get("CODESPACE_START_TIMEOUT_SECONDS", "900") or 900)
 # How long to wait for the container's own agent to answer once the machine is up.
 AGENT_WAIT_S = float(__import__("os").environ.get("CODESPACE_AGENT_WAIT_SECONDS", "300") or 300)
@@ -272,6 +275,19 @@ class CodespaceComputer:
         """
         if self._state == "ON" and self._name:
             return {"ok": True, "adopted": False, "reason": "already_on", "name": self._name}
+        if self._state == "STARTING" and self._name and self._inflight == 0 and self._runs == 0:
+            # Nothing is driving the start any more (the request that asked for it is gone), and
+            # GitHub will say whether anything is really happening. Reconcile instead of sitting in
+            # STARTING for ever; the next task simply asks for the machine again.
+            try:
+                cs = await self.api.get(self._name)
+            except CodespaceError:
+                return {"ok": True, "adopted": False, "reason": "lookup_failed"}
+            if str(cs.get("state") or "") != "Available":
+                self._state, self._error = "OFF", ""
+                await self._save_state()
+                return {"ok": True, "adopted": False, "reason": "start_abandoned",
+                        "state": str(cs.get("state") or "Unknown")}
         async with self._lock:
             name = self._name
             if not name:
@@ -323,6 +339,8 @@ class CodespaceComputer:
         deadline = time.time() + timeout
         delay = 2.0
         last = "unknown"
+        started_at = time.time()
+        reissued = 0
         while time.time() < deadline:
             await asyncio.sleep(delay)
             delay = min(delay * 1.4, 10.0)
@@ -337,6 +355,20 @@ class CodespaceComputer:
                 return cs
             if state in ("Failed", "Unavailable", "Deleted"):
                 raise CodespaceError("start_failed", f"The codespace reported state {state}")
+            # A start request can be lost: GitHub accepts it and then reports the machine as
+            # Shutdown anyway (a stop finishing, a transient 202). Waiting the whole budget on a
+            # request that never took effect is what left the panel in STARTING for 20 minutes, so
+            # a start that shows no progress is re-issued a bounded number of times.
+            if state in ("Shutdown", "Off", "Unknown") and reissued < START_RETRIES:
+                waited = time.time() - started_at
+                if waited >= START_RETRY_AFTER_S * (reissued + 1):
+                    reissued += 1
+                    log.info("codespace still %s after %ds; re-issuing start (%d/%d)",
+                             state, int(waited), reissued, START_RETRIES)
+                    try:
+                        await self.api.start(self._name)
+                    except CodespaceError as exc:
+                        last = exc.code
             self._state = "STARTING"
         raise CodespaceError("start_timeout",
                              f"The codespace was still {last} after {int(timeout)}s; it is being built and "

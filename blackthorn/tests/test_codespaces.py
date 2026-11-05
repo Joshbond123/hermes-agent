@@ -346,3 +346,46 @@ async def test_the_idle_clock_records_what_touched_it():
     computer.run_started()
     assert (await computer.status())["last_activity"] == "run_started"
     computer.run_finished()
+
+
+async def test_a_start_that_github_ignored_is_reissued_and_never_waits_forever():
+    """A lost start used to leave the panel in STARTING for the whole 20-minute budget.
+
+    GitHub accepts the request and then still reports Shutdown (a stop finishing, a transient
+    accept). The wait now observes no progress, re-issues the start, and the machine comes up.
+    """
+    import blackthorn.codespace_computer as cc
+
+    class FlakyStart(FakeCodespaceAPI):
+        def __init__(self):
+            super().__init__(name="blackthorn-test-abc123", state="Shutdown")
+            self.ignored = 1                     # first start is silently lost
+
+        async def start(self, name):
+            self.calls.append("start")
+            if self.ignored:
+                self.ignored -= 1                # accepted, no effect
+                return {}
+            self.state = "Available"
+            return {}
+
+    old = (cc.START_RETRY_AFTER_S, cc.START_RETRIES)
+    cc.START_RETRY_AFTER_S, cc.START_RETRIES = 0.0, 2
+    try:
+        api = FlakyStart()
+        computer = CodespaceComputer(httpx.AsyncClient(), api, channel=CodespaceChannel(None), store=None)
+        computer._name = "blackthorn-test-abc123"
+        assert (await computer._wait_available(timeout=20))["state"] == "Available"
+        assert api.calls.count("start") >= 1
+    finally:
+        cc.START_RETRY_AFTER_S, cc.START_RETRIES = old
+
+
+async def test_an_abandoned_start_is_reconciled_back_to_off():
+    """If nothing drives a start any more and GitHub says the machine is down, say OFF."""
+    api = FakeCodespaceAPI(name="blackthorn-test-abc123", state="Shutdown")
+    computer = CodespaceComputer(httpx.AsyncClient(), api, channel=CodespaceChannel(None), store=None)
+    computer._name, computer._state = "blackthorn-test-abc123", "STARTING"
+    out = await computer.adopt()
+    assert out["reason"] == "start_abandoned"
+    assert (await computer.status())["state"] == "OFF"
