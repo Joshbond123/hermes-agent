@@ -91,6 +91,12 @@ class FakeChannel:
     def known(self, name: str) -> bool:
         return bool(name) and name in self.tokens
 
+    def drop_presence(self, name: str) -> None:
+        self._present = False
+
+    def agents(self, *, fresh_s: float = 90.0) -> List[str]:
+        return [self.name] if (self.name and self._present) else []
+
     def presence(self, name: str) -> Dict[str, Any]:
         return {"connected": bool(name) and self._present, "last_seen_s": 1 if self._present else -1,
                 "registered": self.known(name), "version": "test"}

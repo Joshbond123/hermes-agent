@@ -2,14 +2,14 @@
  "files": {
   "blackthorn/COMPUTER_DRIVE.md": "eb143a189c0bf88482027c6a474b799c2d7d52303f23748258cd01a2417ab5da",
   "blackthorn/README.md": "f3e59f0dd987701577011d23ec5f1c67b630bd9e4c170ed4b628b988492afc84",
-  "blackthorn/__init__.py": "12d100afeb39078b94e5df27fcaf7482d1518f344d32ef77c2284c5ec0495e91",
+  "blackthorn/__init__.py": "622c580a46165cf35f68f7b75fb704aa08fe69a7d2b506d7aedfa43e3c1d65bc",
   "blackthorn/agent.py": "7073056dccbb213cc77d96d3b0e1cbe74bf613b067ab28b10ea855c95b5720cc",
   "blackthorn/api.py": "5fad8f1536d01f956beee4da025437ea80729d2ed765c38ee3f6af2213c242bf",
   "blackthorn/app.py": "0f84d98553ab544ee4d7fc7046e314bf5461ac5bdad676b4e8001a9ca62ea196",
   "blackthorn/auth.py": "dec463fd2d52248f78279eee4bb8f3c2344a1dc7f4ffbe3c7eb190b2da4b1d39",
   "blackthorn/capabilities.py": "1d103d54bddbf5a10c0900308cba3c2fe5edd63ec9ed3e3baca50788ca879583",
-  "blackthorn/codespace_channel.py": "cea4a51b7cdd034324a341c229c28ae03ce34fb969806c4fb8d9b28fe3a9f0db",
-  "blackthorn/codespace_computer.py": "223bd3b60141a486b3dace1bdbd199656d675cf64e27b9c1011381251cb7e9b3",
+  "blackthorn/codespace_channel.py": "fd5df45584ed35daa93f6b0e7b9502ae3269ac92c1cc5550f17ce7d534e10f25",
+  "blackthorn/codespace_computer.py": "00c215ee85a13fee9217d2807c43f5060031bbcad9f612a6681cf762e256bcbc",
   "blackthorn/codespaces.py": "9380c1f1f53dce5dbe64cf1384dd78a06fd6fd8216c7255f12c8b6b7e9eaa9a0",
   "blackthorn/computer_assets/bootstrap.sh": "b0a6230f33196b5aea73bf694ea6ec639ef54cce53f8c15454db93a16639383b",
   "blackthorn/computer_assets/browse.py": "bc7fa572a780448e692dda378bad0914e8ea28eb633e447b8e2bae5638addd2b",
@@ -62,5 +62,5 @@
   "blackthorn/version.py": "a3e10b7f2f39b4d9374851f0c9eb11bb878f68c35925994f623db312cf433ffe",
   "blackthorn_start.py": "847f0cc5ec83b846947b7c485abdb2592b0dd090bedf78af16022a0394d2e9f3"
  },
- "version": "5.5.2"
+ "version": "5.5.3"
 }

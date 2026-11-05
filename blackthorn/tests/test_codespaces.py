@@ -297,3 +297,16 @@ async def test_a_polling_agent_is_accepted_without_an_extra_probe():
     computer._name = "blackthorn-test-abc123"
     await computer._ensure_agent(timeout=3)                        # returns immediately
     assert computer.agent_connected() is True
+
+
+async def test_a_stopped_codespace_is_not_reported_as_connected():
+    api = FakeCodespaceAPI(name="blackthorn-test-abc123", state="Available")
+    channel = CodespaceChannel(None)
+    channel.touch("blackthorn-test-abc123", version="1.1")
+    computer = CodespaceComputer(httpx.AsyncClient(), api, channel=channel, store=None)
+    computer._name, computer._state = "blackthorn-test-abc123", "ON"
+    assert (await computer.status())["agent_connected"] is True
+    await computer.stop(reason="test", force=True)
+    status = await computer.status()
+    assert status["state"] == "OFF"
+    assert status["agent_connected"] is False, "a stopped machine must not look connected"

@@ -450,6 +450,9 @@ class CodespaceComputer:
                 self._error = exc.message
                 raise
             await self.ledger.close_interval()
+            drop = getattr(self.channel, "drop_presence", None)
+            if callable(drop):
+                drop(self._name)   # a stopped container is not connected
             self._state = "OFF"
             self._session = None
             if self.store is not None:

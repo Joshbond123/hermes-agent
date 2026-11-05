@@ -110,6 +110,10 @@ class CodespaceChannel:
         entry = self._presence.get(name) or {}
         return bool(entry) and (time.time() - float(entry.get("last_seen") or 0)) < fresh_s
 
+    def drop_presence(self, name: str) -> None:
+        """Forget that an agent was polling: after a stop it is gone, not "still here for 90s"."""
+        self._presence.pop(name, None)
+
     def agents(self, *, fresh_s: float = 90.0) -> List[str]:
         """Names of codespace agents that are polling right now.
 
