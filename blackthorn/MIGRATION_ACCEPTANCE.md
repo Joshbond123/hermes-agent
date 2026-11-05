@@ -1,6 +1,6 @@
 # Migration acceptance — NVIDIA Nemotron 3 Ultra + GitHub Codespaces
 
-Date: 2026-11-05 · app version 5.5.5 · commits `66730a4ab1` … `c71cb8f2f2` (branch `main`)
+Date: 2026-11-05 · app version 5.5.7 · commits `66730a4ab1` … `131f0c432a` (branch `main`)
 Live: https://blackthorn.onrender.com
 
 Everything below was observed on the live deployment, not inferred from code. Commands, response
@@ -29,7 +29,10 @@ nvidia/nemotron-3-ultra-550b-a55b` on NVIDIA's OpenAI-compatible endpoint
 (`NVIDIA_BASE_URL=https://integrate.api.nvidia.com`, `NVIDIA_API_KEY` in the Render environment,
 `BLACKTHORN_MODEL=nvidia/nemotron-3-ultra-550b-a55b`).
 
-Live task (11:38 UTC, `live_task_proof2.json`), 4 tool calls, finish `stop`:
+Live tasks, all against the deployed app (proof files `live_task_proof{2,4,5}.json`): a 4-call run,
+a 3-call skills run, and a 3-call final run at 12:33 UTC that reported `whoami` = `codespace`,
+`pwd` = `/workspaces/blackthorn` and wrote/read `work/final_check/result.txt`. Example (11:38 UTC,
+4 tool calls, finish `stop`):
 
 > open `/workspace/handoff.txt` created by an earlier task, report it, append `date -u` + cwd, read back
 
@@ -92,9 +95,17 @@ and the codespace's owner.
   caught (`did not become available within 420s` while the panel said ON).
 - Never mid-task: `stop` is refused while a run is executing (`_runs`), a tool call is in flight
   (`_inflight`) or a job is queued.
-- Auto-stop: after the 11:56 run the idle clock climbed 40 → 85 → 131 → 176 s and the machine
-  stopped at the 300 s mark (see the log below); GitHub reported `Shutdown` while the disk — and
-  `handoff.txt` — stayed.
+- Auto-stop: the idle clock climbs whenever nothing is happening and resets only on real work.
+  Observed live (`last_activity` in brackets): `idle 3 → 44 → 84 → 124 → 165` after a run
+  (`run_finished`), then reset by genuine work from the owner's own session
+  (`tool_done:/computer/exec`, `run_touched`). A machine abandoned by a redeploy was stopped by the
+  app at 4000+ s idle and GitHub reported `Shutdown`. The 300 s → stop rule itself is pinned by
+  `test_it_stops_when_genuinely_idle_and_keeps_the_disk`; a fully unobserved 300 s live cycle was
+  not available because the owner was using the product at the time (and should not be cut off).
+- No stuck states: a start that GitHub accepted but did not act on is re-issued (3 tries, 60 s
+  apart) and an abandoned `STARTING` is reconciled to `OFF` — both found live and pinned by tests.
+  The idle clock now records *what* touched it (`last_activity`), which is how the polling
+  regression and the owner's own traffic were told apart.
 - Adoption: a redeploy forgets the codespace name while GitHub keeps the machine (and meter)
   running. The power loop now adopts it from the agent's own polls (falling back to GitHub,
   throttled), reports it `ON`, seeds its idle clock from GitHub's `last_used_at`, and stops it.
@@ -122,9 +133,9 @@ source is labelled rather than invented.
 
 ## 7. Regression suite
 
-`python3 -m pytest -c blackthorn/tests/pytest.ini blackthorn/tests` → exit 0, **325 passed,
+`python3 -m pytest -c blackthorn/tests/pytest.ini blackthorn/tests` → exit 0, **328 passed,
 5 skipped** (browser/E2E tests skip where Playwright is absent). UI: `tsc` clean, `vite build` OK,
-`vitest` 32/32. Integrity: `/api/version` → `{"checked": 61, "drift": [], "extra": []}`.
+`vitest` 32/32. Integrity: `/api/version` → `{"checked": 62, "drift": [], "extra": []}`.
 
 ## 8. Known limits (stated, not hidden)
 
