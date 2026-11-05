@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime
 import logging
 import os
 import shlex
@@ -44,6 +45,15 @@ def _int_env(name: str, default: int) -> int:
     except ValueError:
         return default
 
+
+def _ts(value: Any) -> float:
+    """Parse GitHub's ISO-8601 timestamps; unknown means "not evidence", never "now"."""
+    if not value:
+        return 0.0
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
 
 class _EmptyLedger:
     """No machine has ever run here, so the measured total is exactly zero."""
@@ -101,6 +111,9 @@ class UnconfiguredComputer:
     async def maybe_stop(self) -> Dict[str, Any]:
         return {"ok": True, "stopped": False, "reason": "unconfigured"}
 
+    async def adopt(self, **_kwargs: Any) -> Dict[str, Any]:
+        return {"ok": True, "adopted": False, "reason": "unconfigured"}
+
 
 class CodespaceComputer:
     """``/computer/*`` over a codespace, with start-on-demand and stop-when-idle."""
@@ -123,6 +136,7 @@ class CodespaceComputer:
         self._inflight = 0
         self._runs = 0                       # agent runs currently executing
         self._last_activity = time.time()
+        self._last_lookup = 0.0
         self._state = "OFF"                 # OFF | STARTING | ON | STOPPING | ERROR
         self._error = ""
         self._name = ""
@@ -235,6 +249,56 @@ class CodespaceComputer:
             await self._save_state()
             return {"ok": True, "name": self._name, "state": self._state}
 
+    async def adopt(self, *, throttle_s: float = 60.0) -> Dict[str, Any]:
+        """Take responsibility for a codespace that is already running.
+
+        A previous process (a redeploy, a crash) forgets which codespace is ours while GitHub keeps
+        the machine — and its meter — running. Nothing in the container announces the name to a
+        fresh process except the agent's own poll, so: prefer the agent that is dialling in, fall
+        back to GitHub's listing, and only ask GitHub once a minute while there is nothing to find.
+        Adoption is what makes the panel tell the truth (running, and counted) instead of "off".
+        """
+        if self._state == "ON" and self._name:
+            return {"ok": True, "adopted": False, "reason": "already_on", "name": self._name}
+        async with self._lock:
+            name = self._name
+            if not name:
+                live = self.channel.agents() if self.channel is not None else []
+                name = live[0] if live else ""
+            if not name:
+                if time.time() - self._last_lookup < throttle_s:
+                    return {"ok": True, "adopted": False, "reason": "unknown"}
+                self._last_lookup = time.time()
+                try:
+                    cs = await self.api.find()
+                except CodespaceError:
+                    return {"ok": True, "adopted": False, "reason": "lookup_failed"}
+                name = str(cs.get("name") or "") if cs else ""
+            if not name:
+                return {"ok": True, "adopted": False, "reason": "absent"}
+            self._name = name
+            try:
+                cs = await self.api.get(name)
+            except CodespaceError as exc:
+                self._state, self._error = "ERROR", exc.message
+                return {"ok": False, "adopted": False, "reason": "lookup_failed", "detail": exc.message}
+            if str(cs.get("state") or "") != "Available":
+                self._state, self._error = "OFF", ""
+                await self._save_state()
+                return {"ok": True, "adopted": False, "reason": "not_running",
+                        "state": str(cs.get("state") or "Unknown")}
+            self._state, self._error = "ON", ""
+            # GitHub's own last_used_at is the only honest evidence of when the machine stopped
+            # being used; the idle clock is seeded from it so an abandoned machine stops promptly
+            # instead of waiting a fresh idle window.
+            evidence = _ts(cs.get("last_used_at"))
+            self._last_activity = evidence or time.time()
+            await self.ledger.open_interval(name)
+            await self._save_state()
+            log.info("adopted running codespace %s (last used %s)", name,
+                     "unknown" if not evidence else f"{int(time.time() - evidence)}s ago")
+            return {"ok": True, "adopted": True, "name": name, "idle_seconds": int(self.idle_seconds())}
+
     async def _wait_available(self, timeout: float) -> Dict[str, Any]:
         deadline = time.time() + timeout
         delay = 2.0
@@ -278,7 +342,9 @@ class CodespaceComputer:
                              "The codespace is running but its agent is not attached to the channel")
 
     def agent_connected(self) -> bool:
-        return bool(self._name) and self.channel.present(self._name)
+        if not self._name:
+            return bool(self.channel.agents()) if self.channel is not None else False
+        return self.channel.present(self._name)
 
     async def _agent(self, path: str, body: Dict[str, Any], *, timeout: float) -> Dict[str, Any]:
         """Send one job through the channel; a timeout is reported, never faked."""

@@ -159,7 +159,7 @@ def create_app(settings: Optional[Settings] = None, *, services: Optional[Servic
             import asyncio
 
             async def _codespace_power_loop() -> None:
-                """Automatic power management: stop the computer when it is genuinely idle.
+                """Automatic power management: adopt a running machine, stop it when genuinely idle.
 
                 ``maybe_stop`` refuses while a run is executing, while a tool call is in flight and
                 while the idle window has not elapsed, so a task is never cut off mid-command. The
@@ -174,6 +174,11 @@ def create_app(settings: Optional[Settings] = None, *, services: Optional[Servic
                     interval = 30.0
                 while True:
                     try:
+                        # First make sure we know which machine is ours: a redeploy forgets it
+                        # while GitHub keeps the codespace (and its meter) running.
+                        adopted = await bt.codespaces.adopt()
+                        if adopted.get("adopted"):
+                            log.info("adopted running codespace %s", adopted.get("name"))
                         result = await bt.codespaces.maybe_stop()
                         if result.get("stopped"):
                             log.info("codespace stopped automatically (%s idle)", result.get("reason"))

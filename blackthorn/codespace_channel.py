@@ -110,6 +110,16 @@ class CodespaceChannel:
         entry = self._presence.get(name) or {}
         return bool(entry) and (time.time() - float(entry.get("last_seen") or 0)) < fresh_s
 
+    def agents(self, *, fresh_s: float = 90.0) -> List[str]:
+        """Names of codespace agents that are polling right now.
+
+        Used to recognise the machine we are running on after a restart: the container dials in,
+        so it announces itself even when this process has forgotten which codespace is ours.
+        """
+        now = time.time()
+        return sorted(name for name, entry in self._presence.items()
+                      if (now - float(entry.get("last_seen") or 0)) < fresh_s)
+
     def presence(self, name: str) -> Dict[str, Any]:
         entry = dict(self._presence.get(name) or {})
         last = float(entry.get("last_seen") or 0)

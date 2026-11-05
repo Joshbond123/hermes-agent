@@ -234,3 +234,30 @@ async def test_usage_is_measured_from_observed_intervals_only():
     seconds = await computer.ledger.seconds_this_month()
     assert seconds >= 0.0
     assert isinstance(json.loads(store.values[UsageLedger.KEY]), list)
+
+
+async def test_a_codespace_left_running_by_a_previous_process_is_adopted_and_counted():
+    """A redeploy forgets the name; GitHub keeps the machine — and the meter — running.
+
+    The container's own agent dials in, so its presence is the evidence: the machine is recognised,
+    reported as ON, and an interval is opened so its hours are counted instead of shown as zero.
+    """
+    api = FakeCodespaceAPI(name="blackthorn-live", state="Available")
+    channel = CodespaceChannel(None)
+    channel.touch("blackthorn-live", version="1.1")
+    computer = CodespaceComputer(httpx.AsyncClient(), api, channel=channel, store=None, idle_stop_s=300)
+
+    out = await computer.adopt()
+    assert out["adopted"] is True and out["name"] == "blackthorn-live"
+    status = await computer.status()
+    assert status["state"] == "ON", "a running machine must never be reported as off"
+    assert status["agent_connected"] is True
+    assert await computer.ledger.seconds_this_month() >= 0
+
+
+async def test_adoption_leaves_a_stopped_codespace_off_and_does_not_invent_usage():
+    api = FakeCodespaceAPI(name="blackthorn-live", state="Shutdown")
+    computer = CodespaceComputer(httpx.AsyncClient(), api, channel=CodespaceChannel(None), store=None)
+    out = await computer.adopt()
+    assert out["adopted"] is False and out["reason"] == "not_running"
+    assert (await computer.status())["state"] == "OFF"
