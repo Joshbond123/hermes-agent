@@ -310,3 +310,23 @@ async def test_a_stopped_codespace_is_not_reported_as_connected():
     status = await computer.status()
     assert status["state"] == "OFF"
     assert status["agent_connected"] is False, "a stopped machine must not look connected"
+
+
+async def test_an_idle_machine_stops_even_while_its_agent_keeps_polling():
+    """A polling agent proves the container is alive, not that a task needs it.
+
+    Counting polls as activity reset the idle clock every ~25s, so an idle codespace would never
+    stop and its hours would be wasted. The machine must stop on its idle window regardless.
+    """
+    api = FakeCodespaceAPI(name="blackthorn-test-abc123", state="Available")
+    channel = CodespaceChannel(None)
+    channel.touch("blackthorn-test-abc123", version="1.1")
+    computer = CodespaceComputer(httpx.AsyncClient(), api, channel=channel, store=None, idle_stop_s=300)
+    computer._name, computer._state = "blackthorn-test-abc123", "ON"
+    computer._last_activity = time.time() - 600
+    for _ in range(5):                       # the container polls the channel
+        await channel.pull("blackthorn-test-abc123", wait=0.01)
+    assert channel.present("blackthorn-test-abc123") is True
+    out = await computer.maybe_stop()
+    assert out["stopped"] is True, "an idle machine must not be kept awake by its own polling"
+    assert (await computer.status())["state"] == "OFF"

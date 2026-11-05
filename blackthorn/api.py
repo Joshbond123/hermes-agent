@@ -604,10 +604,10 @@ async def codespaces_pull(request: Request, name: str = "", version: str = "", p
     expected = await s.channel.token_for(name)
     if not expected or token != expected:
         raise _err(401, "unknown_agent", "This codespace agent is not registered.")
-    job = await s.channel.pull(name, version=version, port=port)
-    if s.codespaces is not None:
-        s.codespaces.note_activity()
-    return job
+    # A poll proves the machine is alive (presence is updated inside ``pull``); it does NOT prove a
+    # task needs it. Counting polls as activity kept the idle clock at zero for ever, so an idle
+    # codespace would never stop and its hours were wasted.
+    return await s.channel.pull(name, version=version, port=port)
 
 
 @router.post("/api/codespaces/result/{job_id}")
@@ -617,9 +617,9 @@ async def codespaces_result(request: Request, job_id: str):
     if s.channel is None:
         raise _err(503, "computer_unconfigured", "No codespace channel is configured on this server.")
     body = await request.json()
+    # The caller of the job (``CodespaceComputer.call``) already made the machine busy and touches the
+    # idle clock when it finishes; a result arriving late must not extend the session on its own.
     accepted = s.channel.submit_result(job_id, body if isinstance(body, dict) else {})
-    if s.codespaces is not None:
-        s.codespaces.note_activity()
     return {"ok": True, "accepted": accepted}
 
 
