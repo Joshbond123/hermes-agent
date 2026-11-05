@@ -61,7 +61,11 @@ async def _run_skillctl(ctx: ToolContext, subcommand: str, flags: str, timeout: 
             continue
         if isinstance(parsed, dict) and "ok" in parsed:
             return parsed
-    return {"ok": False, "error": "skill catalog returned no JSON", "output": "\n".join(raw)[-400:]}
+    # Say what actually happened: a silent "no JSON" hid a broken path inside the container for a
+    # whole live run. The tail of the real output is the actionable part.
+    tail = "\n".join(raw)[-600:]
+    return {"ok": False, "error": f"skill catalog returned no JSON (exit output: {tail or 'empty'})",
+            "output": tail}
 
 
 def _fail(message: str, data: Dict[str, Any] | None = None) -> ToolResult:
