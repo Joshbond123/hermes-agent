@@ -7,11 +7,11 @@ import { Header } from './components/Header'
 import { Sidebar } from './components/Sidebar'
 import { SettingsDialog } from './components/Settings'
 import { Toasts, type Toast } from './components/Toasts'
-import { summarize, useGpu } from './gpu'
+import { useCodespaces } from './codespaces'
 import { attachRun, startRun, type Outcome, type RunHandle } from './sse'
 import { initialState, reducer } from './state'
 import type { ServerEvent, Session, VersionInfo } from './types'
-import { formatElapsed, uid } from './util'
+import { uid } from './util'
 
 const NARROW = '(max-width: 899px)'
 const routeId = () => /^\/c\/([^/]+)/.exec(window.location.pathname)?.[1] ?? null
@@ -35,7 +35,7 @@ export default function App() {
   const [sidebarPref, setSidebarPref] = useState(() => localStorage.getItem('bt.sidebar') !== '0')
   const [drawer, setDrawer] = useState(false)
   const sidebarOpen = narrow ? drawer : sidebarPref
-  const [gpuOpen, setGpuOpen] = useState(false)
+  const [codespacesOpen, setCodespacesOpen] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [deleting, setDeleting] = useState<Session | null>(null)
   const [deleteBusy, setDeleteBusy] = useState(false)
@@ -61,8 +61,7 @@ export default function App() {
     setToasts((t) => [...t.slice(-3), { id, kind, text }])
     setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), kind === 'error' ? 7000 : 3500)
   }, [])
-  const gpu = useGpu(gpuOpen, notify)
-  const gpuSummary = summarize(gpu)
+  const codespaces = useCodespaces(codespacesOpen, notify)
 
   // ---------------------------------------------------------------- sessions list
   const loadSessions = useCallback(async (q = '') => {
@@ -172,9 +171,9 @@ export default function App() {
   // ---------------------------------------------------------------- sending
   const failedToStart = useCallback((err: unknown) => {
     const e = err instanceof ApiError ? err : new ApiError(0, 'network', 'Could not reach the server. Your message was not sent.')
-    if (e.code.startsWith('gpu_')) void gpu.refresh()
+    if (e.code.startsWith('model_') || e.code.startsWith('codespace')) void codespaces.refresh()
     notify('error', e.message)
-  }, [gpu, notify])
+  }, [codespaces, notify])
 
   const send = useCallback(async (text: string, files: AttachedFile[]): Promise<boolean> => {
     if (stateRef.current.chat.run) return false
@@ -266,22 +265,35 @@ export default function App() {
   }, [narrow, drawer])
 
   const chat = state.chat
+  // The computer starts by itself when a task needs it, so there is nothing to "turn on" here.
+  // The banner only speaks when the computer genuinely cannot work (a real error), not while it boots.
   const banner = useMemo(() => {
-    if (gpu.status === null) return null
-    const s = gpu.status
-    if (s.online && s.model_loaded !== false) return null
-    if (s.booting || gpu.busy === 'on') {
-      const el = s.elapsed_seconds != null ? ` · ${formatElapsed(s.elapsed_seconds)}` : ''
-      return <div className="banner warn" data-testid="gpu-banner" role="status"><span>{gpuSummary.label}{el}. You can send messages once it is ready.</span><button type="button" className="link" onClick={() => setGpuOpen(true)}>Details</button></div>
+    const state = codespaces.status?.state
+    if (state === 'ERROR') {
+      return (
+        <div className="banner bad" data-testid="codespaces-banner" role="status">
+          <span>Computer problem: {codespaces.status?.error || 'the codespace reported an error'}.</span>
+          <button type="button" className="link" onClick={() => setCodespacesOpen(true)}>Details</button>
+        </div>
+      )
     }
-    if (s.online) return <div className="banner warn" data-testid="gpu-banner" role="status"><span>Loading the model into GPU memory…</span></div>
-    return (
-      <div className={`banner ${s.error ? 'bad' : 'warn'}`} data-testid="gpu-banner" role="status">
-        <span>{s.error ? `GPU problem: ${s.error}` : 'The GPU is off, so the assistant cannot answer yet.'}</span>
-        <button type="button" className="link" onClick={() => void gpu.turnOn()} data-testid="banner-turn-on" disabled={!s.can_turn_on}>Turn on GPU</button>
-      </div>
-    )
-  }, [gpu, gpuSummary.label])
+    if (codespaces.error && !codespaces.status) {
+      return (
+        <div className="banner warn" data-testid="codespaces-banner" role="status">
+          <span>{codespaces.error} The assistant will start it when a task needs it.</span>
+        </div>
+      )
+    }
+    if (codespaces.usage && codespaces.usage.hours_remaining <= 0.5) {
+      return (
+        <div className="banner warn" data-testid="codespaces-banner" role="status">
+          <span>Only {codespaces.usage.hours_remaining.toFixed(1)}h of Codespaces time left this month.</span>
+          <button type="button" className="link" onClick={() => setCodespacesOpen(true)}>Usage</button>
+        </div>
+      )
+    }
+    return null
+  }, [codespaces.status, codespaces.error, codespaces.usage])
 
   return (
     <div className={`app${sidebarOpen && !narrow ? ' with-sidebar' : ''}`} data-testid="app">
@@ -291,8 +303,9 @@ export default function App() {
         onDelete={setDeleting} onLoadArchived={() => void loadArchived()} onRetry={() => void loadSessions(query.trim())}
         onSettings={() => setSettingsOpen(true)} version={version} />
       <div className="main">
-        <Header title={chat.title} sidebarOpen={sidebarOpen} onToggleSidebar={toggleSidebar} onNew={() => goNew()} gpu={gpu}
-          gpuOpen={gpuOpen} onToggleGpu={() => setGpuOpen((v) => !v)} onCloseGpu={() => setGpuOpen(false)} />
+        <Header title={chat.title} sidebarOpen={sidebarOpen} onToggleSidebar={toggleSidebar} onNew={() => goNew()}
+          codespaces={codespaces} csOpen={codespacesOpen} onToggleCodespaces={() => setCodespacesOpen((v) => !v)}
+          onCloseCodespaces={() => setCodespacesOpen(false)} />
         <Chat chat={chat} onRegenerate={() => void regenerate()} onRetryLoad={() => chat.sessionId && void openSession(chat.sessionId, false)} />
         <Composer busy={chat.run !== null} stopping={chat.run?.stopping ?? false} onSend={send} onStop={() => void stop()}
           onError={(t) => notify('error', t)} focusKey={chat.sessionId ?? 'new'} banner={banner} />

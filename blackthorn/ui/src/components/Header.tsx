@@ -1,16 +1,16 @@
-import type { GpuView } from '../gpu'
-import { GpuButton, GpuPanel } from './GpuPanel'
+import type { CodespacesView } from '../codespaces'
+import { CodespacesButton, CodespacesPanel } from './CodespacesPanel'
 import { MenuIcon, PlusIcon } from './Icons'
 
-export function Header({ title, sidebarOpen, onToggleSidebar, onNew, gpu, gpuOpen, onToggleGpu, onCloseGpu }: {
+export function Header({ title, sidebarOpen, onToggleSidebar, onNew, codespaces, csOpen, onToggleCodespaces, onCloseCodespaces }: {
   title: string
   sidebarOpen: boolean
   onToggleSidebar: () => void
   onNew: () => void
-  gpu: GpuView
-  gpuOpen: boolean
-  onToggleGpu: () => void
-  onCloseGpu: () => void
+  codespaces: CodespacesView
+  csOpen: boolean
+  onToggleCodespaces: () => void
+  onCloseCodespaces: () => void
 }) {
   return (
     <header className="header" data-testid="header">
@@ -18,8 +18,8 @@ export function Header({ title, sidebarOpen, onToggleSidebar, onNew, gpu, gpuOpe
       <h1 className="title" data-testid="chat-title" title={title}>{title || 'New chat'}</h1>
       <div className="header-actions">
         <div className="rel">
-          <GpuButton gpu={gpu} open={gpuOpen} onToggle={onToggleGpu} />
-          {gpuOpen && <GpuPanel gpu={gpu} onClose={onCloseGpu} />}
+          <CodespacesButton codespaces={codespaces} open={csOpen} onToggle={onToggleCodespaces} />
+          {csOpen && <CodespacesPanel codespaces={codespaces} onClose={onCloseCodespaces} />}
         </div>
         <button type="button" className="icon-btn only-narrow" onClick={onNew} aria-label="New chat" data-testid="new-chat-header"><PlusIcon /></button>
       </div>

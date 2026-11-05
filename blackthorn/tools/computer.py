@@ -1,4 +1,8 @@
-"""Agent computer tools using the configured /computer/* transport."""
+"""The agent's computer tools: shell, files, URL fetch, info — transport agnostic.
+
+The computer is a GitHub Codespace; ``ctx.computer`` is whatever client implements the
+``/computer/*`` surface (``blackthorn/codespace_computer.py`` in production).
+"""
 
 from __future__ import annotations
 
@@ -7,8 +11,6 @@ from typing import Any, Dict, Optional
 
 import httpx
 
-from ..llm import tunnel_headers
-from ..route import RouteError, RouteResolver
 from .base import ToolContext, ToolError, ToolResult, ToolSpec, clip
 
 DEAD = {404, 410, 521, 522, 523, 530}  # permanent; 502/503/504 retried as transient
@@ -19,149 +21,6 @@ DENY_PATTERNS = (
     r":\(\)\s*\{", r">\s*/dev/sd", r"chmod\s+-R\s+777\s+/(\s|$)", r"\bmv\s+/(\s|$)", r"kill\s+-9\s+1\b", r"\bkillall5\b",
     r"(sudo\s+)?rm\s+(-[a-zA-Z]*\s+)*\/(\s|$)",  # wiping the root filesystem, with or without sudo
 )
-
-
-class ComputerClient:
-    """Talks to the agent's personal computer. A dedicated computer host (id='computer' in
-    kaggle_gpu_state) is preferred; when none is enrolled the model host answers instead."""
-
-    def __init__(self, resolver: RouteResolver, http: httpx.AsyncClient, store: Any = None):
-        self._resolver = resolver
-        self._http = http
-        self._store = store
-
-    async def _endpoint(self) -> tuple:
-        if self._store is not None:
-            try:
-                row = await self._store.computer_row()
-            except Exception:  # noqa: BLE001 - fall back to the model host
-                row = {}
-            url = str(row.get("tunnel_url") or "").rstrip("/")
-            if url.endswith("/v1"):
-                url = url[:-3]
-            key = str(row.get("api_key") or "")
-            status = str(row.get("status") or "").upper()
-            offline = {
-                "", "OFF", "OFFLINE", "GPU_STOPPED_SAVING_QUOTA", "STOPPED", "STOPPING_KAGGLE_GPU",
-                "ERROR", "FAILED", "BOOT_FAILED", "TUNNEL_ERROR", "GPU_UNAVAILABLE",
-            }
-            # Once a computer is enrolled, NEVER silently fall back to the model GPU:
-            # it has a different ephemeral filesystem. A fallback can report success
-            # while writing files to the wrong machine and destroy task continuity.
-            if row:
-                if status in {"OFF", "OFFLINE", "GPU_STOPPED_SAVING_QUOTA", "STOPPED", "STOPPING_KAGGLE_GPU"}:
-                    raise RouteError("computer_off", "The computer is intentionally off; turn it on before using computer tools.")
-                if status in {"BOOT_FAILED", "GPU_UNAVAILABLE"}:
-                    raise RouteError("computer_failed", "The computer boot failed; check GPU status before retrying.")
-                if url and key and status not in offline:
-                    return url, key
-                raise RouteError("computer_offline", "The dedicated computer is offline or recovering; "
-                                 "its workspace has not been replaced. Retry after health is verified.")
-        route = await self._resolver.get()  # legacy single-kernel deployment only
-        return route.url, route.api_key
-
-    async def call(self, path: str, payload: Dict[str, Any] | None = None, *, method: str = "POST",
-                   timeout: float = 90.0, idempotent: bool = True) -> Dict[str, Any]:
-        """Call the remote computer through the relay.
-
-        ``idempotent=True`` (reads, info, file reads/writes of whole content): transient timeouts and
-        502/503 are retried with bounded backoff.
-        ``idempotent=False`` (shell commands): once a request may have reached the notebook it is
-        **never** re-sent, because a re-run would execute the command twice. Only a connection that
-        never opened is retried. The caller then gets a clear "may still be running" error and can
-        check the outcome through a background job.
-        """
-        import asyncio
-        import time
-        # Never let a model-chosen short timeout kill a healthy but busy notebook.
-        timeout = max(45.0, float(timeout))
-        last_err: Optional[Exception] = None
-        # Kaggle's independent tunnel watchdog needs up to ~90 s to detect an
-        # outage and relaunch Inrok, plus time for re-registration. The old 12
-        # retries expired before the computer recovered. Bound by both count
-        # and elapsed time so an unavailable platform cannot trap a task forever.
-        attempts = 40
-        deadline = time.monotonic() + 195.0
-        for attempt in range(1, attempts + 1):
-            try:
-                base_url, api_key = await self._endpoint()
-            except RouteError as exc:
-                if exc.code in ("computer_off", "computer_failed"):
-                    # A deliberate stop or a terminal boot error cannot heal through
-                    # 195 seconds of retry sleeps. Return actionable feedback now.
-                    raise ToolError("offline", exc.message) from exc
-                last_err = ToolError("offline", "The remote computer is offline or recovering.", hint=exc.message)
-                if attempt >= attempts or time.monotonic() >= deadline:
-                    raise last_err from exc
-                await asyncio.sleep(min(8.0, 0.5 * 2 ** min(attempt, 5)))
-                continue
-            try:
-                resp = await self._http.request(
-                    method, f"{base_url}{path}", json=payload if method == "POST" else None, timeout=timeout,
-                    headers={**tunnel_headers(base_url), "Authorization": f"Bearer {api_key}"})
-            except httpx.ConnectError as exc:
-                self._resolver.invalidate()
-                last_err = ToolError("offline", "Could not reach the remote computer (the tunnel may have stopped).",
-                                     hint="Open the GPU panel and check that the GPU is Ready.")
-                if attempt >= attempts or time.monotonic() >= deadline:
-                    raise last_err from exc
-                await asyncio.sleep(min(8.0, 0.5 * (2 ** min(attempt - 1, 4))))
-                continue
-            except httpx.TimeoutException as exc:
-                last_err = ToolError("timeout", f"The remote computer did not answer within {int(timeout)}s.",
-                                     hint=("The command may still be running on the computer. Start long work as a "
-                                           "background job (run_command with background=true) and poll it with job_status."
-                                           if not idempotent else None))
-                if not idempotent:
-                    self._resolver.invalidate()
-                    raise last_err from exc
-                if attempt >= attempts or time.monotonic() >= deadline:
-                    raise last_err from exc
-                self._resolver.invalidate()
-                await asyncio.sleep(min(8.0, 0.5 * (2 ** min(attempt - 1, 4))))
-                continue
-            except httpx.HTTPError as exc:
-                raise ToolError("network", f"Network error talking to the remote computer: {type(exc).__name__}") from exc
-
-            ctype = (resp.headers.get("content-type") or "").lower()
-            if resp.status_code in DEAD or "text/html" in ctype:
-                self._resolver.invalidate()
-                last_err = ToolError("offline", f"The remote computer tunnel is down (HTTP {resp.status_code}).",
-                                     hint="Open the GPU panel and turn the GPU on again if it is not Ready.")
-                if attempt >= attempts or time.monotonic() >= deadline:
-                    raise last_err
-                await asyncio.sleep(min(8.0, 0.5 * (2 ** min(attempt - 1, 4))))
-                continue
-            if resp.status_code in (401, 403):
-                # Key rotation / multi-worker race: refresh D1 key and retry.
-                self._resolver.invalidate()
-                last_err = ToolError("auth", "The remote computer rejected the access key.",
-                                     hint="Turn the GPU off and on to refresh it.")
-                if attempt >= attempts or time.monotonic() >= deadline:
-                    raise last_err
-                await asyncio.sleep(min(0.5 * (2 ** (attempt - 1)), 15.0))
-                continue
-            try:
-                data = resp.json()
-            except ValueError:
-                raise ToolError("protocol", f"The remote computer returned a non-JSON response (HTTP {resp.status_code}).") from None
-            if resp.status_code >= 400:
-                # 502/503 from the relay are transient — retry (reads only; a command may already be running).
-                if not idempotent and resp.status_code in (502, 503, 504):
-                    self._resolver.invalidate()
-                    raise ToolError("timeout", f"The remote computer did not complete the request (HTTP {resp.status_code}).",
-                                    hint="The command may still be running. Check with job_status if it was a background job.")
-                if resp.status_code in (502, 503, 504) and attempt < attempts and time.monotonic() < deadline:
-                    self._resolver.invalidate()
-                    await asyncio.sleep(min(8.0, 0.5 * (2 ** min(attempt - 1, 4))))
-                    continue
-                raise ToolError("rejected", str(data.get("detail") or data.get("error") or f"HTTP {resp.status_code}")[:300])
-            if not isinstance(data, dict):
-                raise ToolError("protocol", "Unexpected response shape from the remote computer.")
-            return data
-        if last_err:
-            raise last_err
-        raise ToolError("offline", "The remote computer is offline.")
 
 
 def _need(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -334,7 +193,7 @@ def specs() -> list[ToolSpec]:
     return [
         ToolSpec("job_status", "Check a background job started by run_command: RUNNING, EXITED (with exit code) or LOST, plus the latest output.",
                  SCHEMAS["job_status"], job_status, timeout=90.0, describe=lambda a: str(a.get("job_id") or "")),
-        ToolSpec("run_command", "Run a bash command on the remote Linux computer (Python, GPU). Commands over 300s or background=true run as background jobs.",
+        ToolSpec("run_command", "Run a bash command on the Linux computer (a GitHub Codespace: Python, git, package installs). Commands over 300s or background=true run as background jobs.",
                  SCHEMAS["run_command"], run_command, timeout=3660.0, kind="exec", describe=lambda a: f"$ {a.get('command', '')}"),
         ToolSpec("list_files", "List a remote workspace directory.", SCHEMAS["list_files"], list_files,
                  timeout=45.0, describe=lambda a: str(a.get("path") or ".")),

@@ -232,12 +232,15 @@ class AuthMiddleware:
             return
         request = Request(scope, receive=receive)
         path = scope.get("path", "")
-        # /api/kaggle-relay/* carries its own per-request relay key; exempt from owner wall.
+        # A registered codespace agent authenticates with its own session token, not the site
+        # cookie wall, so the channel endpoints are reachable from inside the container.
         if (
             not path.startswith("/api/")
             # /api/lab is the same kind of signal as /api/health: wiring only, no secrets.
             or path in ("/api/health", "/api/lab", "/api/auth/status", "/api/auth/login", "/api/auth/logout")
-            or path.startswith("/api/kaggle-relay/")
+            or path.startswith("/api/codespaces/register")
+            or path.startswith("/api/codespaces/pull")
+            or path.startswith("/api/codespaces/result/")
         ):
             await self.app(scope, receive, send)
             return

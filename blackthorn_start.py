@@ -2,7 +2,7 @@
 """Blackthorn entrypoint for Render:  ``python3 blackthorn_start.py``
 
 * Git is the only source of the code that runs. There is no overlay, no download-and-extract step and no
-  credential in this file — secrets come from the Render environment (CLOUDFLARE_*, KAGGLE_*, TAVILY_*) or from D1.
+  credential in this file — secrets come from the Render environment (CLOUDFLARE_*, NVIDIA_API_KEY, TAVILY_*) or from D1.
 * The build command's ``hermes_cli.main pm repair`` prepares a sealed dependency environment; this script
   activates it, then serves the lean Blackthorn app (``blackthorn.app``). The server is listening within seconds,
   so a cold start after the free instance sleeps is short.

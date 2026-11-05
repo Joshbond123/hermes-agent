@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -328,16 +329,17 @@ class FileStack:
         self.executor = SqliteExecutor(str(db_path))
         self.settings = Settings(store="sqlite", heartbeat_s=0.5, tool_timeout_s=5.0)
         self.services = build_services(self.settings, executor=self.executor, static_dir=static_dir)
-        self.app_srv = ServerThread(create_app(self.settings, services=self.services, gpu_daemon=False)).start()
+        # a real manager over a fake transport: the tool path exercised here is the production one
+        from .fake_codespaces import attach_fake_codespace
+        attach_fake_codespace(self.services, self.backend_srv.url)
+        self.app_srv = ServerThread(create_app(self.settings, services=self.services)).start()
         self.url = self.app_srv.url
 
     async def ready(self) -> None:
         await self.services.store.ensure_schema()
-        await self.executor.query("DELETE FROM kaggle_gpu_state")
-        await self.executor.query(
-            "INSERT INTO kaggle_gpu_state (id, status, tunnel_url, api_key, model, gpu_info, updated_at) "
-            "VALUES ('primary', 'HEARTBEAT_ONLINE', ?, 'test-key', 'fake-model', 'T4', ?)",
-            [self.backend_srv.url, time.time()])
+        # The model route is environment-configured now: point it at the fake backend.
+        os.environ["NVIDIA_BASE_URL"] = self.backend_srv.url
+        os.environ["NVIDIA_API_KEY"] = "test-key"
         self.services.resolver.invalidate()
 
     async def stream(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:

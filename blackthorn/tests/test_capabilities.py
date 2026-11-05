@@ -32,6 +32,11 @@ FIXTURES = {
     "AKCodez/hackingtool-plugin": _repo_zip("hackingtool-plugin-main", {
         "plugins/hackingtool/data/tools.json": json.dumps({"tools": [{"name": "nmap", "run": "nmap"}]}),
     }),
+    "obra/superpowers": _repo_zip("superpowers-main", {
+        "skills/systematic-debugging/SKILL.md": "---\nname: systematic-debugging\ndescription: Root cause first\n---\nbody",
+        "skills/brainstorming/SKILL.md": "---\nname: brainstorming\ndescription: Design first\n---\nbody",
+        "LICENSE": "MIT",
+    }),
 }
 
 

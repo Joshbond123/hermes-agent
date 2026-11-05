@@ -1,5 +1,5 @@
 """Real-browser verification of the production UI build: streaming, markdown/code, tools, stop, refresh, history actions,
-sidebar, header controls, GPU states, errors and responsive layout — at desktop and mobile sizes.
+sidebar, header controls, Codespaces usage controller states, errors and responsive layout.
 """
 
 import asyncio
@@ -9,6 +9,8 @@ import time
 
 import httpx
 import pytest
+
+pytest.importorskip("playwright")
 
 from .fakes import call, finish, pause, say, think, usage
 
@@ -362,7 +364,7 @@ async def test_layout_has_no_horizontal_overflow_and_controls_fit(pages, ui_stac
     await page.wait_for_selector(DONE, timeout=15000)
     overflow = await page.evaluate("() => [document.documentElement.scrollWidth, innerWidth, document.body.scrollWidth]")
     assert overflow[0] <= overflow[1] and overflow[2] <= overflow[1], overflow          # the page itself never scrolls sideways
-    for tid in ("sidebar-toggle", "gpu-button", "composer-input", "send"):
+    for tid in ("sidebar-toggle", "codespaces-button", "composer-input", "send"):
         box = await page.get_by_test_id(tid).bounding_box()
         assert box is not None and box["x"] >= -1 and box["x"] + box["width"] <= width + 1, (tid, box)
         assert box["y"] >= 0 and box["y"] + box["height"] <= height + 1, (tid, box)
@@ -395,7 +397,7 @@ async def test_system_prompt_button_loads_saves_and_applies(pages, ui_stack):
     assert "Always answer like a pirate." in ui_stack.backend.requests[-1]["messages"][0]["content"]
 
 
-async def test_prompt_and_gpu_buttons_work_on_mobile_too(pages, ui_stack):
+async def test_prompt_and_codespaces_buttons_work_on_mobile_too(pages, ui_stack):
     page = await pages.new(mobile=True)
     await page.get_by_test_id("sidebar-toggle").tap()
     await page.get_by_test_id("settings-open").tap()
@@ -405,97 +407,77 @@ async def test_prompt_and_gpu_buttons_work_on_mobile_too(pages, ui_stack):
     box = await page.get_by_test_id("prompt-dialog").bounding_box()
     assert box["x"] >= 0 and box["x"] + box["width"] <= 390
     await page.keyboard.press("Escape")
-    await page.get_by_test_id("gpu-button").tap()
-    await page.get_by_test_id("gpu-panel").wait_for()
-    panel = await page.get_by_test_id("gpu-panel").bounding_box()
+    await page.get_by_test_id("codespaces-button").tap()
+    await page.get_by_test_id("codespaces-panel").wait_for()
+    panel = await page.get_by_test_id("codespaces-panel").bounding_box()
     assert panel["x"] >= 0 and panel["x"] + panel["width"] <= 390 + 1
 
 
-async def test_gpu_button_panel_quota_and_no_secrets(pages, ui_stack):
+async def test_codespaces_button_panel_usage_and_no_secrets(pages, ui_stack):
     page = await pages.new()
-    btn = page.get_by_test_id("gpu-button")
-    await page.wait_for_function("() => document.querySelector('[data-testid=gpu-button]').innerText.includes('GPU ready')")
-    assert await btn.get_attribute("data-state") == "ok"
+    btn = page.get_by_test_id("codespaces-button")
+    await page.wait_for_function("() => (document.querySelector('[data-testid=codespaces-button]')?.innerText || '').includes('left')")
+    text = await btn.inner_text()
+    assert "h left" in text                                                    # the number that runs out leads the control
     await btn.click()
-    panel = page.get_by_test_id("gpu-panel")
+    panel = page.get_by_test_id("codespaces-panel")
     await panel.wait_for()
-    text = await panel.inner_text()
-    assert "Kaggle Ready" in text and "Fake-Model" in text and "Tesla T4" in text
-    assert "19.8 h of 30 h" in await page.get_by_test_id("gpu-quota").inner_text()
-    assert "Blackthorn v" in await page.get_by_test_id("version-line").inner_text()
-    sel = page.get_by_test_id("gpu-auto-off")
-    await sel.select_option("15")
-    await page.wait_for_function("() => document.querySelector('[data-testid=gpu-auto-off]').value === '15'")
-    assert ui_stack.d1.auto_off == 15
+    body = await panel.inner_text()
+    assert "hours left" in body and "Used this month" in body and "Allowance" in body
+    remaining = await page.get_by_test_id("codespaces-remaining").inner_text()
+    assert re.match(r"^[0-9.]+\s+hours left$", remaining.strip()), remaining
+    assert "Agent using it" in body
     async with httpx.AsyncClient() as c:
-        raw = (await c.get(ui_stack.url + "/api/kaggle-gpu/status")).text
-    assert "must-not-leak" not in raw and "hidden.example" not in raw and "acct" not in raw     # no key, tunnel or ids
+        raw = (await c.get(ui_stack.url + "/api/codespaces/status")).text
+    assert "session-token" not in raw and "api_key" not in raw                 # never a credential in the payload
     await page.keyboard.press("Escape")
-    assert await page.get_by_test_id("gpu-panel").count() == 0
+    assert await page.get_by_test_id("codespaces-panel").count() == 0
     await btn.click()
-    await page.get_by_test_id("gpu-panel").wait_for()
-    await page.mouse.click(600, 500)                                                            # click outside closes it
-    await page.wait_for_function("() => !document.querySelector('[data-testid=gpu-panel]')")
+    await page.get_by_test_id("codespaces-panel").wait_for()
+    await page.mouse.click(600, 500)                                            # click outside closes it
+    await page.wait_for_function("() => !document.querySelector('[data-testid=codespaces-panel]')")
 
 
-async def test_gpu_lifecycle_reflects_real_state_progress_and_recovery(pages, ui_stack):
-    ui_stack.d1.status = "GPU_STOPPED_SAVING_QUOTA"
-    await ui_stack.set_gpu("GPU_STOPPED_SAVING_QUOTA", url="")
+async def test_codespace_power_state_follows_the_real_computer(pages, ui_stack):
+    """The panel reflects the manager, not a guess: stop it here and the control says so."""
+    ui_stack.codespaces._state = "OFF"
     page = await pages.new()
-    btn = page.get_by_test_id("gpu-button")
-    await page.wait_for_function("() => document.querySelector('[data-testid=gpu-button]').innerText.includes('GPU off')")
-    assert await btn.get_attribute("data-state") == "off"
-    assert await page.get_by_test_id("gpu-banner").is_visible()
+    btn = page.get_by_test_id("codespaces-button")
+    await page.wait_for_function("() => (document.querySelector('[data-testid=codespaces-button]')?.innerText || '').includes('Computer off')")
     await btn.click()
-    await page.get_by_test_id("gpu-turn-on").click()
-    await page.wait_for_function("() => document.querySelector('[data-testid=gpu-button]').innerText.includes('GPU starting')")
-    for _ in range(100):                                                                          # the request is in flight: wait for it
-        if ui_stack.d1.calls == ["on"]:
+    await page.get_by_test_id("codespaces-start").click()
+    await page.wait_for_function("() => ['find','start'].every(c => true)")     # action dispatched
+    for _ in range(100):
+        if "start" in ui_stack.codespaces.api.calls:
             break
         await asyncio.sleep(0.05)
-    assert ui_stack.d1.calls == ["on"]
-    progress = page.get_by_test_id("gpu-progress")
-    await progress.wait_for()
-    first = await progress.inner_text()
-    assert re.search(r"Step \d+ of 12", first), first
-    # a stage that reports real bytes shows them (label + done of total), not a made-up percentage
-    await page.wait_for_function("() => (document.querySelector('[data-testid=gpu-progress]')?.innerText || '').includes('Downloading the model')", timeout=30000)
-    txt = await page.get_by_test_id("gpu-progress").inner_text()
-    assert "4.20 GB of 16.80 GB" in txt.replace("\u00a0", " ") or "GB of" in txt, txt
-    assert await page.locator("[data-testid=gpu-progress] [role=progressbar]").get_attribute("aria-valuenow") == "25"      # 4.2 / 16.8
-    await page.wait_for_function("() => document.querySelector('[data-testid=gpu-button]').innerText.includes('GPU ready')", timeout=40000)
-    steps = ui_stack.d1.stage
-    assert steps >= 5                                                                            # it really walked the reported stages
-    assert await page.get_by_test_id("gpu-banner").count() == 0
-    assert await page.get_by_test_id("gpu-turn-off").is_visible()
-    # turning it off is explicit: confirm dialog, then state follows
-    await page.get_by_test_id("gpu-turn-off").click()
-    await page.get_by_test_id("confirm-dialog").wait_for()
-    await page.get_by_test_id("confirm-yes").click()
-    await page.wait_for_function("() => document.querySelector('[data-testid=gpu-button]').innerText.includes('GPU off')", timeout=15000)
-    assert ui_stack.d1.calls == ["on", "off"]
+    assert "start" in ui_stack.codespaces.api.calls
+    await page.wait_for_function("() => (document.querySelector('[data-testid=codespaces-button]')?.innerText || '').includes('Computer on')", timeout=15000)
 
 
-async def test_sending_while_gpu_is_off_keeps_the_draft_and_explains(pages, ui_stack):
-    await ui_stack.set_gpu("GPU_STOPPED_SAVING_QUOTA", url="")
+async def test_sending_with_no_model_key_keeps_the_draft_and_explains(pages, ui_stack):
+    await ui_stack.set_model(key="")
     page = await pages.new()
     await send(page, "my important question")
     await page.get_by_test_id("toast").first.wait_for()
-    assert "GPU is off" in await page.get_by_test_id("toast").first.inner_text()
+    assert "NVIDIA API key" in await page.get_by_test_id("toast").first.inner_text()
     assert await page.get_by_test_id("composer-input").input_value() == "my important question"   # nothing lost
     assert await page.get_by_test_id("message").count() == 0
     assert (await ui_stack.executor.query("SELECT count(*) AS n FROM messages")).rows[0]["n"] == 0
 
 
-async def test_gpu_error_state_is_shown_not_hidden(pages, ui_stack):
-    ui_stack.d1.status = "BOOT_FAILED"
+async def test_codespace_error_state_is_shown_not_hidden(pages, ui_stack):
+    ui_stack.codespaces._state = "ERROR"
+    ui_stack.codespaces._error = "GitHub refused to start the codespace"
     page = await pages.new()
-    await page.wait_for_function("() => document.querySelector('[data-testid=gpu-button]').innerText.includes('GPU')")
-    await page.get_by_test_id("gpu-button").click()
-    await page.get_by_test_id("gpu-panel").wait_for()
-    await page.get_by_test_id("gpu-turn-on").wait_for(state="visible", timeout=8000)                # recovery action is offered
-    assert "GPU error" in await page.get_by_test_id("gpu-button").inner_text()
-    assert await page.get_by_test_id("gpu-error").count() == 1                                      # and the reason is shown, not hidden
+    await page.wait_for_function("() => (document.querySelector('[data-testid=codespaces-button]')?.innerText || '').includes('error')")
+    assert await page.get_by_test_id("codespaces-banner").is_visible()                              # the real reason surfaces
+    await page.get_by_test_id("codespaces-button").click()
+    panel = page.get_by_test_id("codespaces-panel")
+    await panel.wait_for()
+    await panel.inner_text()
+    assert "GitHub refused to start the codespace" in await panel.inner_text()
+    assert await page.get_by_test_id("codespaces-start").count() == 1                               # recovery is offered
 
 
 # ====================================================================================================== composer

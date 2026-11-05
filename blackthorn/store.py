@@ -44,9 +44,6 @@ SQLITE_SCHEMA: Tuple[str, ...] = (
     """CREATE TABLE IF NOT EXISTS hermes_memories (
         id TEXT PRIMARY KEY, target TEXT, content TEXT, memory_type TEXT, importance REAL, user_id TEXT,
         session_id TEXT, profile TEXT, created_at REAL, updated_at REAL)""",
-    """CREATE TABLE IF NOT EXISTS kaggle_gpu_state (
-        id TEXT PRIMARY KEY, status TEXT, tunnel_url TEXT, api_key TEXT, model TEXT, gpu_info TEXT,
-        updated_at REAL, detail TEXT)""",
 )
 
 # Columns the store relies on; added with ALTER TABLE when an older database lacks them.
@@ -464,34 +461,3 @@ class ChatStore:
             "created_at, updated_at) VALUES (?, 'memory', ?, 'factual', 0.9, 'blackthorn', '', 'default', ?, ?)",
             [mid, note, now, now])
         return mid
-
-    async def gpu_row(self) -> Dict[str, Any]:
-        res = await self.db.query(
-            "SELECT status, tunnel_url, api_key, model, gpu_info, updated_at FROM kaggle_gpu_state WHERE id = 'primary' LIMIT 1")
-        return dict(res.rows[0]) if res.rows else {}
-
-    async def unblock_gpu_row(self) -> bool:
-        """Re-open a row that a stop left closed, keeping the published link.
-
-        The notebook refuses to publish while its row says GPU_STOPPED/OFF/STOPPING (so a late
-        heartbeat cannot resurrect a role). If the session is in fact alive - it is answering, so
-        its credential was rejected for another reason - that guard strands it: it can never
-        republish and the agent refreshes against a key that will never change. Moving the row to
-        a neutral state lets the next heartbeat publish the real credential. The link is preserved
-        because it is still the live session's link.
-        """
-        try:
-            await self.db.query(
-                "UPDATE kaggle_gpu_state SET status = 'RECOVERING_KEY', updated_at = ? "
-                "WHERE id = 'primary' AND status IN ('GPU_STOPPED_SAVING_QUOTA','OFF','STOPPING_KAGGLE_GPU')",
-                [__import__("time").time()])
-            row = await self.gpu_row()
-            return str(row.get("status") or "").upper() == "RECOVERING_KEY"
-        except Exception:
-            return False
-
-    async def computer_row(self) -> Dict[str, Any]:
-        """The agent's personal computer (id='computer'); empty until one is enrolled."""
-        res = await self.db.query(
-            "SELECT status, tunnel_url, api_key, model, gpu_info, updated_at FROM kaggle_gpu_state WHERE id = 'computer' LIMIT 1")
-        return dict(res.rows[0]) if res.rows else {}

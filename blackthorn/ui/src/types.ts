@@ -64,50 +64,42 @@ export interface Session {
   message_count: number
 }
 
-export interface GpuQuota { used_hours: number; total_hours: number; remaining_hours: number; used_pct: number; refresh_time?: string; account?: string }
-export interface FleetSlot extends GpuQuota { account?: string; slot?: string; error?: string }
-export interface GpuStatus {
-  online: boolean
-  active: boolean
-  booting: boolean
-  status: string
-  display_status?: string
-  engine_state?: string
-  model?: string
-  model_loaded?: boolean | null
-  gpu_info?: string
-  worker_status?: string
-  progress_step?: string
-  progress_stage?: number
-  progress_total_stages?: number
-  progress_kind?: 'stage' | 'bytes'
-  progress_bytes_done?: number
-  progress_bytes_total?: number
-  progress_label?: string
-  progress_stalled?: boolean
-  elapsed_seconds?: number
-  quota?: GpuQuota
-  quotas?: { model?: GpuQuota & { account?: string }; computer?: GpuQuota & { account?: string } }
-  fleet_slots?: {
-    model?: { primary?: FleetSlot; backup?: FleetSlot; active?: string }
-    computer?: { primary?: FleetSlot; backup?: FleetSlot; active?: string }
-  }
-  model_cache_dataset?: string
-  model_name?: string
-  computer?: {
-    status?: string; online?: boolean; booting?: boolean; display_status?: string; gpu_info?: string
-    host?: string; environment?: string; progress?: string; transport?: string
-    storage?: string; usage_display?: string; error?: string
-    last_health?: { phase?: string; mode?: string; detail?: string; verified_at?: number; external_ip?: string; all_passed?: boolean; run_id?: string }
-  }
-  computer_ready?: boolean
-  transport?: string
-  auto_off?: { enabled?: boolean; minutes?: number; idle_seconds?: number; active_tasks?: number; should_stop?: boolean; reason?: string; computer_jobs?: number }
-  error?: string
-  can_turn_on: boolean
-  can_turn_off: boolean
-  busy?: boolean
-  server_time?: number
+export type CodespaceState = 'ON' | 'OFF' | 'STARTING' | 'STOPPING' | 'ERROR'
+
+export interface CodespaceStatus {
+  state: CodespaceState | string
+  name: string
+  error: string
+  agent_using: boolean
+  agent_connected?: boolean
+  runs_active?: number
+  idle_seconds: number
+  idle_stop_seconds: number
+  workspace: string
+  provider: string
+  link?: { connected?: boolean; last_seen_s?: number; registered?: boolean; version?: string }
+  codespace?: { name?: string; state?: string; machine?: string; last_used_at?: string; error?: string }
+}
+
+export interface CodespaceUsage {
+  provider: string
+  state: CodespaceState | string
+  running: boolean
+  agent_using: boolean
+  agent_connected: boolean
+  name: string
+  machine: string
+  cores: number
+  hours_total: number
+  hours_used: number
+  hours_remaining: number
+  percent_used: number
+  hours_basis: string
+  usage_source: string
+  month: string
+  updated_at: number
+  projected_hours?: number
+  idle_stop_seconds?: number
 }
 
 export interface VersionInfo {

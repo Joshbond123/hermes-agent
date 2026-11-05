@@ -1,4 +1,4 @@
-"""Unified cybersecurity registry tests (all three upstream repositories).
+"""Unified catalogue registry tests (three security repositories + superpowers).
 
 A synthetic catalogue with the same on-disk shape as the real repositories is
 built in a temporary directory, so the tests are hermetic and fast while still
@@ -58,6 +58,12 @@ def catalog(tmp_path) -> Path:
         {"id": "phishing_attack.Evilginx", "title": "Evilginx", "category": "phishing_attack",
          "description": "Reverse proxy phishing", "install_commands": ["curl -s https://x.sh | bash"],
          "run_commands": ["evilginx -h"]}]}))
+    # ---- obra/superpowers style repository (skills/<name>/SKILL.md, process skills)
+    sp = root / "superpowers"
+    _write(sp / "skills" / "brainstorming" / "SKILL.md",
+           "---\nname: brainstorming\ndescription: Use before designing a feature.\n---\n\n# Brainstorm\n")
+    _write(sp / "skills" / "verification-before-completion" / "SKILL.md",
+           "---\nname: verification-before-completion\ndescription: Use before reporting done.\n---\nverify\n")
     return root
 
 
@@ -97,11 +103,11 @@ def test_installs_run_in_scratch_not_the_catalogue_root(catalog, tmp_path):
 def test_registry_indexes_every_source(catalog):
     result = run(catalog, "registry")
     assert result["ok"]
-    assert result["counts"]["skills"] == 4        # 2 anthropic + 2 claude-red
+    assert result["counts"]["skills"] == 6        # 2 anthropic + 2 claude-red + 2 superpowers
     assert result["counts"]["tools"] == 3
-    assert result["counts"]["by_source"] == {"anthropic": 2, "claude-red": 2}
+    assert result["counts"]["by_source"] == {"anthropic": 2, "claude-red": 2, "hackingtool": 0, "superpowers": 2}
     stored = json.loads((catalog / "registry.json").read_text())
-    assert {item["source"] for item in stored["skills"]} == {"anthropic", "claude-red"}
+    assert {item["source"] for item in stored["skills"]} == {"anthropic", "claude-red", "superpowers"}
     assert any(item["id"] == "claude-red:offensive-osint" for item in stored["skills"])
 
 
@@ -173,6 +179,6 @@ def test_a_failing_tool_is_reported_as_a_failure(catalog, tmp_path):
 def test_preflight_reports_sources_and_missing_binaries(catalog):
     result = run(catalog, "preflight")
     assert result["ok"]
-    assert result["counts"]["skills"] == 4
-    assert set(result["sources"]) == {"anthropic", "claude-red", "hackingtool"}
+    assert result["counts"]["skills"] == 6
+    assert set(result["sources"]) == {"anthropic", "claude-red", "hackingtool", "superpowers"}
     assert all(result["sources"][name]["present"] for name in result["sources"])

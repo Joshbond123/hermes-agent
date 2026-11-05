@@ -45,12 +45,16 @@ def _default_root() -> str:
     a search never silently returns nothing.
     """
     for candidate in ("/opt/blackthorn/catalog", "/workspace/security_catalog",
-                      "/kaggle/working/blackthorn_workspace/security_catalog"):
+                      "/workspaces/blackthorn/security_catalog"):
         if os.path.exists(os.path.join(candidate, "registry.json")):
             return candidate
-    return "/opt/blackthorn/catalog" if os.path.isdir("/opt/blackthorn") else (
-        "/workspace/security_catalog" if os.path.isdir("/workspace")
-        else "/kaggle/working/blackthorn_workspace/security_catalog")
+    if os.path.isdir("/opt/blackthorn"):
+        return "/opt/blackthorn/catalog"
+    for candidate in ("/workspace", "/workspaces/blackthorn"):
+        if os.path.isdir(candidate):
+            return os.path.join(candidate, "security_catalog")
+    # Last resort: a home-relative catalog, so an unusual host still works instead of crashing.
+    return os.path.join(os.path.expanduser("~"), ".blackthorn", "security_catalog")
 
 
 ROOT = os.environ.get("BLACKTHORN_SKILL_ROOT") or _default_root()
@@ -61,6 +65,9 @@ SOURCES = {
                    "dir": "claude-red", "license": "MIT"},
     "hackingtool": {"repo": "https://github.com/AKCodez/hackingtool-plugin",
                     "dir": "hackingtool-plugin", "license": "see upstream README"},
+    # obra/superpowers: process skills (brainstorming, planning, TDD, debugging, review, verification)
+    "superpowers": {"repo": "https://github.com/obra/superpowers",
+                    "dir": "superpowers", "license": "MIT"},
 }
 REGISTRY = os.path.join(ROOT, "registry.json")
 INSTALLED = os.path.join(ROOT, "installed.json")
@@ -225,7 +232,22 @@ def _resolve_skill_folder(source: str, name: str, hinted: str = "") -> str:
     return os.path.relpath(candidates[0] if candidates else os.path.join(base, name), ROOT)
 
 
+def _ensure_sources() -> dict:
+    """Clone any missing catalog source on first use.
+
+    A brand-new computer has an empty catalog; asking the agent to run an installer before its
+    first skill search is a step it cannot know about. Cloning here makes discovery work from the
+    very first call, and the check is a cheap directory test afterwards (the clones live on the
+    codespace disk, so they survive stop/start).
+    """
+    missing = [name for name in SOURCES if not os.path.isdir(path_of(name))]
+    if not missing or os.environ.get("BLACKTHORN_SKILL_NO_CLONE"):
+        return {}
+    return clone_sources()
+
+
 def build_registry() -> dict:
+    ensure = _ensure_sources()
     skills: list[dict] = []
     index_path = path_of("anthropic", "index.json")
     index = _load(index_path, {"skills": []})
@@ -257,6 +279,17 @@ def build_registry() -> dict:
             skills.extend(_map_parallel(
                 lambda n, c=category, d=cat_dir: _skill_entry("claude-red", f"claude-red:{n}", n, c,
                                                               os.path.join(d, n)), names))
+    # A source that keeps its skills as ``skills/<name>/SKILL.md`` needs no per-source code:
+    # superpowers ships exactly that layout, and so will the next one.
+    for source in SOURCES:
+        skills_root = path_of(source, "skills")
+        if source in ("anthropic", "claude-red") or not os.path.isdir(skills_root):
+            continue
+        names = [n for n in sorted(os.listdir(skills_root))
+                 if os.path.isfile(os.path.join(skills_root, n, "SKILL.md"))]
+        skills.extend(_map_parallel(
+            lambda n, src=source, root=skills_root: _skill_entry(src, f"{src}:{n}", n, "process",
+                                                                 os.path.join(root, n)), names))
     tools: list[dict] = []
     catalog_path = path_of("hackingtool", "plugins", "hackingtool", "data", "tools.json")
     catalog = _load(catalog_path, {"tools": []})
@@ -275,12 +308,12 @@ def build_registry() -> dict:
                       "archived": bool(item.get("archived"))})
     registry = {"built": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "root": ROOT,
+                "ensured": ensure,
                 "sources": {name: {"repo": meta["repo"], "license": meta["license"],
                                    "present": os.path.isdir(path_of(name))}
                             for name, meta in SOURCES.items()},
                 "counts": {"skills": len(skills), "tools": len(tools),
-                           "by_source": {s: sum(1 for x in skills if x["source"] == s)
-                                         for s in ("anthropic", "claude-red")},
+                           "by_source": {s: sum(1 for x in skills if x["source"] == s) for s in SOURCES},
                            "skipped": len(skipped)},
                 "skipped": skipped[:50],
                 "skills": skills, "tools": tools}

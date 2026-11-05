@@ -197,7 +197,8 @@ class FakeBackend:
         async def info(request: Request):
             if not authed(request):
                 return JSONResponse({"detail": "no"}, status_code=401)
-            return {"workspace": "/w", "hostname": "fake", "gpu": "Tesla T4\nTesla T4", "disk_free_gb": 3.2, "disk_total_gb": 20.9,
-                    "cuda_available": True, "platform": "Linux", "python": "3.13"}
+            return {"workspace": "/workspace", "hostname": "fake-codespace", "gpu": "none (GitHub Codespace)",
+                    "disk_free_gb": 26.4, "disk_total_gb": 32.0, "cuda_available": False, "platform": "Linux",
+                    "python": "3.12"}
 
         return app

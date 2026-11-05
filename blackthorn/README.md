@@ -1,15 +1,20 @@
 # Blackthorn
 
 Blackthorn is the chat product served at <https://blackthorn.onrender.com>: a ChatGPT/Grok-style web UI, an agent that
-chooses its own tools through the model's **native tool calling**, and a Kaggle GPU (Qwen3.8-27B, 2×T4) that runs the
-model and the "remote computer" the tools act on.
+chooses its own tools through the model's **native tool calling**, a hosted model (**NVIDIA Nemotron 3 Ultra** through
+NVIDIA's OpenAI-compatible API), and a real machine to work on (**GitHub Codespaces**).
 
 ```
-browser ──SSE──▶ blackthorn.app (Render) ──OpenAI-compatible stream──▶ Kaggle gateway (Cloudflare tunnel) ──▶ Ollama/llama.cpp
-                  │    ▲                                                   └─ /computer/{exec,read_file,write_file,list_files,fetch_url,info}
-                  │    └── tools: web_search (Tavily) · run_command · read/write/list files · fetch_url · computer_info · remember
-                  └── Cloudflare D1: sessions, messages (history), memories, GPU row, system prompt
+browser ──SSE──▶ blackthorn.app (Render) ──OpenAI-compatible stream──▶ integrate.api.nvidia.com ──▶ nvidia/nemotron-3-ultra-550b-a55b
+                  │    ▲
+                  │    └── tools: web_search (Tavily) · run_command · read/write/list files · fetch_url · computer_info · skills · lab
+                  │
+                  ├── Cloudflare D1: sessions, messages, memories, settings, Codespaces usage intervals
+                  └── command channel (outbound long-poll) ──▶ agent inside the codespace ──▶ /workspace on its persistent disk
 ```
+
+The app never dials into the codespace: the container's own agent opens the connection outwards
+(`/api/codespaces/pull`), so there is no public port to expose and a restarted container simply reconnects.
 
 ## What runs in production (and only this)
 
@@ -23,19 +28,23 @@ is no overlay, no download-and-extract step, and no credential in the repository
 | `blackthorn/app.py`, `api.py` | FastAPI app, routes, static serving (only content-hashed assets are `immutable`), CSP |
 | `blackthorn/agent.py` | the agent loop (native tool calls, bounded, cancellable, never stores reasoning) |
 | `blackthorn/tools/` | tool registry: JSON-schema validation, timeouts, output budgets, redaction, permissions |
-| `blackthorn/llm.py`, `route.py` | streaming client for the Kaggle gateway; route (tunnel + key) read from D1 |
+| `blackthorn/llm.py`, `route.py` | streaming client; the route is NVIDIA's base URL + API key + model id (environment only) |
 | `blackthorn/store.py`, `sql.py` | history on the real `sessions`/`messages` tables (D1 in prod, SQLite in tests) |
 | `blackthorn/runs.py` | detached, resumable runs (refresh / reconnect never loses or duplicates events) |
-| `blackthorn/gpu.py`, `kaggle_bundle.py` | GPU facade (honest status, no secrets) · notebook generated from source at push time |
-| `cloudflare_d1_client.py` | GPU controller (Kaggle API, tunnel health, watchdog, quota) — credentials from env only |
-| `kaggle_cyber_ornith/cyber_ornith_server.py` | the code that runs on Kaggle (gateway + model engine + `/computer/*`) |
+| `blackthorn/codespaces.py` | GitHub Codespaces API (create/start/stop/find/duplicates) + the measured usage ledger |
+| `blackthorn/codespace_channel.py` | the job channel: long-poll queue, presence, registration tokens, one re-queue on a restart |
+| `blackthorn/codespace_computer.py` | the `/computer/*` surface the tools already speak, plus start-on-demand and stop-when-idle |
+| `devcontainer/blackthorn_agent.py` (in the computer repo) | the in-codespace agent: authenticated exec/files/info over the outbound channel |
 | `blackthorn/ui/` | **UI source** (React + TypeScript + Vite) — `blackthorn/static/` is its committed, hashed build |
 
 ## Deployment contract (Render)
 
 Render builds `main` from GitHub automatically. Required environment variables (Render → Environment):
-`CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_D1_DATABASE_ID`, `KAGGLE_USERNAME`, `KAGGLE_API_TOKEN`,
-`HERMES_HOME`; optional `TAVILY_API_KEYS` (comma separated; otherwise read from D1 `state_meta.tavily_api_keys`).
+`CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_D1_DATABASE_ID`, `NVIDIA_API_KEY`,
+`COMPUTER_DRIVE_GITHUB_PAT` (a Codespaces-capable fine-grained PAT for the computer repository), `HERMES_HOME`;
+optional `TAVILY_API_KEYS`, `BLACKTHORN_MODEL`, `NVIDIA_BASE_URL`, `CODESPACE_REPO`, `CODESPACE_MACHINE`,
+`CODESPACE_IDLE_STOP_SECONDS` (default 300), `CODESPACE_POWER_INTERVAL_SECONDS` (default 30),
+`CODESPACES_MONTHLY_HOURS` (overrides the derived allowance), `CODESPACES_CORE_HOURS` (default 120).
 
 * **Start command:** `HERMES_HOME=/opt/render/project/src/.hermes_home HERMES_DISABLE_LAZY_INSTALLS=1 python3 blackthorn_start.py`
 * **Build command (recommended):**
@@ -47,12 +56,12 @@ Render builds `main` from GitHub automatically. Required environment variables (
 
 `GET /api/version` returns the commit Render built (`RENDER_GIT_COMMIT`), the UI build hash, and an **integrity check**:
 every shipped file is re-hashed and compared with `blackthorn/MANIFEST.json`. Any out-of-band modification of the deployed
-tree appears as `integrity.drift`, is logged at startup, and is shown in the sidebar footer. The sidebar footer and the GPU
+tree appears as `integrity.drift`, is logged at startup, and is shown in the sidebar footer. The sidebar footer and the Codespaces
 panel also show `v<version> · <commit>`.
 
 ## Public remote sample analysis (Proton WireGuard)
 
-The agent has `malware_analyzer_submit` (one selected file in the computer's `malware_samples/` directory) and `malware_analyzer_report` (SHA-256 lookup). Submissions go to MalwareAnalyzer's public unauthenticated REST API, **not** to an on-Kaggle malware VM. All submitted bytes and results may be public; only submit files approved for public release. A successful submit does not establish that the provider detonated the file; inspect the report's `dynamicDegraded` and behavior fields. Local `sample_triage` remains read-only static triage.
+The agent has `malware_analyzer_submit` (one selected file in the computer's `malware_samples/` directory) and `malware_analyzer_report` (SHA-256 lookup). Submissions go to MalwareAnalyzer's public unauthenticated REST API, **not** to a lab VM. All submitted bytes and results may be public; only submit files approved for public release. A successful submit does not establish that the provider detonated the file; inspect the report's `dynamicDegraded` and behavior fields. Local `sample_triage` remains read-only static triage.
 
 Configure `BLACKTHORN_MA_WG_CONFIG_B64` **only in Render's secret environment**, containing a base64-encoded Proton WireGuard profile (do not commit it or place it in D1). The userspace WireGuard client is a SHA-256-pinned `wireproxy` release, downloaded on first use to `/tmp` and bound to loopback. A dedicated HTTP CONNECT client uses `trust_env=False`, no redirects, an IP-literal VPN endpoint and DNS inside the tunnel. It compares direct and proxied public IP echoes before use and refuses uploads/lookup if unconfigured or the exit cannot be verified. There is **no direct connection fallback** to MalwareAnalyzer. The authenticated `GET /api/malware-analyzer/egress` checks the Render-side tunnel and provider without revealing either IP or sending a sample. `GET /api/malware-analyzer/report/{sha256}` returns only the public verdict and dynamic-analysis status, through that same verified exit. Provisioning or reconnecting can add seconds to the first remote tool call. Use a dedicated WireGuard profile for the Render process; starting the same profile on a second machine (including a local test client) can cause WireGuard endpoint roaming and interrupt the tunnel. A stalled proxy is restarted once and reverified before any remote call. A failed report GET can be retried once via the verified proxy; a public submission POST is never replayed automatically. The service provider, VPN operator, public sample content, and timing may still identify a submitter; this is not an untraceability guarantee. The browser and general-purpose tools are not forced through this VPN.
 
@@ -67,9 +76,23 @@ answer is saved progressively and finalised exactly once (`stop | length | cance
 
 ## Model context budget
 
-The model server runs with a **4096-token** window. The system prompt is ~150 tokens, tool schemas ~800, history is trimmed to fit,
-tool output is clipped (~3 200 chars) and older tool output is stubbed when the window fills. Raise it by changing the Kaggle
-engine's context size (`QWEN38_NUM_CTX`) *and* `BLACKTHORN_CONTEXT_TOKENS` on Render.
+The agent plans against `BLACKTHORN_CONTEXT_TOKENS` (default 131 072, well inside Nemotron 3 Ultra's window). The
+system prompt is small, tool schemas are counted separately, history is trimmed to fit and tool output is clipped;
+older tool output is stubbed when the window fills. There is no engine to reconfigure — the number is a planning
+budget, and the provider enforces its own hard limit.
+
+## Codespaces: the agent's computer
+
+* **Starts on demand.** Any computer tool call (`run_command`, `read_file`, `write_file`, …) calls `ensure_running`,
+  which reuses the one codespace for the repository (never a second one) and waits for its agent to attach.
+* **Stops when the task is finished.** `maybe_stop` refuses while a run is executing, while a tool call is in flight,
+  or before `CODESPACE_IDLE_STOP_SECONDS` of real inactivity. Nothing is deleted: the container keeps its disk, so
+  files, installed packages and task progress survive and a later task resumes them.
+* **Reconnect, don't re-create.** Stopping is not deleting; `handover()` stops and starts the same codespace, and the
+  agent re-registers on boot. A job that was in flight when the container died is re-queued once.
+* **Honest usage.** `GET /api/codespaces/usage` reports the monthly allowance, hours measured from the intervals the
+  app observed the machine running, the remainder and the percentage. GitHub's billing API needs a `Plan`-scoped
+  token for personal accounts; without it the panel says "measured" instead of inventing a figure.
 
 ## Develop & test
 
@@ -91,9 +114,9 @@ without rebuilding `blackthorn/static`.
   The login sets an HttpOnly, Secure, SameSite=Strict cookie and refreshes it for active users. Settings can
   change the password; that invalidates older sessions across workers. Keep the site behind Cloudflare Access
   as additional protection. Neither the password nor the signing key belongs in Git or D1 in plaintext.
-* The public GPU status never contains the tunnel URL, gateway key or account identifiers.
-* The gateway key is generated per Kaggle boot (`bt-…`) and published to D1 by the notebook. A previous constant key remains in
-  old Git history: treat it as compromised (it stops working at the next GPU boot).
+* No model credential is ever sent to the browser; `/api/health` reports only the provider, model id and whether a key is configured.
+* The codespace agent authenticates with a session token it generates and keeps on the codespace disk. The app accepts
+  that token only from a container that proves ownership with the `GITHUB_TOKEN` GitHub injects into it.
 
 ---
 
@@ -102,8 +125,7 @@ without rebuilding `blackthorn/static`.
 | Module | Responsibility |
 | --- | --- |
 | `recovery.py` | Classifies every tool outcome as `ok` / `invalid` / `duplicate` / `infra` / `logic` and supplies bounded retry policies (exponential backoff + jitter + hard deadline). Infrastructure failures are the *environment's* fault, so they are retried and never counted as the model repeating itself. |
-| `lifecycle.py` | Sandbox-lifecycle manager. Five minutes before the provider TTL it publishes a durable checkpoint, creates an overlapping replacement sandbox, restores and verifies the workspace, promotes the replacement, then deletes the old VM. Failures roll back to the still-live sandbox and are retried with backoff. |
-| `panda_keys.py` | PandaStack key pool. Verifies each key against `/v1/me` and `/v1/usage`, projects exhaustion from the provider's own month-to-date rollup + configured budget, and rotates ~5 minutes before the projected limit (or immediately on 401/402/403/429). Only 12-character fingerprints are ever logged or stored. |
+| `codespace_computer.py` | Power management for the codespace: start on demand, stop when idle, restart to resume, and a refusal to stop while work is in flight. |
 | `computer_assets/skillctl.py` | One registry over Anthropic-Cybersecurity-Skills (811 loadable playbooks of 818 indexed), Claude-Red (68 offensive playbooks) and hackingtool-plugin (183 executable tools) — 879 skills / 183 tools in total, counted from the filesystem so nothing unloadable is advertised: discovery, loading, `preflight`, and install-once execution with real exit codes. |
 | `computer_assets/browse.py` | Camoufox controller: open / click / type / scroll / screenshot / accessibility / tabs / download / close, with crash-relaunch, timeout retry, session persistence and bot-challenge *detection* (never a false claim of solving). |
 | `computer_assets/bootstrap.sh` | Idempotent bootstrap for a replacement sandbox: workspace layout, all three repositories, the unified registry, Camoufox and the base utilities. |
@@ -118,14 +140,13 @@ without rebuilding `blackthorn/static`.
    *completed* against an unchanged workspace can strike, and even then the model is first told to
    change strategy. `BLACKTHORN_MAX_RECOVERY_ROUNDS` bounds the automatic recovery rounds.
 
-### Live verification (PandaStack, this deployment)
+### Live verification (real Codespaces, this deployment)
 
-Two scripts exist because "it works in a unit test" is not evidence:
+"Works in a unit test" is not evidence, so a live script exercises the real service:
 
 | Script | What it proves |
 | --- | --- |
-| `blackthorn/scripts/live_acceptance.py` | Real provider: creates the managed sandbox, runs python/git on it, publishes a workspace checkpoint to the private GitHub drive, performs a full handover (replacement created → workspace restored → probe → promoted → old VM deleted), proves a file written *before* the handover is readable *after*, clones all three repositories in the guest, builds the 879-skill/183-tool registry, and releases every sandbox it created. |
-| `blackthorn/scripts/live_browser_test.py` | Real Camoufox inside a real microVM: install (disk-backed scratch), browser fetch, then open / click / type+submit / scroll / screenshot / accessibility / tabs / download / challenge detection / session persistence / close, plus "no browser processes left behind". |
+| `blackthorn/scripts/live_codespaces.py` | Real GitHub Codespaces: start → run a command → write a file → stop → start again → read the same file back (the disk survived), plus the idle-refusal rule and a duplicate check (exactly one codespace for the repository). |
 | `blackthorn/scripts/smoke_catalog.py` | The cybersecurity tools through the **real ToolRegistry** against a real catalogue: `cyber_preflight`, `skill_search`, `tool_search`, `skill_load`, `cyber_run` (including honest refusal of an entry with no command and rejection of a malformed id), and that no credential travels to the computer. |
 
 Operational notes learned from the live run:
@@ -152,9 +173,10 @@ Operational notes learned from the live run:
 
 | Variable | Purpose |
 | --- | --- |
-| `PANDASTACK_API_KEY` (+ `_2`, `_3`, … or comma-separated `PANDASTACK_API_KEYS`) | Authorized keys available for rotation |
-| `PANDASTACK_MONTHLY_BUDGET_USD` | Optional cap used only when the provider reports none (`monthly_budget_usd: 0`) |
-| `PANDASTACK_ROTATE_BEFORE_SECONDS` | Rotation lead time (default 300) |
-| `PANDASTACK_HANDOVER_WINDOW_SECONDS` | Handover lead time (default 300) |
-| `PANDASTACK_LIFECYCLE_INTERVAL_SECONDS` | Lifecycle tick (default 60) |
+| `NVIDIA_API_KEY` | The model credential (NVIDIA API catalog) |
+| `BLACKTHORN_MODEL` | Model id (default `nvidia/nemotron-3-ultra-550b-a55b`) |
+| `COMPUTER_DRIVE_GITHUB_PAT` | Codespaces-capable PAT: creates/starts/stops the computer and reads its repository |
+| `CODESPACE_REPO` / `CODESPACE_MACHINE` | Repository and machine type for the computer (default `jadeniran21/Computer-drive`, `basicLinux32gb`) |
+| `CODESPACE_IDLE_STOP_SECONDS` / `CODESPACE_POWER_INTERVAL_SECONDS` | Idle window before an automatic stop (300) and how often the power loop checks (30) |
+| `PANDASTACK_LAB_API_KEY` | Only for the separate malware lab; the computer no longer uses PandaStack |
 | `BLACKTHORN_MAX_STRIKES` / `BLACKTHORN_MAX_RECOVERY_ROUNDS` / `BLACKTHORN_TOOL_ATTEMPTS` | Execution-continuity bounds |

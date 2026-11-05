@@ -1,4 +1,4 @@
-import type { GpuStatus, Message, Session, VersionInfo } from './types'
+import type { CodespaceStatus, CodespaceUsage, Message, Session, VersionInfo } from './types'
 
 export class ApiError extends Error {
   status: number
@@ -64,13 +64,12 @@ export const api = {
       request<{ session: Session }>(`/api/chat/sessions/${encodeURIComponent(id)}`, { method: 'PATCH', ...json(body) }).then((r) => r.session),
     remove: (id: string) => request<{ ok: boolean }>(`/api/chat/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   },
-  gpu: {
-    status: (refresh = false) => request<GpuStatus>(`/api/kaggle-gpu/status${refresh ? '?refresh=true' : ''}`, { timeoutMs: 30000 }),
-    turnOn: () => request<GpuStatus>('/api/kaggle-gpu/turn-on', { method: 'POST', timeoutMs: 60000 }),
-    turnOff: () => request<GpuStatus>('/api/kaggle-gpu/turn-off', { method: 'POST', ...json({ confirm: true }), timeoutMs: 180000 }),
-    activity: () => request<{ auto_off_minutes: number; choices: number[] }>('/api/kaggle-gpu/activity'),
-    setAutoOff: (minutes: number) => request<{ auto_off_minutes: number }>('/api/kaggle-gpu/auto-off', { method: 'POST', ...json({ minutes }) }),
-    logs: () => request<{ lines: string[]; error?: string }>('/api/kaggle-gpu/logs?limit=80', { timeoutMs: 25000 }),
+  codespaces: {
+    status: (refresh = false) => request<CodespaceStatus>(`/api/codespaces/status${refresh ? '?refresh=true' : ''}`, { timeoutMs: 30000 }),
+    usage: () => request<CodespaceUsage>('/api/codespaces/usage', { timeoutMs: 30000 }),
+    start: () => request<{ ok: boolean }>('/api/codespaces/start', { method: 'POST', timeoutMs: 240000 }),
+    stop: () => request<{ ok: boolean; stopped?: boolean; reason?: string; detail?: string }>('/api/codespaces/stop', { method: 'POST', timeoutMs: 180000 }),
+    restart: () => request<{ ok: boolean }>('/api/codespaces/restart', { method: 'POST', timeoutMs: 420000 }),
   },
   prompt: {
     get: () => request<{ prompt: string }>('/api/system-prompt').then((r) => r.prompt),

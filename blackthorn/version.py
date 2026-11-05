@@ -22,9 +22,7 @@ ROOT = Path(__file__).resolve().parent.parent
 MANIFEST_PATH = Path(__file__).resolve().parent / "MANIFEST.json"
 STARTED_AT = time.time()
 
-TRACKED = (
-    "blackthorn_start.py", "cloudflare_d1_client.py", "kaggle_cyber_ornith/cyber_ornith_server.py",
-)
+TRACKED = ("blackthorn_start.py",)
 TRACKED_DIRS = ("blackthorn",)
 SKIP_PARTS = {"__pycache__", "ui", "node_modules", "tests"}
 SKIP_FILES = {"MANIFEST.json"}

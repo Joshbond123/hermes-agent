@@ -90,7 +90,7 @@ async def test_healthy_stream_still_completes(upstream):
 async def test_silent_model_fails_at_first_byte_watchdog(upstream):
     # Production idle window is 120 s; the first-byte watchdog must fire well before it.
     events, err, elapsed = await _run(upstream, "hang", first_byte=2, idle=120)
-    assert isinstance(err, LLMError) and err.code == "gpu_stalled" and err.retryable
+    assert isinstance(err, LLMError) and err.code == "model_stalled" and err.retryable
     assert elapsed < 6, f"stall took {elapsed:.1f}s; first-byte watchdog did not fire"
 
 
@@ -99,14 +99,14 @@ async def test_dead_route_is_reported_as_unreachable_not_as_a_stall(upstream):
     import socket
     sock = socket.socket(); sock.bind(("127.0.0.1", 0)); dead = sock.getsockname()[1]; sock.close()
     events, err, elapsed = await _run(f"http://127.0.0.1:{dead}", "x", first_byte=2, idle=120)
-    assert isinstance(err, LLMError) and err.code in ("gpu_unreachable", "gpu_dropped") and err.retryable
+    assert isinstance(err, LLMError) and err.code in ("model_unreachable", "model_dropped") and err.retryable
     assert elapsed < 6
 
 
 async def test_stall_after_first_chunk_uses_idle_window(upstream):
     events, err, elapsed = await _run(upstream, "midstall", first_byte=2, idle=3)
     assert [e["v"] for e in events if e["t"] == "content"] == ["hi"]
-    assert isinstance(err, LLMError) and err.code == "gpu_stalled"
+    assert isinstance(err, LLMError) and err.code == "model_stalled"
     assert 2.5 < elapsed < 8, f"idle window not honoured ({elapsed:.1f}s)"
 
 

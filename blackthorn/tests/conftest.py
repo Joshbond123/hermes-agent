@@ -4,6 +4,7 @@ import asyncio
 import time
 import json
 import time
+import os
 from pathlib import Path
 from typing import AsyncIterator, Dict, List
 
@@ -15,6 +16,7 @@ from blackthorn.app import build_services, create_app
 from blackthorn.config import Settings
 from blackthorn.sql import SqliteExecutor
 
+from .fake_codespaces import BackendBridge, FakeChannel, FakeCodespaceAPI
 from .fakes import FakeBackend, ServerThread
 
 pytest_plugins = ("pytest_asyncio",)
@@ -23,17 +25,23 @@ pytest_plugins = ("pytest_asyncio",)
 class Stack:
     """The real Blackthorn app + the fake model/computer backend, both on real sockets."""
 
-    def __init__(self, backend: FakeBackend, backend_srv: ServerThread, app_srv: ServerThread, services, executor):
+    def __init__(self, backend: FakeBackend, backend_srv: ServerThread, app_srv: ServerThread, services, executor,
+                 codespaces=None):
         self.backend, self.backend_srv, self.app_srv = backend, backend_srv, app_srv
         self.services, self.executor = services, executor
+        self.codespaces = codespaces
         self.url = app_srv.url
 
-    async def set_gpu(self, status: str = "HEARTBEAT_ONLINE", url: str | None = None, key: str = "test-key") -> None:
-        await self.executor.query("DELETE FROM kaggle_gpu_state")
-        await self.executor.query(
-            "INSERT INTO kaggle_gpu_state (id, status, tunnel_url, api_key, model, gpu_info, updated_at) VALUES ('primary', ?, ?, ?, 'fake-model', 'T4', ?)",
-            [status, self.backend_srv.url if url is None else url, key, time.time()])
+    async def set_model(self, url: str | None = None, key: str = "test-key", model: str = "nvidia/nemotron-3-ultra-550b-a55b") -> None:
+        """Point the NVIDIA route at the fake OpenAI-compatible backend (or at nothing at all)."""
+        os.environ["NVIDIA_BASE_URL"] = self.backend_srv.url if url is None else url
+        os.environ["NVIDIA_API_KEY"] = key
+        os.environ["BLACKTHORN_MODEL"] = model
         self.services.resolver.invalidate()
+
+    def computer(self):
+        """The fake codespace the app is wired to."""
+        return self.codespaces
 
     async def stream(self, payload: Dict, client: httpx.AsyncClient | None = None) -> "Streamed":
         """POST /api/chat/stream and collect every SSE event with its arrival time."""
@@ -98,8 +106,15 @@ class Streamed:
         return self.of("run.start")[0]["session_id"]
 
 
+def fake_codespace(services, *, backend_url: str = "", state: str = "ON", name: str = "blackthorn-test-abc123"):
+    """Attach a fake codespace computer to a Services instance (no network, real manager code)."""
+    from .fake_codespaces import attach_fake_codespace
+    return attach_fake_codespace(services, backend_url, name=name, state=state)
+
+
 @pytest_asyncio.fixture
 async def stack(tmp_path) -> AsyncIterator[Stack]:
+    saved_env = {k: os.environ.get(k) for k in ("NVIDIA_BASE_URL", "NVIDIA_API_KEY", "BLACKTHORN_MODEL")}
     backend = FakeBackend()
     backend_srv = ServerThread(backend.app).start()
     executor = SqliteExecutor(":memory:")
@@ -107,106 +122,64 @@ async def stack(tmp_path) -> AsyncIterator[Stack]:
     services = build_services(settings, executor=executor, static_dir=tmp_path / "static")
     (tmp_path / "static" / "assets").mkdir(parents=True)
     (tmp_path / "static" / "index.html").write_text("<!doctype html><title>t</title>")
-    app = create_app(settings, services=services, gpu_daemon=False)
+    app = create_app(settings, services=services)
     app_srv = ServerThread(app).start()
     s = Stack(backend, backend_srv, app_srv, services, executor)
+    s.codespaces = fake_codespace(services, backend_url=backend_srv.url)
+    s.services.computer = s.codespaces            # the tools must talk to the codespace, not the network
     await services.store.ensure_schema()
-    await s.set_gpu()
+    await s.set_model()
     try:
         yield s
     finally:
         app_srv.stop()
         backend_srv.stop()
+        for key, value in saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 # ======================================================================================================
-# Real-browser fixtures: the production UI build served by the real app, a scripted GPU controller.
+# Real-browser fixtures: the production UI build served by the real app and a fake codespace.
 # ======================================================================================================
-class FakeD1:
-    """Stand-in for ``cloudflare_d1_client`` with a deterministic boot sequence (one stage per status poll)."""
-
-    SEQUENCE = ["BOOTING_KAGGLE_GPU", "CHECKING_ENVIRONMENT", "CHECKING_CACHE", "DOWNLOADING_MODEL", "STARTING_OLLAMA", "LOADING_MODEL", "WARMING_GPU"]
-
-    def __init__(self, status: str = "GPU_STOPPED_SAVING_QUOTA"):
-        self.status = status
-        self.stage = 0
-        self.calls: list = []
-        self.auto_off = 0
-        self.boot_started = None
-
-    def _state(self) -> dict:
-        s = self.status
-        booting = s in self.SEQUENCE
-        ready = s == "HEARTBEAT_ONLINE"
-        return {"active": ready, "booting": booting, "status": s, "tunnel_url": "https://hidden.example" if (ready or booting) else "",
-                "api_key": "must-not-leak", "display_status": "Kaggle Ready" if ready else ("Starting Kaggle" if booting else "Kaggle Offline"),
-                "engine_state": "ready" if ready else ("starting" if booting else "off"), "model": "Fake-Model", "model_loaded": True if ready else None,
-                "gpu_info": "Tesla T4 + Tesla T4" if (ready or booting) else ("FAILED: Kaggle refused the kernel push" if s == "BOOT_FAILED" else ""), "progress_step": s.replace("_", " ").title() if booting else "",
-                "quota": {"used_hours": 19.8, "total_hours": 30.0, "remaining_hours": 10.2, "used_pct": 66.0, "refresh_time": "2026-10-10T00:00:00Z"},
-                "detail": json.dumps({"label": "Downloading the model", "bytes_done": 4_200_000_000, "bytes_total": 16_800_000_000}) if s == "DOWNLOADING_MODEL" else "",
-                "cloudflare_d1": {"account_id": "acct", "database_id": "db"}, "busy": False, "worker_status": "RUNNING" if ready else "OFF"}
-
-    def get_kaggle_gpu_status(self, refresh=False):
-        if self.status in self.SEQUENCE:
-            self.stage += 1
-            self.status = self.SEQUENCE[self.stage] if self.stage < len(self.SEQUENCE) else "HEARTBEAT_ONLINE"
-        return self._state()
-
-    def public_gpu_status(self, state):
-        import cloudflare_d1_client as real
-        return real.public_gpu_status(state)
-
-    def turn_on_kaggle_gpu(self, blocking=False):
-        self.calls.append("on")
-        self.status, self.stage = self.SEQUENCE[0], 0
-        self.boot_started = time.time()
-        return self._state()
-
-    def turn_off_kaggle_gpu(self):
-        self.calls.append("off")
-        self.status = "GPU_STOPPED_SAVING_QUOTA"
-        return self._state()
-
-    def activity_snapshot(self): return {"idle_seconds": 3.0, "active_tasks": 0, "busy": False}
-    def auto_off_decision(self): return {"enabled": self.auto_off > 0, "minutes": self.auto_off, "should_stop": False}
-    def get_auto_off_minutes(self): return self.auto_off
-    def set_auto_off_minutes(self, m):
-        if m not in (0, 5, 10, 15, 30, 60):
-            raise ValueError("bad choice")
-        self.auto_off = m
-        return m
-    def _gateway_api_key(self): return "test-key"
-
-
 UI_DIR = Path(__file__).resolve().parents[1] / "static"
 
 
 @pytest_asyncio.fixture
 async def ui_stack() -> AsyncIterator[Stack]:
-    from blackthorn.gpu import GpuService
+    saved_env = {k: os.environ.get(k) for k in ("NVIDIA_BASE_URL", "NVIDIA_API_KEY", "BLACKTHORN_MODEL")}
     backend = FakeBackend()
     backend_srv = ServerThread(backend.app).start()
     executor = SqliteExecutor(":memory:")
     settings = Settings(store="sqlite", heartbeat_s=0.5, tool_timeout_s=5.0)
     services = build_services(settings, executor=executor, static_dir=UI_DIR)
-    fake_d1 = FakeD1("HEARTBEAT_ONLINE")
-    services.gpu = GpuService(services.store, fake_d1)
-    app = create_app(settings, services=services, gpu_daemon=False)
+    app = create_app(settings, services=services)
     app_srv = ServerThread(app).start()
     s = Stack(backend, backend_srv, app_srv, services, executor)
-    s.d1 = fake_d1  # type: ignore[attr-defined]
+    s.codespaces = fake_codespace(services, backend_url=backend_srv.url)
+    s.services.computer = s.codespaces
     await services.store.ensure_schema()
-    await s.set_gpu()
+    await s.set_model()
     try:
         yield s
     finally:
         app_srv.stop()
         backend_srv.stop()
+        for key, value in saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 @pytest_asyncio.fixture
 async def browser():
-    from playwright.async_api import async_playwright
+    # Browser tests need playwright + chromium; skip cleanly where they are not installed instead of
+    # reporting a false failure of the product.
+    playwright = pytest.importorskip("playwright.async_api")
+    async_playwright = playwright.async_playwright
     async with async_playwright() as p:
         b = await p.chromium.launch(args=["--no-sandbox"])
         try:

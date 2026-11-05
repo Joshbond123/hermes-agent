@@ -1,4 +1,8 @@
-"""Streaming client for the OpenAI-compatible endpoint exposed by the Kaggle gateway."""
+"""Streaming client for the OpenAI-compatible endpoint that serves the agent's model.
+
+NVIDIA's hosted endpoint and any other OpenAI-compatible provider work through the same code path;
+provider-specific request fields are added only for the providers that accept them.
+"""
 
 from __future__ import annotations
 
@@ -62,6 +66,9 @@ async def server_context(client: httpx.AsyncClient, route: Route, timeout: float
     retry. llama.cpp reports the real window on /props; a gateway that does not implement it is
     simply unknown, and the caller keeps its configured budget.
     """
+    if (getattr(route, "provider", "") or "") not in ("llamacpp", ""):
+        # Hosted providers publish no runtime settings endpoint; the configured budget is used.
+        return 0
     headers = {**tunnel_headers(route.url), "Authorization": f"Bearer {route.api_key}"}
     for path in ("/props", "/v1/props"):
         try:
@@ -87,9 +94,10 @@ async def server_context(client: httpx.AsyncClient, route: Route, timeout: float
 
 
 async def route_alive(client: httpx.AsyncClient, route: Route) -> bool:
-    """Cheap liveness probe of the GPU route, used only to label a silent stream (dead vs slow)."""
+    """Cheap liveness probe of the model route, used only to label a silent stream (dead vs slow)."""
+    path = "/health" if (getattr(route, "provider", "") == "llamacpp") else "/v1/models"
     try:
-        resp = await client.get(f"{route.url}/health", headers={**tunnel_headers(route.url), "Authorization": f"Bearer {route.api_key}"},
+        resp = await client.get(f"{route.url}{path}", headers={**tunnel_headers(route.url), "Authorization": f"Bearer {route.api_key}"},
                                 timeout=httpx.Timeout(8.0, connect=5.0))
         return resp.status_code == 200
     except Exception:  # noqa: BLE001 - a failed probe is simply 'not alive'
@@ -135,13 +143,16 @@ async def stream_chat(route: Route, messages: List[Dict[str, Any]], *, client: h
     * ``finish``    {"v": reason}
     * ``usage``     {"prompt": n, "completion": n}
     """
+    provider = getattr(route, "provider", "nvidia") or "nvidia"
     body: Dict[str, Any] = {"model": route.model, "messages": messages, "stream": True,
                             "stream_options": {"include_usage": True}}
     if tools:
         body["tools"] = tools
         body["tool_choice"] = "auto"
     body["max_tokens"] = int(max_tokens or 8192)
-    body.setdefault("keep_alive", "30m")
+    if provider == "llamacpp":
+        # llama.cpp keeps a model resident between requests; other providers reject the field.
+        body.setdefault("keep_alive", "30m")
     if temperature is not None:
         body["temperature"] = temperature
     if extra:
@@ -161,9 +172,9 @@ async def stream_chat(route: Route, messages: List[Dict[str, Any]], *, client: h
         except asyncio.TimeoutError as exc:
             alive = await route_alive(client, route)
             if alive:
-                raise LLMError("gpu_stalled", f"The model sent no response within {int(first_byte_timeout)}s (GPU is online); the request was closed and will be retried.",
+                raise LLMError("model_stalled", f"The model sent no response within {int(first_byte_timeout)}s (the endpoint is online); the request was closed and will be retried.",
                                retryable=True) from exc
-            raise LLMError("gpu_unreachable", f"No response from the GPU within {int(first_byte_timeout)}s and its route is not answering; retrying on a fresh connection.",
+            raise LLMError("model_unreachable", f"No response from the model provider within {int(first_byte_timeout)}s; retrying on a fresh connection.",
                            retryable=True) from exc
         if resp.status_code != 200:
             detail = _error_text(await resp.aread())
@@ -172,12 +183,12 @@ async def stream_chat(route: Route, messages: List[Dict[str, Any]], *, client: h
             if resp.status_code in (401, 403):
                 # No model output has been accepted on a non-200 response. The caller may
                 # refresh the D1 route and retry this model step (never its earlier tools).
-                raise LLMError("gpu_auth", "The GPU gateway did not accept this request's access key.",
+                raise LLMError("model_auth", "The model provider did not accept this request's access key.",
                                status=resp.status_code)
             if resp.status_code in DEAD_TUNNEL_CODES:
-                raise LLMError("gpu_unreachable", f"The GPU tunnel is unreachable (HTTP {resp.status_code}).",
+                raise LLMError("model_unreachable", f"The model endpoint is unreachable (HTTP {resp.status_code}).",
                                retryable=True, status=resp.status_code)
-            raise LLMError("gpu_http", f"The GPU endpoint returned HTTP {resp.status_code}: {detail}",
+            raise LLMError("model_http", f"The model endpoint returned HTTP {resp.status_code}: {detail}",
                            retryable=resp.status_code >= 500, status=resp.status_code)
         lines = resp.aiter_lines().__aiter__()
         first_line = True
@@ -189,9 +200,9 @@ async def stream_chat(route: Route, messages: List[Dict[str, Any]], *, client: h
                 break
             except asyncio.TimeoutError as exc:
                 if first_line:
-                    raise LLMError("gpu_stalled", f"The model sent no output within {int(first_byte_timeout)}s; the request was closed and will be retried.",
+                    raise LLMError("model_stalled", f"The model sent no output within {int(first_byte_timeout)}s; the request was closed and will be retried.",
                                    retryable=True) from exc
-                raise LLMError("gpu_stalled", f"The model produced no output for {int(idle_timeout)}s and the request was abandoned.",
+                raise LLMError("model_stalled", f"The model produced no output for {int(idle_timeout)}s and the request was abandoned.",
                                retryable=True) from exc
             first_line = False
             if not raw.startswith("data:"):
@@ -209,7 +220,7 @@ async def stream_chat(route: Route, messages: List[Dict[str, Any]], *, client: h
                 message = _error_text(json.dumps({"error": obj["error"]}).encode())
                 if _is_overflow(message):
                     raise ContextOverflow("context_overflow", message)
-                raise LLMError("gpu_stream", message, retryable=False)
+                raise LLMError("model_stream", message, retryable=False)
             usage = obj.get("usage") if isinstance(obj, dict) else None
             if isinstance(usage, dict) and usage.get("completion_tokens") is not None:
                 yield {"t": "usage", "prompt": int(usage.get("prompt_tokens") or 0),
@@ -232,13 +243,13 @@ async def stream_chat(route: Route, messages: List[Dict[str, Any]], *, client: h
             if choice.get("finish_reason"):
                 yield {"t": "finish", "v": str(choice["finish_reason"])}
     except httpx.ConnectTimeout as exc:
-        raise LLMError("gpu_unreachable", "Timed out connecting to the GPU tunnel.", retryable=True) from exc
+        raise LLMError("model_unreachable", "Timed out connecting to the model endpoint.", retryable=True) from exc
     except httpx.ConnectError as exc:
-        raise LLMError("gpu_unreachable", "Could not connect to the GPU tunnel (it may have stopped).", retryable=True) from exc
+        raise LLMError("model_unreachable", "Could not connect to the model endpoint.", retryable=True) from exc
     except httpx.ReadTimeout as exc:
-        raise LLMError("gpu_stalled", f"The model produced no output for {int(idle_timeout)}s and the request was abandoned.", retryable=True) from exc
+        raise LLMError("model_stalled", f"The model produced no output for {int(idle_timeout)}s and the request was abandoned.", retryable=True) from exc
     except (httpx.RemoteProtocolError, httpx.ReadError) as exc:
-        raise LLMError("gpu_dropped", "The connection to the GPU dropped mid-response.", retryable=True) from exc
+        raise LLMError("model_dropped", "The connection to the model dropped mid-response.", retryable=True) from exc
     finally:
         # Always close the upstream connection: a stalled or abandoned stream must not keep
         # a dead socket in the pool for the next request.

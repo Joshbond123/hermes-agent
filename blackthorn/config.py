@@ -27,7 +27,7 @@ class Settings:
     sqlite_path: str = field(default_factory=lambda: os.environ.get("BLACKTHORN_SQLITE_PATH", "blackthorn-dev.sqlite3"))
     session_source: str = "blackthorn-studio"  # value of sessions.source for chats created here
 
-    # ---- model context budget (MUST match the Kaggle engine window: QWEN38_NUM_CTX, default 8192) ----
+    # ---- model context budget (the agent's planning budget; Nemotron itself allows far more) ----
     # When these disagree the engine rejects long steps (ContextOverflow) and the run
     # thrashes on trimming — one of the real causes of mid-task interruptions.
     # completion_reserve is what is kept free for the answer *inside* that same window

@@ -17,14 +17,15 @@ from . import __version__
 from .auth import AuthMiddleware, router as auth_router
 from .api import Services, router
 from .config import Settings, get_settings
-from .gpu import GpuService
+from .codespace_channel import CodespaceChannel
+from .codespace_computer import CodespaceComputer
+from .codespaces import CodespaceAPI, CodespaceError
 from .llm import new_http_client
 from .route import RouteResolver
 from .runs import RunManager
 from .sql import D1Executor, SqliteExecutor
 from .store import ChatStore
 from .tools import default_registry
-from .tools.computer import ComputerClient
 from .tools.web import TavilyKeys
 
 log = logging.getLogger("blackthorn")
@@ -46,45 +47,34 @@ def build_services(settings: Settings, *, executor: Any = None, http: Any = None
     store = ChatStore(executor, source=settings.session_source, backend=backend)
     http = http or new_http_client()
     resolver = RouteResolver(store)
-    fleet = None
-    try:
-        from .fleet import FleetManager, accounts_from_env
-        accounts = accounts_from_env(os.environ)
-        if accounts:
-            fleet = FleetManager(accounts)
-    except Exception as exc:  # noqa: BLE001 - the studio must run even without fleet accounts
-        log.warning("fleet not configured: %s", exc)
-    # The Panda route is opt-in. Never fall back to Kaggle when a configured
-    # PandaStack sandbox fails; its filesystem is a different computer.
-    panda_key = os.environ.get("PANDASTACK_API_KEY", "").strip()
-    panda_id = os.environ.get("PANDASTACK_SANDBOX_ID", "").strip()
-    drive_key = os.environ.get("COMPUTER_DRIVE_GITHUB_PAT", "").strip()
-    if bool(panda_key) != bool(drive_key):
-        raise ValueError("PandaStack computer requires both private provider and drive credentials")
-    key_pool = None
-    lifecycle = None
     runs = RunManager(ttl=settings.run_ttl_s, max_active=settings.max_active_runs)
-    if panda_key:
-        from .panda_computer import PandaComputerClient
-        from .panda_keys import PandaKeyPool
-        from .lifecycle import SandboxLifecycle, DEFAULT_WINDOW_S
-        try:
-            key_pool = PandaKeyPool.from_env(http, store)
-        except Exception as exc:  # noqa: BLE001 - a bad pool must not stop the app
-            log.error("PandaStack key pool unavailable: %s", type(exc).__name__)
-            key_pool = None
-        computer = PandaComputerClient(http, api_key=key_pool or panda_key, sandbox_id=panda_id,
-                                       github_token=drive_key, store=store, key_pool=key_pool)
-        try:
-            window = float(os.environ.get("PANDASTACK_HANDOVER_WINDOW_SECONDS") or DEFAULT_WINDOW_S)
-        except ValueError:
-            window = DEFAULT_WINDOW_S
-        lifecycle = SandboxLifecycle(store, computer, window_s=window)
-        # The lifecycle must be able to see running agent turns, so it never rotates
-        # (or hibernates) the computer out from under an active task.
-        lifecycle.runs = runs
+    # ---------------------------------------------------------------- the computer
+    # GitHub Codespaces is the agent's computer: a machine that is created on demand, keeps its disk
+    # across stop/start, and is reached through a channel its own agent opens outwards. The token is
+    # the private drive PAT that already lives in the environment; without it the app still runs,
+    # it simply has no computer and says so.
+    codespaces = None
+    computer = None
+    channel = None
+    repo = (os.environ.get("CODESPACE_REPO") or "jadeniran21/Computer-drive").strip()
+    cs_token = (os.environ.get("COMPUTER_DRIVE_GITHUB_PAT") or os.environ.get("CODESPACE_GITHUB_TOKEN") or "").strip()
+    if cs_token:
+        channel = CodespaceChannel(store)
+        api = CodespaceAPI(http, cs_token, repo=repo, owner=(os.environ.get("CODESPACE_OWNER") or "").strip(),
+                           machine=(os.environ.get("CODESPACE_MACHINE") or "").strip(),
+                           idle_timeout_minutes=int(os.environ.get("CODESPACE_IDLE_MINUTES") or 30),
+                           retention_minutes=int(os.environ.get("CODESPACE_RETENTION_MINUTES") or 4320))
+        computer = CodespaceComputer(
+            http, api, channel=channel, store=store,
+            idle_stop_s=int(os.environ.get("CODESPACE_IDLE_STOP_SECONDS") or 300),
+            busy=lambda: bool(runs.active_count() if hasattr(runs, "active_count") else False))
+        codespaces = computer
+        log.info("computer: GitHub Codespaces (%s)", repo)
     else:
-        computer = ComputerClient(resolver, http, store=store)
+        from .codespace_computer import UnconfiguredComputer
+        computer = UnconfiguredComputer()
+        log.warning("computer: no Codespaces token configured; computer tools will report it unavailable")
+
     # Skills + tools live in the GitHub drive and are restored onto every computer and
     # lab VM, so a replaced microVM never loses its capability catalog.
     capabilities = None
@@ -111,11 +101,9 @@ def build_services(settings: Settings, *, executor: Any = None, http: Any = None
             log.error("malware lab unavailable: %s", type(exc).__name__)
             lab = None
     return Services(settings=settings, store=store, resolver=resolver, registry=default_registry(), http=http,
-                    tavily=TavilyKeys(store), computer=computer,
-                    runs=runs,
-                    gpu=GpuService(store), static_dir=static_dir or STATIC_DIR, fleet=fleet,
-                    key_pool=key_pool, lifecycle=lifecycle, lab=lab,
-                    capabilities=capabilities)
+                    tavily=TavilyKeys(store), computer=computer, runs=runs,
+                    codespaces=codespaces, static_dir=static_dir or STATIC_DIR, channel=channel,
+                    lab=lab, capabilities=capabilities)
 
 
 
@@ -146,10 +134,9 @@ class SecurityHeadersMiddleware:
         await self.app(scope, receive, send_with_headers)
 
 
-def create_app(settings: Optional[Settings] = None, *, services: Optional[Services] = None, gpu_daemon: Optional[bool] = None) -> FastAPI:
+def create_app(settings: Optional[Settings] = None, *, services: Optional[Services] = None) -> FastAPI:
     settings = settings or get_settings()
     bt = services or build_services(settings)
-    start_daemon = (os.environ.get("BLACKTHORN_GPU_DAEMON", "1") == "1" and settings.resolved_store() == "d1") if gpu_daemon is None else gpu_daemon
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -167,123 +154,43 @@ def create_app(settings: Optional[Settings] = None, *, services: Optional[Servic
         from .version import overlay_status
         if overlay_status().get("active"):
             log.error("INTEGRITY: a code overlay was extracted over the checkout at build time; running code may differ from Git")
-        if start_daemon:
-            try:
-                import cloudflare_d1_client
-                cloudflare_d1_client.start_permanent_gpu_daemon()
-            except Exception as exc:
-                log.error("GPU watchdog could not start: %s", exc)
-        if bt.fleet is not None:
-            import threading
-
-            def _fleet_watchdog() -> None:
-                roles = ("model",) if os.environ.get("PANDASTACK_API_KEY") else ("model", "computer")
-                active = {role: bt.fleet.state[role].active for role in roles}
-                while True:
-                    try:
-                        for role in roles:
-                            before = active[role]
-                            st = bt.fleet.decide(role)
-                            if st.active != before:
-                                active[role] = st.active
-                                log.warning("fleet failover: %s %s -> %s (%s)", role, before, st.active, st.reason)
-                                try:
-                                    import cloudflare_d1_client as _d1
-                                    # A watchdog on Render startup sees "primary" as its
-                                    # initial slot. Invalid primary credentials must not
-                                    # resurrect a user-stopped backup computer/model.
-                                    if _d1._role_intended_online(role) and not _d1._role_boot_in_progress(role):
-                                        _d1.failover_fleet_role(role, before, st.active)
-                                    else:
-                                        log.info("fleet %s switched standby slot without booting an off role", role)
-                                except Exception:  # noqa: BLE001
-                                    log.exception("failover execution failed for %s", role)
-                    except Exception:  # noqa: BLE001 - a watchdog must survive anything
-                        log.exception("fleet watchdog tick failed")
-                    import time as _t
-                    _t.sleep(60)
-
-            threading.Thread(target=_fleet_watchdog, daemon=True, name="fleet-watchdog").start()
-        panda_watchdog = None
-        if os.environ.get("PANDASTACK_API_KEY"):
+        power_task = None
+        if bt.codespaces is not None:
             import asyncio
-            from .panda_control import PandaControl, INTENT, SANDBOX
-            from .route import BOOTING
 
-            async def _panda_power_watchdog():
-                while True:
-                    try:
-                        intent = await bt.store.get_setting(INTENT)
-                        row = await bt.store.gpu_row()
-                        state = str(row.get("status") or "").upper()
-                        controller = PandaControl(bt.store, bt.http)
-                        if intent == "on" and state in {"OFF", "OFFLINE", "GPU_STOPPED_SAVING_QUOTA", "STOPPED", "BOOT_FAILED", "GPU_UNAVAILABLE"}:
-                            log.warning("model GPU is off; stopping linked PandaStack computer")
-                            await controller.stop()
-                        elif intent == "off" and state in (BOOTING | {"MODEL_READY_COLD", "MODEL_READY_AND_WARMED", "HEARTBEAT_ONLINE", "ONLINE"}):
-                            # A failed model boot may be restarted by the fleet watchdog
-                            # after we hibernated the computer. Wake an existing VM once;
-                            # never rotate expired sandboxes merely to evade tier TTL.
-                            if await bt.store.get_setting(SANDBOX):
-                                owned = await controller._owned()
-                                if len(owned) == 1 and str(owned[0].get("status") or "").lower() == "hibernated":
-                                    await controller.start()
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        log.error("PandaStack power reconciliation failed: %s", type(exc).__name__)
-                    await asyncio.sleep(15)
+            async def _codespace_power_loop() -> None:
+                """Automatic power management: stop the computer when it is genuinely idle.
 
-            panda_watchdog = asyncio.create_task(_panda_power_watchdog())
-        lifecycle_task = None
-        rotation_task = None
-        if bt.lifecycle is not None:
-            import asyncio
-            from .lifecycle import lifecycle_daemon
-
-            async def _activity() -> bool:
-                # True while any run is streaming: an active task must not be cut by a TTL reap.
+                ``maybe_stop`` refuses while a run is executing, while a tool call is in flight and
+                while the idle window has not elapsed, so a task is never cut off mid-command. The
+                task starts the computer on demand instead (any computer tool call does), so this
+                loop only ever has to switch it off — and, if it was left running by a previous
+                process, to notice and adopt it.
+                """
+                interval = 30.0
                 try:
-                    return bool(bt.runs.active_count()) if hasattr(bt.runs, "active_count") else bool(bt.runs._active)
-                except Exception:  # noqa: BLE001
-                    return False
-
-            async def _quota_rotation():
-                pool = bt.key_pool
+                    interval = float(os.environ.get("CODESPACE_POWER_INTERVAL_SECONDS") or 30)
+                except ValueError:
+                    interval = 30.0
                 while True:
                     try:
-                        state = await pool.ensure_active()
-                        if not state.valid:
-                            log.error("PandaStack: no usable API key remains; affected operations are paused")
+                        result = await bt.codespaces.maybe_stop()
+                        if result.get("stopped"):
+                            log.info("codespace stopped automatically (%s idle)", result.get("reason"))
                     except asyncio.CancelledError:
                         raise
-                    except Exception as exc:  # noqa: BLE001
-                        log.error("PandaStack key rotation check failed: %s", type(exc).__name__)
-                    await asyncio.sleep(60)
+                    except Exception as exc:  # noqa: BLE001 - the loop must outlive any single failure
+                        log.error("codespace power check failed: %s", type(exc).__name__)
+                    await asyncio.sleep(interval)
 
-            try:
-                interval = float(os.environ.get("PANDASTACK_LIFECYCLE_INTERVAL_SECONDS") or 60)
-            except ValueError:
-                interval = 60.0
-            lifecycle_task = asyncio.create_task(
-                lifecycle_daemon(bt.store, bt.computer, interval=interval,
-                                 window_s=bt.lifecycle.window_s, activity=_activity))
-            if bt.key_pool is not None:
-                rotation_task = asyncio.create_task(_quota_rotation())
+            power_task = asyncio.create_task(_codespace_power_loop())
         try:
             yield
         finally:
-            for task in (locals().get("lifecycle_task"), locals().get("rotation_task")):
-                if task is not None:
-                    task.cancel()
-                    try:
-                        await task
-                    except __import__("asyncio").CancelledError:
-                        pass
-            if panda_watchdog is not None:
-                panda_watchdog.cancel()
+            if power_task is not None:
+                power_task.cancel()
                 try:
-                    await panda_watchdog
+                    await power_task
                 except __import__("asyncio").CancelledError:
                     pass
         await bt.runs.shutdown()
@@ -297,7 +204,7 @@ def create_app(settings: Optional[Settings] = None, *, services: Optional[Servic
     app.include_router(auth_router)
 
     # Pure ASGI, not @app.middleware("http"): BaseHTTPMiddleware wraps every response in its own
-    # stream and does not propagate a client disconnect into a streaming body, which left GPU relay
+    # stream and does not propagate a client disconnect into a streaming body, which left
     # generators running with nobody reading them. Headers are added on the start message only.
     app.add_middleware(SecurityHeadersMiddleware)
     app.add_middleware(AuthMiddleware)

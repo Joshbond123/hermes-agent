@@ -39,12 +39,15 @@ DRIVE_BUNDLE = "capabilities/catalog.tar.gz"
 DRIVE_META = "capabilities/latest.json"
 FORMAT = 2
 
-# Same three upstream repositories the catalog indexes. ``dir`` must match
-# skillctl.SOURCES so the restored tree works with no extra configuration.
+# Same upstream repositories the catalog indexes. ``dir`` must match skillctl.SOURCES so the
+# restored tree works with no extra configuration.
 SOURCES: Dict[str, Dict[str, str]] = {
     "anthropic": {"repo": "mukul975/Anthropic-Cybersecurity-Skills", "dir": "anthropic-cybersecurity-skills"},
     "claude-red": {"repo": "SnailSploit/Claude-Red", "dir": "claude-red"},
     "hackingtool": {"repo": "AKCodez/hackingtool-plugin", "dir": "hackingtool-plugin"},
+    # Process skills: how to brainstorm, plan, test, debug, review and verify. They ship with the
+    # catalog so every computer (and every lab VM) can load them the moment a task needs one.
+    "superpowers": {"repo": "obra/superpowers", "dir": "superpowers"},
 }
 
 # Only text a skill needs at run time. Upstream assets (images, screenshots, videos)

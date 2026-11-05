@@ -33,24 +33,12 @@ Each upload creates a *draft* release, streams 128 MiB assets into it, and publi
 
 **What stays in the lab:** the sample bytes and anything it dropped are never copied to the working computer or the GitHub drive; only a redacted text report is archived under `malware_lab/reports/`. No API key, token or credential is ever written into the lab VM. Static inspection (`sample_triage`) remains the default and needs no lab at all.
 
-## Key rotation, computer failover, and the lab's internet
+## The lab's key role
 
-**Every PandaStack request** — list, exec, delete, create and the lab — is signed with the pool
-(`PANDASTACK_API_KEY`, `PANDASTACK_API_KEY_2..9`, `PANDASTACK_API_KEYS`), not with a single account.
-Creation walks the pool: a `401/402/403/429` marks that account unusable for the moment, rotates the
-persisted active fingerprint and tries the next key, and each attempt is recorded so a real failure
-reports per-account status instead of one opaque error. A single rate-limited key can no longer make the
-provider look "not configured" or stop the computer from starting.
-
-**Failover ladder for the computer:** rotated keys → `code-interpreter` template → the lab-style `base`
-template used as a stand-in (`role: lab-fallback`, with `fallback_reason` carrying the primary error).
-"All the computers failed" means every configured account refused the create; then the click fails with
-both reasons attached, and no VM is left running — a VM whose exec probe fails or throws is deleted before
-the error is raised.
-
-**GPU turn-on** starts the computer first and only then submits the Kaggle kernel, so a GPU session is
-never paid for while the agent has no computer; if the GPU does not come up, the computer is powered off
-again. `GET /api/kaggle-gpu/status` reports `computer_ready` only when both halves are live.
+**Every PandaStack request** is signed with the lab account's key (`PANDASTACK_LAB_API_KEY`, or
+`PANDASTACK_SANDBOX_LAB_KEY`). The working computer no longer uses PandaStack at all — it is a GitHub
+Codespace — so a lab credential and a computer credential can never be confused, and no PandaStack key is
+needed for ordinary work.
 
 **The lab has internet.** Its microVM must reach the network or the lab refuses to open
 (`BLACKTHORN_LAB_INTERNET=off` relaxes this). A detonation chooses what the *sample* gets:

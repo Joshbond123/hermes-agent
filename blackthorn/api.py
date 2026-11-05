@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import logging
 import time
 from dataclasses import dataclass, field
@@ -39,20 +40,17 @@ class Services:
     tavily: Any
     computer: Any
     runs: RunManager
-    gpu: Any
+    codespaces: Any             # the CodespaceComputer: the agent's own computer (power-managed)
     static_dir: Path
-    relay_hub: Any = None
-    fleet: Any = None
-    key_pool: Any = None        # PandaStack API-key pool (rotation, quota projection)
-    lifecycle: Any = None       # sandbox lifecycle manager (TTL handover)
+    channel: Any = None         # command channel to the in-codespace agent
     lab: Any = None             # dedicated malware/ransomware execution lab (own provider account)
-    capabilities: Any = None    # drive-hosted skills/tools restored onto every VM
+    capabilities: Any = None    # drive-hosted skills/tools restored onto every machine
     _prompt_cache: tuple = field(default=(0.0, ""))
     _memory_cache: tuple = field(default=(0.0, ()))
 
     def deps(self) -> Deps:
         return Deps(settings=self.settings, store=self.store, resolver=self.resolver, registry=self.registry,
-                    http=self.http, tavily=self.tavily, computer=self.computer, activity=self.gpu,
+                    http=self.http, tavily=self.tavily, computer=self.computer, activity=self.codespaces,
                     lab=self.lab)
 
     async def user_prompt(self) -> str:
@@ -430,187 +428,231 @@ class AutoOffBody(BaseModel):
     minutes: int
 
 
-def _gpu_error(exc: Exception) -> HTTPException:
-    log.warning("gpu operation failed: %s", exc)
-    return _err(502, "gpu_control_failed", f"GPU control failed: {type(exc).__name__}: {str(exc)[:160]}")
 
 
-def _relay_overlay(request: Request, out: dict) -> dict:
-    """Readiness must reflect the link, not just the control-plane row. A GPU whose relay has stopped
-    answering is reported as not ready (with the reason) instead of "online" until someone notices."""
-    hubs = getattr(svc(request), "relay_hubs", None) or {}
-    for role, key in (("model", None), ("computer", "computer")):
-        hub = hubs.get(role)
-        target = out if key is None else out.get(key)
-        if hub is None or not isinstance(target, dict) or not target.get("online") or target.get("host") == "PandaStack":
-            continue
-        if target.get("transport") == "inrok":
-            # Direct Inrok tunnel: the notebook does not run the relay long-poll client, so relay liveness
-            # says nothing about the GPU. Readiness comes from the heartbeat and the tunnel itself.
-            continue
-        health = hub.health()
-        target["relay"] = health
-        if health["stalled"]:
-            target["online"] = False
-            target["display_status"] = f"{'Model' if key is None else 'Computer'} link stalled — not answering"
-            target["error"] = "The GPU relay did not answer the last requests. Requests are not being sent to a dead link."
-        elif not health["alive"]:
-            target["online"] = False
-            target["display_status"] = "Waiting for the GPU relay to reconnect"
-    return out
+def _computer(request: Request) -> Any:
+    computer = svc(request).codespaces
+    if computer is None:
+        raise _err(503, "computer_unconfigured", "No codespace computer is configured on this server.")
+    return computer
 
 
-@router.get("/api/kaggle-gpu/status")
-async def gpu_status(request: Request, refresh: bool = False):
-    try:
-        out = await svc(request).gpu.status(refresh=refresh)
-    except Exception as exc:
-        raise _gpu_error(exc)
-    return _relay_overlay(request, out)
+# ----------------------------------------------------------------- codespaces: power
+CODESPACE_CORE_HOURS_DEFAULT = 120.0     # GitHub's included Codespaces core-hours per month
 
 
-@router.post("/api/kaggle-gpu/turn-on")
-async def gpu_on(request: Request):
+def _cores(machine: str) -> int:
+    """Core count from a machine type name (``basicLinux32gb`` -> 2, ``standardLinux32gb`` -> 4)."""
+    table = {"basiclinux32gb": 2, "standardlinux32gb": 4, "premiumlinux64gb": 8}
+    return table.get(str(machine or "").lower(), 2)
+
+
+@router.get("/api/codespaces/status")
+async def codespaces_status(request: Request, refresh: bool = False):
+    """Everything the usage controller shows: power state, live link, and measured hours."""
     s = svc(request)
+    computer = s.codespaces
+    if computer is None:
+        raise _err(503, "computer_unconfigured", "No codespace computer is configured on this server.")
     try:
-        out = await s.gpu.turn_on()
-    except Exception as exc:
-        raise _gpu_error(exc)
-    s.resolver.invalidate()
-    return out
-
-
-@router.post("/api/kaggle-gpu/turn-off")
-async def gpu_off(body: OffBody, request: Request):
-    s = svc(request)
-    if not body.confirm:
-        raise _err(422, "confirm_required", "Turning the GPU off stops the model session. Send {\"confirm\": true} to proceed.")
-    live = s.runs.active_count()
-
-    async def stop_once():
-        return await s.gpu.turn_off() if body.role == "all" else await s.gpu.turn_off(role=body.role)
-
-    # A power-off is idempotent, so a transient upstream failure (a Kaggle API ReadTimeout was
-    # observed taking the whole turn-off down with 'gpu_control_failed') must be retried here
-    # rather than handed to the operator as a refusal. Two attempts, then an honest error.
-    out = None
-    last: Exception | None = None
-    for attempt in range(2):
+        out = await computer.status()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("codespace status failed: %s", exc)
+        raise _err(502, "codespace_status_failed", f"{type(exc).__name__}: {str(exc)[:160]}") from exc
+    out["link"] = s.channel.presence(out.get("name") or "") if s.channel is not None else {}
+    out["channel"] = s.channel.summary() if s.channel is not None else {}
+    if refresh:
         try:
-            out = await stop_once()
-            break
-        except Exception as exc:  # noqa: BLE001 - retried, then reported with its reason
-            last = exc
-            kind = type(exc).__name__.lower()
-            transient = any(word in kind for word in ("timeout", "connect", "readerror", "remotedisconnected")) \
-                or "timed out" in str(exc).lower()
-            if not transient:
-                raise _gpu_error(exc)
-            await asyncio.sleep(2.0 + 2.0 * attempt)
-    if out is None:
-        raise _gpu_error(last if last is not None else RuntimeError("turn-off failed"))
-    s.resolver.invalidate()
-    out["interrupted_runs"] = live if out.get("turn_off_ok") else 0
+            out["codespace"] = (await computer.lifecycle_snapshot()).get("codespace") or {}
+        except Exception as exc:  # noqa: BLE001
+            out["codespace"] = {"error": type(exc).__name__}
     return out
 
 
-@router.get("/api/kaggle-gpu/activity")
-async def gpu_activity(request: Request):
+@router.post("/api/codespaces/start")
+async def codespaces_start(request: Request):
+    computer = _computer(request)
     try:
-        return await svc(request).gpu.activity()
-    except Exception as exc:
-        raise _gpu_error(exc)
+        return await computer.ensure_running()
+    except Exception as exc:  # noqa: BLE001
+        raise _err(502, "codespace_start_failed", f"{type(exc).__name__}: {str(exc)[:200]}") from exc
 
 
-@router.post("/api/kaggle-gpu/auto-off")
-async def gpu_auto_off(body: AutoOffBody, request: Request):
+@router.post("/api/codespaces/stop")
+async def codespaces_stop(request: Request, force: bool = False):
+    computer = _computer(request)
     try:
-        return await svc(request).gpu.set_auto_off(body.minutes)
-    except ValueError as exc:
-        raise _err(422, "invalid", str(exc))
-    except Exception as exc:
-        raise _gpu_error(exc)
+        return await computer.stop(reason="manual", force=force)
+    except Exception as exc:  # noqa: BLE001
+        raise _err(502, "codespace_stop_failed", f"{type(exc).__name__}: {str(exc)[:200]}") from exc
 
 
-@router.get("/api/kaggle-gpu/logs")
-async def gpu_logs(request: Request, limit: int = Query(120, ge=1, le=300)):
-    return await svc(request).gpu.logs(limit)
-
-
-# --------------------------------------------------------------------------- fleet (4-GPU failover)
-_SECRET_ROW_FIELDS = {"api_key", "tunnel_url", "token", "password", "secret"}
-
-
-def _public_row(row: Any) -> dict:
-    if not isinstance(row, dict):
-        return {}
-    return {k: v for k, v in row.items() if k not in _SECRET_ROW_FIELDS and "key" not in k.lower()}
-
-
-@router.get("/api/fleet/status")
-async def fleet_status(request: Request, refresh: bool = False):
-    s = svc(request)
-    if s.fleet is None:
-        return {"configured": False}
+@router.post("/api/codespaces/restart")
+async def codespaces_restart(request: Request):
+    """Resume unfinished work: stop and start the same codespace, keeping its disk."""
+    computer = _computer(request)
     try:
-        if refresh:
-            for role in (("model",) if __import__("os").environ.get("PANDASTACK_API_KEY") else ("model", "computer")):
-                s.fleet.decide(role, force=True)
-        else:
-            s.fleet.refresh_slots()
-        out = {"configured": True, **s.fleet.status()}
-        if __import__("os").environ.get("PANDASTACK_API_KEY"):
-            out.pop("computer", None)
-            out["computer_provider"] = "PandaStack"
-        try:
-            # Public view only: the gateway key and tunnel URL are secrets and must never leave the server.
-            if __import__("os").environ.get("PANDASTACK_API_KEY"):
-                out["live"] = {"model": _public_row(await s.store.gpu_row())}
-            else:
-                out["live"] = {role: _public_row(row) for role, row in
-                               (("model", await s.store.gpu_row()), ("computer", await s.store.computer_row()))}
-        except Exception:  # noqa: BLE001
-            out["live"] = {}
-        return out
-    except Exception as exc:  # noqa: BLE001 - the panel must show errors, not 500
-        return {"configured": True, "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+        return await computer.handover(reason="manual")
+    except Exception as exc:  # noqa: BLE001
+        raise _err(502, "codespace_restart_failed", f"{type(exc).__name__}: {str(exc)[:200]}") from exc
 
 
-@router.post("/api/fleet/decide")
-async def fleet_decide(request: Request):
-    s = svc(request)
-    if s.fleet is None:
-        raise _err(503, "fleet_unconfigured", "No fleet accounts are configured on this server.")
-    out = {}
-    for role in (("model",) if __import__("os").environ.get("PANDASTACK_API_KEY") else ("model", "computer")):
-        st = s.fleet.decide(role, force=True)
-        out[role] = {"active": st.active, "reason": st.reason}
+@router.get("/api/codespaces/usage")
+async def codespaces_usage(request: Request):
+    """Monthly Codespaces hours: the allowance, what has been measured, what is left.
+
+    The consumed figure is measured from the intervals the app itself observed (recorded while the
+    codespace was running). When the GitHub token also carries the Plan permission, GitHub's own
+    billing figure is returned instead and labelled as such — the panel never invents a number.
+    """
+    computer = _computer(request)
+    status = await computer.status()
+    state = str(status.get("state") or "OFF")
+    machine = ((await computer.lifecycle_snapshot()).get("codespace") or {}).get("machine") or ""
+    machine = machine if isinstance(machine, str) else str((machine or {}).get("name") or "")
+    cores = _cores(machine)
+    allowance_core_hours = float(os.environ.get("CODESPACES_CORE_HOURS") or CODESPACE_CORE_HOURS_DEFAULT)
+    if os.environ.get("CODESPACES_MONTHLY_HOURS"):
+        allowance_hours = float(os.environ["CODESPACES_MONTHLY_HOURS"])
+        basis = "configured monthly hours (CODESPACES_MONTHLY_HOURS)"
+    else:
+        allowance_hours = allowance_core_hours / max(1, cores)
+        basis = f"{allowance_core_hours:g} included core-hours per month / {cores} cores"
+    measured_s = await computer.ledger.seconds_this_month()
+    out: Dict[str, Any] = {
+        "provider": "GitHub Codespaces",
+        "state": state,
+        "running": state == "ON",
+        "agent_using": bool(status.get("agent_using")),
+        "agent_connected": bool(status.get("agent_connected")),
+        "name": status.get("name") or "",
+        "machine": machine or "basicLinux32gb",
+        "cores": cores,
+        "hours_total": round(allowance_hours, 2),
+        "hours_used": round(measured_s / 3600.0, 2),
+        "hours_basis": basis,
+        "usage_source": "measured" if measured_s else "measured (nothing recorded yet this month)",
+        "month": time.strftime("%Y-%m", time.gmtime()),
+        "updated_at": int(time.time()),
+        "idle_stop_seconds": status.get("idle_stop_seconds"),
+    }
+    out["hours_remaining"] = round(max(0.0, allowance_hours - out["hours_used"]), 2)
+    out["percent_used"] = round(min(100.0, (out["hours_used"] / allowance_hours) * 100.0), 1) if allowance_hours else 0.0
+    if state == "ON":
+        # Live projection: what the month will cost if the current session keeps running.
+        session_s = float(status.get("idle_seconds") or 0)
+        out["projected_hours"] = round(out["hours_used"] + session_s / 3600.0, 2)
     return out
 
 
-@router.get("/api/computer/session")
-async def computer_session(request: Request):
-    """Provider-reported computer session state, quota projection and rotation history.
+# ------------------------------------------------------- codespaces: agent channel
+class RegisterBody(BaseModel):
+    name: str
+    port: int = 8787
+    token: str
+    version: str = ""
 
-    Secrets never appear here: keys are represented only by short fingerprints.
+
+@router.post("/api/codespaces/register")
+async def codespaces_register(request: Request, body: RegisterBody):
+    """An agent inside a codespace announces itself, proving identity with its GitHub token.
+
+    The token must belong to the configured owner *and* be able to read the very codespace that is
+    registering; only then is its session token accepted.
     """
     s = svc(request)
-    out: dict = {"provider": "PandaStack" if s.key_pool is not None or getattr(s.computer, "key_pool", None) else "relay"}
+    if s.codespaces is None or s.channel is None:
+        raise _err(503, "computer_unconfigured", "No codespace computer is configured on this server.")
+    header = request.headers.get("authorization") or ""
+    github_token = header[7:].strip() if header.lower().startswith("bearer ") else ""
+    if not github_token:
+        raise _err(401, "missing_token", "Registration requires the codespace's GitHub token.")
+    api = s.codespaces.api
     try:
-        if hasattr(s.computer, "lifecycle_snapshot"):
-            out["session"] = await s.computer.lifecycle_snapshot()
+        me = await _github_get(s.http, github_token, "/user")
+        login = str((me or {}).get("login") or "")
+        if not login:
+            raise _err(401, "bad_token", "The supplied token is not a valid GitHub token.")
+        if api.owner and login.lower() != api.owner.lower():
+            raise _err(403, "wrong_owner", f"This token belongs to {login}, not to the configured owner.")
+        cs = await _github_get(s.http, github_token, f"/user/codespaces/{body.name}")
+        owner = str(((cs or {}).get("owner") or {}).get("login") or "")
+        if not cs or not cs.get("name"):
+            raise _err(404, "codespace_unknown", "That codespace is not visible to the supplied token.")
+        if owner and owner.lower() != login.lower():
+            raise _err(403, "foreign_codespace", "That codespace belongs to a different account.")
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise _err(502, "github_unreachable", f"Could not verify the token with GitHub: {type(exc).__name__}") from exc
+    await s.channel.accept_registration(body.name, body.token)
+    s.channel.touch(body.name, version=body.version, port=body.port)
+    log.info("codespace agent registered: %s (%s)", body.name, body.version)
+    return {"ok": True, "name": body.name, "owner": login}
+
+
+@router.get("/api/codespaces/pull")
+async def codespaces_pull(request: Request, name: str = "", version: str = "", port: int = 0):
+    """Long-poll: the agent asks for the next unit of work."""
+    s = svc(request)
+    if s.channel is None:
+        raise _err(503, "computer_unconfigured", "No codespace channel is configured on this server.")
+    if not name:
+        raise _err(400, "missing_name", "The agent must identify its codespace.")
+    header = request.headers.get("authorization") or ""
+    token = header[7:].strip() if header.lower().startswith("bearer ") else ""
+    expected = await s.channel.token_for(name)
+    if not expected or token != expected:
+        raise _err(401, "unknown_agent", "This codespace agent is not registered.")
+    job = await s.channel.pull(name, version=version, port=port)
+    if s.codespaces is not None:
+        s.codespaces.note_activity()
+    return job
+
+
+@router.post("/api/codespaces/result/{job_id}")
+async def codespaces_result(request: Request, job_id: str):
+    """The agent posts the outcome of one job."""
+    s = svc(request)
+    if s.channel is None:
+        raise _err(503, "computer_unconfigured", "No codespace channel is configured on this server.")
+    body = await request.json()
+    accepted = s.channel.submit_result(job_id, body if isinstance(body, dict) else {})
+    if s.codespaces is not None:
+        s.codespaces.note_activity()
+    return {"ok": True, "accepted": accepted}
+
+
+async def _github_get(http: httpx.AsyncClient, token: str, path: str) -> Dict[str, Any]:
+    resp = await http.get(f"https://api.github.com{path}", timeout=30.0,
+                          headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+                                   "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "Blackthorn-Codespaces"})
+    if resp.status_code != 200:
+        raise _err(resp.status_code if resp.status_code in (401, 403, 404) else 502, "github_error",
+                   f"GitHub {path} returned HTTP {resp.status_code}")
+    try:
+        return resp.json()
+    except ValueError:
+        return {}
+
+
+# ----------------------------------------------------------------- computer session
+@router.get("/api/computer/session")
+async def computer_session(request: Request):
+    """Computer session state for the operator: power state, live link, workspace and events."""
+    s = svc(request)
+    out: Dict[str, Any] = {"provider": "GitHub Codespaces"}
+    computer = s.codespaces
+    if computer is None:
+        out["session"] = {"state": "OFF", "error": "unconfigured"}
+        return out
+    try:
+        out["session"] = await computer.lifecycle_snapshot()
     except Exception as exc:  # noqa: BLE001
         out["session"] = {"error": type(exc).__name__}
-    pool = s.key_pool if s.key_pool is not None else getattr(s.computer, "key_pool", None)
-    if pool is not None:
-        try:
-            out["keys"] = pool.snapshot()
-            out["rotation_threshold_s"] = pool.threshold_s
-        except Exception as exc:  # noqa: BLE001
-            out["keys"] = [{"error": type(exc).__name__}]
+    out["link"] = s.channel.presence(out["session"].get("name") or "") if s.channel is not None else {}
     try:
-        import json
-        raw = await s.store.get_setting("pandastack_lifecycle_log")
+        raw = await s.store.get_setting("codespace_events")
         out["lifecycle_events"] = (json.loads(raw) if raw else [])[-10:]
     except Exception:  # noqa: BLE001
         out["lifecycle_events"] = []
@@ -619,45 +661,13 @@ async def computer_session(request: Request):
 
 @router.post("/api/computer/checkpoint")
 async def computer_checkpoint(request: Request):
-    """Owner-only durability barrier before a reset or failover.
-
-    Never advertise success until the computer confirms the dataset version published.
-    """
+    """Durability barrier: the codespace writes its checkpoint to the persistent disk."""
     try:
         result = await svc(request).computer.call("/computer/checkpoint", {}, timeout=230.0,
                                                   idempotent=False)
     except ToolError as exc:
-        # Report the computer's real reason (offline / storage / unsupported), not a
-        # generic failure: the operator needs to know what actually broke.
         raise _err(502, "checkpoint_failed",
                    "Checkpoint failed: " + (str(getattr(exc, "message", "") or exc) or "the computer did not confirm it")) from exc
     if not result.get("ok"):
         raise _err(502, "checkpoint_failed", str(result.get("error") or "Checkpoint not published")[:160])
     return result
-
-
-@router.post("/api/fleet/sync")
-async def fleet_sync(request: Request):
-    """Mirror the computer pair's state dataset (primary -> backup) on demand."""
-    s = svc(request)
-    if __import__("os").environ.get("PANDASTACK_API_KEY"):
-        raise _err(410, "retired", "Kaggle computer dataset mirroring is retired; the active computer uses a private GitHub drive.")
-    if s.fleet is None:
-        raise _err(503, "fleet_unconfigured", "No fleet accounts are configured on this server.")
-    from .fleet import mirror_state_dataset
-    primary = s.fleet.by_slot.get(("computer", "primary"))
-    backup = s.fleet.by_slot.get(("computer", "backup"))
-    if primary is None or backup is None:
-        raise _err(503, "pair_incomplete", "Both computer accounts are required for sync.")
-    import asyncio as _a
-    try:
-        result = await _a.to_thread(mirror_state_dataset, primary, backup)
-    except Exception as exc:  # noqa: BLE001
-        raise _err(502, "sync_failed", f"{type(exc).__name__}: {str(exc)[:160]}")
-    return result
-
-
-# --------------------------------------------------------------------------- durable GPU relay
-from . import relay as _relay  # noqa: E402  (registered last: owns /gpu-relay/* and /api/kaggle-relay/*)
-
-_relay.register(router)

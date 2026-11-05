@@ -48,7 +48,7 @@ def _format(raw: bytes) -> dict:
 
 
 def _root() -> Path:
-    workspace = Path(os.environ.get("BLACKTHORN_WORKSPACE") or "/kaggle/working/blackthorn_workspace")
+    workspace = Path(os.environ.get("BLACKTHORN_WORKSPACE") or "/workspaces/blackthorn")
     root = workspace / "malware_samples"
     # Do not follow a redirected quarantine folder into the host or credentials.
     if root.is_symlink() or workspace.is_symlink():

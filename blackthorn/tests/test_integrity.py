@@ -18,8 +18,7 @@ SECRET_PATTERNS = [r"cfut_[A-Za-z0-9]{16,}", r"KGAT_[A-Za-z0-9]{16,}", r"tvly-[A
 
 
 def tracked_product_files():
-    names = subprocess.run(["git", "ls-files", "-co", "--exclude-standard", "blackthorn", "blackthorn_start.py", "cloudflare_d1_client.py",
-                            "kaggle_cyber_ornith", "KAGGLE_COMPUTER_ARCHITECTURE.md", "docs"],
+    names = subprocess.run(["git", "ls-files", "-co", "--exclude-standard", "blackthorn", "blackthorn_start.py", "docs"],
                            cwd=ROOT, capture_output=True, text=True).stdout.split()
     return [ROOT / n for n in names if (ROOT / n).is_file() and "node_modules" not in n]
 

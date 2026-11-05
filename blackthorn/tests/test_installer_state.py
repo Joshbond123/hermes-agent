@@ -54,17 +54,20 @@ def test_installed_tool_is_reproved_and_reinstalled_when_gone(inst, monkeypatch,
     assert reinstalled == ["demo"]                                # probe failed on this runtime -> reinstall
 
 
-def test_kaggle_cancelling_packages_are_never_installed(inst, monkeypatch):
+def test_the_previously_cancelled_packages_install_normally_now(inst, monkeypatch):
     calls = []
     monkeypatch.setattr(inst, "apt_installed", lambda pkg: False)
     monkeypatch.setattr(inst, "run", lambda cmd, timeout, cwd=None: calls.append(cmd) or {"cmd": cmd, "rc": 0, "seconds": 0, "tail": ""})
     monkeypatch.setattr(inst, "save", lambda reg: None)
     reg = {"base": []}
     inst.apt_base(reg)
+    # These used to cancel the old notebook session, so they were skipped. A codespace is a normal
+    # Ubuntu container: they must be in the apt line and nothing may be skipped.
     for pkg in ("hydra", "john", "hashcat", "aircrack-ng"):
-        assert not any(c.endswith(" " + pkg) for c in calls), pkg
-        assert any(b["pkg"] == pkg and b["status"] == "skipped_kaggle_session_cancel" for b in reg["base"])
-    assert any(c.endswith(" nmap") for c in calls)            # scanners that work on Kaggle are still installed
+        assert pkg in inst.APT_BASE, pkg
+        assert not any(b.get("status") == "blocked" for b in reg["base"]), pkg
+    assert any(c.endswith(" nmap") for c in calls)
+    assert "apt-get update" in " ".join(c for c in calls)
 
 
 def test_caches_are_not_on_the_workspace(inst):

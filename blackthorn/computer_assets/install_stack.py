@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Install the Blackthorn security stack on the Kaggle computer. Runs ON THE COMPUTER, as root, Ubuntu 24.04.
+"""Install the Blackthorn security stack on the agent's computer. Runs ON THE COMPUTER (a GitHub
+Codespace, Ubuntu): root through passwordless sudo, and the codespace disk persists across stop/start.
 
-Everything persistent goes under WS (/kaggle/working/blackthorn_workspace, a 20 GB volume that survives
-runtime restarts). The registry is WS/tools/registry.json: one entry per catalog tool with every step's
+Everything persistent goes under WS (/workspaces/blackthorn, the codespace's persistent disk). The registry is WS/tools/registry.json: one entry per catalog tool with every step's
 exit code and output tail, plus a probe that runs the tool's own run command.
 
 Policy:
@@ -25,7 +25,7 @@ from pathlib import Path
 
 WS = Path(os.environ.get("BLACKTHORN_WS",
                          "/workspace/blackthorn_workspace" if Path("/workspace").is_dir()
-                         else "/kaggle/working/blackthorn_workspace"))
+                         else "/workspaces/blackthorn"))
 TOOLS = WS / "tools"
 HOME = TOOLS / "home"
 VENV = TOOLS / "venv"
@@ -41,8 +41,11 @@ HELD = re.compile(r"\|\s*(sudo\s+)?(sh|bash)\b|\|\s*sudo\s+(sh|bash|tar)|sudo\s+
 # Kaggle cancelled the computer kernel every time these were installed (reproduced 2/2 on 2026-10-10: the session
 # was CANCEL_ACKNOWLEDGED within ~1 min of the install starting; the same host survived scanner, forensics and
 # general package installs). They are NOT installed on Kaggle. Run them on a host that permits them.
-KAGGLE_BLOCKED_PACKAGES = ["hydra", "john", "hashcat", "aircrack-ng"]
-KAGGLE_BLOCKED_TOOL_WORDS = ("hydra", "john-the-ripper", "hashcat", "aircrack")
+# These used to be skipped because installing them cancelled the old notebook session. A codespace
+# is an ordinary Ubuntu container with passwordless sudo, so they install like anything else.
+BLOCKED_PACKAGES: list = []
+BLOCKED_TOOL_WORDS: tuple = ()
+IS_ROOT = os.geteuid() == 0
 
 APT_BASE = [
     "git", "unzip", "jq", "golang-go", "ruby-full", "python3-venv", "python3-pip", "build-essential", "pkg-config",
@@ -50,6 +53,7 @@ APT_BASE = [
     "nmap", "masscan", "dnsutils", "whois", "netcat-openbsd", "socat", "tcpdump", "binwalk", "foremost", "steghide",
     "exiftool", "file", "binutils", "yara", "sqlmap", "nikto", "gobuster",
     "dirb", "sslscan", "smbclient", "proxychains4", "radare2", "strace", "ltrace", "gdb",
+    "hydra", "john", "hashcat", "aircrack-ng",
 ]
 
 
@@ -115,9 +119,8 @@ def apt_installed(pkg: str) -> bool:
 
 
 def apt_base(reg: dict) -> None:
-    for pkg in KAGGLE_BLOCKED_PACKAGES:
-        reg["base"].append({"pkg": pkg, "rc": None, "status": "skipped_kaggle_session_cancel",
-                            "tail": "Kaggle cancels the computer session on this install; run it elsewhere"})
+    for pkg in BLOCKED_PACKAGES:
+        reg["base"].append({"pkg": pkg, "rc": None, "status": "blocked", "tail": "blocked by policy"})
     todo = [p for p in APT_BASE if not apt_installed(p)]
     if not todo:
         return
@@ -170,7 +173,8 @@ def install_tool(tool: dict, reg: dict) -> dict:
         if re.search(r"\bsudo\s+su\b", cmd):
             entry["status"] = "held_review"
             continue
-        clean = re.sub(r"\bsudo\s+", "", cmd)  # we are root; sudo would prompt
+        # The codespace user is not root: keep sudo (it is passwordless there) instead of dropping it.
+        clean = re.sub(r"\bsudo\s+", "", cmd) if IS_ROOT else cmd
         clean = clean.replace("cd ~/", "cd " + str(HOME) + "/").replace("~/", str(HOME) + "/")
         step = run(clean, STEP_TIMEOUT)
         entry["steps"].append(step)
@@ -195,8 +199,8 @@ def catalog(reg: dict) -> None:
     for tool in tools:
         blob = (str(tool.get("id", "")) + " " + str(tool.get("title", "")) + " " +
                 " ".join(map(str, tool.get("install_commands") or []))).lower()
-        if any(word in blob for word in KAGGLE_BLOCKED_TOOL_WORDS):
-            reg["tools"].append({"id": tool["id"], "status": "skipped_kaggle_session_cancel", "steps": [], "probe": None})
+        if any(word in blob for word in BLOCKED_TOOL_WORDS):
+            reg["tools"].append({"id": tool["id"], "status": "blocked", "steps": [], "probe": None})
             continue
         prior = done.get(tool["id"])
         if prior and prior["status"] in ("installed", "installed_probe_failed") and tool.get("run_commands"):

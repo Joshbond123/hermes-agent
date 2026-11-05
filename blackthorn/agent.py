@@ -74,17 +74,6 @@ GATE_STEPS = 6                      # extra steps a run may spend on the complet
 # without letting a real loop run longer.
 MAX_STRIKES = int(__import__("os").environ.get("BLACKTHORN_MAX_STRIKES", "3") or 3)
 MAX_RECOVERY_ROUNDS = int(__import__("os").environ.get("BLACKTHORN_MAX_RECOVERY_ROUNDS", "3") or 3)
-# How many times a rejected GPU credential may be re-read from the control plane before the
-# step is reported as a real auth failure. One refresh was too few: the notebook publishes its
-# rotated key a few seconds after the old one starts being refused.
-AUTH_REFRESH_ROUNDS = int(__import__("os").environ.get("BLACKTHORN_AUTH_REFRESH_ROUNDS", "3") or 3)
-# A notebook publishes on its own heartbeat; after its row is re-opened it needs a beat to
-# republish the key it is actually serving. Long enough for one heartbeat, short enough that a
-# repair never looks like a hang.
-GPU_REPUBLISH_WAIT_S = float(__import__("os").environ.get("BLACKTHORN_GPU_REPUBLISH_WAIT_S", "6") or 6)
-# First wait before re-reading the control plane. The notebook publishes its rotated key on a
-# heartbeat, so an immediate re-read usually returns the same (already refused) key.
-AUTH_REFRESH_BACKOFF_S = float(__import__("os").environ.get("BLACKTHORN_AUTH_BACKOFF_S", "4") or 4)
 # How many times a stalled loop may be answered with "change your approach" before the run
 # falls back to a final answer. Two rounds fixed the observed failure (the agent gave up on a
 # task it could still finish) without letting a genuinely impossible step run for ever.
@@ -145,7 +134,7 @@ class Deps:
     http: httpx.AsyncClient
     tavily: Any
     computer: Any
-    activity: Any = None   # run_started() / run_touched() / run_finished(): keeps the GPU's inactivity clock honest
+    activity: Any = None   # run_started() / run_touched() / run_finished(): keeps the computer's idle clock honest
     lab: Any = None        # on-demand malware execution lab (separate microVM)
 
 
@@ -236,7 +225,7 @@ class AgentRun:
         self._remote_analysis = bool(re.search(r"malware|ransomware|sample|detonat|sandbox|virus|malicious", context, re.I))
         # An explicitly requested public upload/report has a known short workflow:
         # omit unrelated catalog, browser and shell schemas for this turn. That
-        # saves ~1k prefill tokens on the slow partially-offloaded 27B GPU, while
+        # saves ~1k prefill tokens of prefill per step, while
         # keeping the general research/computer toolbox on broader tasks.
         specific_remote = self._remote_analysis and bool(re.search(
             r"(submit|upload|report|lookup|public remote analysis).{0,120}(malware|analyzer)|"
@@ -684,7 +673,7 @@ class AgentRun:
         status, error = "stop", None
         self._activity("run_started")
         lease = asyncio.create_task(self._lease_heartbeat())
-        # Immediate UI feedback: do not wait for GPU connect / prefill before the user sees activity.
+        # Immediate UI feedback: do not wait for the model connect / prefill before the user sees activity.
         self.run.emit("thinking", state="start")
         self._early_thinking = True
         try:
@@ -904,40 +893,6 @@ class AgentRun:
             raise RunFailure("empty_response", "The model returned an empty response (it produced only reasoning). Retry to ask again.", True)
 
     # ------------------------------------------------------------------ one model call (with recovery)
-    async def _reopen_closed_row(self, route) -> bool:
-        """Re-open a control-plane row that a stop closed while this session is still serving.
-
-        A notebook may not publish its key over a row marked stopped - that guard is correct, it
-        stops a late heartbeat resurrecting a role. It becomes a deadlock only when the host is
-        demonstrably alive: the published key then stays the previous boot's (or empty) for ever,
-        every refresh returns the same rejected credential, and the task dies with "the GPU
-        gateway kept rejecting the refreshed credential".
-
-        So: prove the host answers (any HTTP status counts - a 401 still proves a live endpoint),
-        and only then re-open a row that is actually closed. A genuinely stopped GPU answers
-        nothing and is left alone, so a real shutdown is never undone.
-        """
-        url = str(getattr(route, "url", "") or "").rstrip("/")
-        if not url:
-            return False
-        try:
-            probe = await self.deps.http.get(f"{url}/v1/models", timeout=8.0)
-            alive = probe.status_code in (200, 401, 403, 404)
-        except (OSError, httpx.HTTPError):
-            return False
-        if not alive:
-            return False
-        try:
-            reopened = bool(await self.deps.store.unblock_gpu_row())
-        except Exception:  # noqa: BLE001 - a repair attempt must never fail the run
-            return False
-        if reopened:
-            self.run.emit("notice", level="info",
-                          text="The published model key was stale because a stop had closed its record while "
-                               "the GPU was still serving; re-opened it so the live session can publish the "
-                               "key it actually uses.")
-        return reopened
-
     async def _adopt_server_context(self) -> None:
         """Size the budget to the window the engine really has, once per run.
 
@@ -1032,77 +987,21 @@ class AgentRun:
                     messages.append({"role": "user", "content": RESUME_NOTE})
                 continue
             except LLMError as exc:
-                if exc.code == "gpu_auth":
-                    # A notebook publishes its per-boot key to the control plane on its own
-                    # clock; a rejection therefore means "the published key is behind", not
-                    # necessarily "the credential is wrong". The same key that was refused
-                    # mid-run authenticated again a minute later in live testing, so the
-                    # refresh is patient (4s, 8s, 15s of backoff) and re-reads D1 each round,
-                    # instead of spending the whole budget in six seconds. Tools are never
-                    # replayed: only the rejected model step is retried, so this costs time
-                    # on failure and nothing on success.
-                    if auth_refreshes:
-                        await asyncio.sleep(min(AUTH_REFRESH_BACKOFF_S * (2 ** (auth_refreshes - 1)), 15.0))
-                    self.deps.resolver.invalidate()
-                    fresh, failure = None, None
-                    try:
-                        fresh = await self.deps.resolver.get(force=True)
-                    except Exception as refresh_exc:  # noqa: BLE001 - repaired below
-                        failure = refresh_exc
-                    changed = fresh is not None and (fresh.api_key != route.api_key or fresh.url != route.url)
-                    if not changed:
-                        # The refresh did not produce a different credential (or could not read one
-                        # at all). The one cause that repeating can never fix: a stop closed the
-                        # control-plane row while the session is still serving, which forbids the
-                        # notebook from publishing the key it actually uses - so the same rejected
-                        # credential comes back for ever. Re-open the row and let it republish.
-                        if await self._reopen_closed_row(route):
-                            await asyncio.sleep(GPU_REPUBLISH_WAIT_S)
-                            self.deps.resolver.invalidate()
-                            try:
-                                fresh = await self.deps.resolver.get(force=True)
-                                failure = None
-                                changed = (fresh.api_key != route.api_key or fresh.url != route.url)
-                            except Exception as refresh_exc:  # noqa: BLE001 - handled below
-                                failure = refresh_exc
-                    if auth_refreshes >= AUTH_REFRESH_ROUNDS:
-                        if fresh is None:
-                            raise LLMError("gpu_auth", "The GPU connection dropped while the task was running "
-                                           f"({getattr(failure, 'code', 'unavailable')}). The task is saved; retry "
-                                           "when the GPU connection is healthy and it will continue where it "
-                                           "stopped.", retryable=True,
-                                           status=getattr(failure, "status", exc.status)) from (failure or exc)
-                        raise LLMError("gpu_auth", "The GPU gateway kept rejecting the refreshed credential after "
-                                       f"{AUTH_REFRESH_ROUNDS} refresh rounds. The task is saved; retry when the GPU "
-                                       "connection is healthy and it will continue where it stopped.",
-                                       retryable=True, status=exc.status) from exc
-                    if not changed and fresh is not None:
-                        # Same published credential: it is either genuinely wrong or the edge
-                        # refused one stream. A cheap authenticated call decides which, and a
-                        # fresh key may still land before the next round.
-                        try:
-                            check = await self.deps.http.get(
-                                f"{fresh.url}/v1/models",
-                                headers={"Authorization": f"Bearer {fresh.api_key}"}, timeout=8.0)
-                            accepted = check.status_code == 200
-                        except (OSError, httpx.HTTPError):
-                            accepted = False
-                        if not accepted and auth_refreshes + 1 >= AUTH_REFRESH_ROUNDS:
-                            raise LLMError("gpu_auth", "The GPU gateway rejects the credential published in the "
-                                           "control plane and the probe does not authenticate either. The task is "
-                                           "saved; retry once the GPU connection is healthy.",
-                                           retryable=True, status=exc.status) from exc
-                    auth_refreshes += 1
-                    self.run.emit("notice", level="info",
-                                  text=("GPU connection refreshed — resuming this model step…" if auth_refreshes == 1
-                                        else f"GPU connection refreshed again (attempt {auth_refreshes}) — "
-                                             "waiting for the updated access key, then resuming…"))
-                    continue
+                if exc.code == "model_auth":
+                    # NVIDIA's API has one credential: a 401/403 means the configured key is wrong,
+                    # revoked or out of credit. Nothing the agent can do inside this run changes that,
+                    # so it fails fast with the real reason instead of burning the retry budget on a
+                    # loop that can never succeed. The task is saved and can be resumed.
+                    raise LLMError("model_auth",
+                                   "The model provider rejected the configured NVIDIA API key (a wrong, revoked or "
+                                   "exhausted key looks identical). The task is saved; retry once the key in the "
+                                   "server environment is valid.", retryable=False,
+                                   status=exc.status) from exc
                 # Some engines truncate the conversation *before* applying Qwen3.8's template.
                 # When their SSE error says the latest user query vanished, perform ONE bounded
                 # compaction and repeat the real request near the tail. Do not lose the ledger or
                 # retry indefinitely; the normal context_full error remains actionable.
-                if (exc.code in ("gpu_stream", "gpu_http") and
+                if (exc.code in ("model_stream", "model_http") and
                         "no user query found in messages" in exc.message.lower() and attempt == 1):
                     self._force_compact()
                     messages.append({"role": "user", "content":
@@ -1110,16 +1009,16 @@ class AgentRun:
                     self.run.emit("internal.compaction", stage="qwen_query_retry")
                     continue
                 # Transport faults (edge timeout 524, dropped tunnel, stalled stream) are not
-                # the model failing: recover instead of killing a long run mid-task. A dead GPU
+                # the model failing: recover instead of killing a long run mid-task. A dead endpoint
                 # still fails fast (retryable=False on auth/protocol errors).
                 transient = (exc.retryable or
-                             exc.code in ("gpu_unreachable", "gpu_dropped", "gpu_stalled") or
+                             exc.code in ("model_unreachable", "model_dropped", "model_stalled") or
                              (exc.status is not None and exc.status in (502, 503, 521, 522, 523, 524)))
                 # More patience on edge/proxy blips; auth/protocol still fail fast (retryable=False).
                 # Bounded and visible (attempt N of limit); the first-byte watchdog already
                 # fails over half-open sockets quickly, so each attempt is cheap.
                 limit = 6 if (exc.status in (502, 503, 521, 522, 523, 524) or
-                              exc.code in ("gpu_unreachable", "gpu_dropped", "gpu_stalled")) else 3
+                              exc.code in ("model_unreachable", "model_dropped", "model_stalled")) else 3
                 if not transient or attempt >= limit:
                     raise
                 self.deps.resolver.invalidate()
@@ -1136,7 +1035,7 @@ class AgentRun:
                     messages.append({"role": "user", "content": CONTINUE_NOTE})
                 else:
                     self.run.emit("notice", level="info",
-                                  text=f"Reconnecting to the GPU — retrying (attempt {attempt + 1} of {limit})…")
+                                  text=f"Reconnecting to the model — retrying (attempt {attempt + 1} of {limit})…")
                 await asyncio.sleep(min(6.0, 0.6 * (2 ** (attempt - 1))))
                 continue
             finally:
@@ -1232,7 +1131,7 @@ class AgentRun:
                           board=self.board, user_message=self.user_message,
                           lab=getattr(self.deps, "lab", None))
         # Every call the model asked for is executed — none are ever dropped or skipped.
-        # max_calls_per_step bounds *concurrency* (protects the GPU computer from a stampede),
+        # max_calls_per_step bounds *concurrency* (protects the computer from a stampede),
         # not how much work a step may do. Each call reports its result the moment it finishes
         # so the UI shows live progress instead of one late batch.
         sem = asyncio.Semaphore(max(1, int(s.max_calls_per_step)))

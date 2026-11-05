@@ -4,8 +4,8 @@ import pytest
 
 from blackthorn import prompts
 from blackthorn.agent import ThinkFilter
-from blackthorn.gpu import GpuService
-from blackthorn.kaggle_bundle import BundleError, REQUIRED_ENV, build_notebook_text
+from blackthorn.codespaces import UsageLedger
+from blackthorn.route import DEFAULT_MODEL, RouteResolver, context_tokens
 
 
 # ---- ThinkFilter: never eats normal text, whatever the chunking -----------------------------------------------
@@ -69,7 +69,11 @@ def test_shrink_tool_messages_stubs_old_outputs_first():
 
 def test_system_prompt_composition_is_small_and_contains_context():
     text = prompts.system_prompt("Be brief.", ["likes tea", "lives in Ibadan"])
-    assert "Be brief." in text and "likes tea" in text and "Today is" in text and len(text) < 1500
+    assert "Be brief." in text and "likes tea" in text and "Today is" in text
+    # The Superpowers bootstrap is part of the prompt (there is no plugin loader here), so the budget
+    # allows for it — but it must stay a small fraction of the context window, not a wall of text.
+    assert len(text) < 2600, len(text)
+    assert "skill_load" in text and "systematic-debugging" in text and "verification-before-completion" in text
     assert "NEVER" not in prompts.BASE_PROMPT
 
 
@@ -78,75 +82,54 @@ def test_safe_filename():
     assert prompts.safe_filename("") == "file" and prompts.safe_filename("a" * 300).startswith("a" * 80)
 
 
-# ---- Kaggle notebook is generated from source with injected credentials -----------------------------------------------
-def test_notebook_is_built_from_the_committed_source_with_injected_env():
-    import base64, json, re
-    env = {k: f"value-of-{k}" for k in REQUIRED_ENV}
-    nb = json.loads(build_notebook_text("print('hello gpu')\n", env))
-    src = "".join(nb["cells"][0]["source"])
-    parts = re.findall(r"parts\.append\('([A-Za-z0-9+/=]+)'\)", src)
-    assert base64.b64decode("".join(parts)).decode() == "print('hello gpu')\n"
-    injected = json.loads(base64.b64decode(re.search(r"b64decode\('([A-Za-z0-9+/=]+)'\)\)\)", src).group(1)))
-    assert injected["CLOUDFLARE_API_TOKEN"] == "value-of-CLOUDFLARE_API_TOKEN"
-    compile(src, "cell", "exec")                                    # the cell itself is valid Python
+# ---- the model route is NVIDIA, configured by environment -------------------------------------------------------------
+def test_the_route_is_nvidia_and_reads_its_settings_from_the_environment(monkeypatch):
+    monkeypatch.delenv("NVIDIA_BASE_URL", raising=False)      # the default base URL, not a test double
+    monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-test-key")
+    monkeypatch.setenv("BLACKTHORN_MODEL", "nvidia/nemotron-3-ultra-550b-a55b")
+    import asyncio
+    route = asyncio.run(RouteResolver().get())
+    assert route.provider == "nvidia" and route.url.startswith("https://integrate.api.nvidia.com")
+    assert route.model == "nvidia/nemotron-3-ultra-550b-a55b" and route.api_key == "nvapi-test-key"
 
 
-def test_notebook_refuses_to_build_without_credentials():
-    with pytest.raises(BundleError, match="CLOUDFLARE_API_TOKEN"):
-        build_notebook_text("x", {})
+def test_without_a_key_the_route_fails_loudly_instead_of_inventing_one(monkeypatch):
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    import asyncio
+    from blackthorn.route import RouteError
+    with pytest.raises(RouteError) as exc:
+        asyncio.run(RouteResolver().get())
+    assert exc.value.code == "model_unconfigured"
 
 
-def test_real_server_source_compiles_and_has_no_literal_secrets():
-    from blackthorn.kaggle_bundle import SERVER_SOURCE
-    src = SERVER_SOURCE.read_text()
-    compile(src, str(SERVER_SOURCE), "exec")
-    import re
-    assert not re.search(r"cfut_[A-Za-z0-9]{10,}|KGAT_[a-f0-9]{10,}|sk-qwen38-[A-Za-z0-9-]{6,}", src)
+def test_the_default_model_is_nemotron_3_ultra():
+    assert DEFAULT_MODEL == "nvidia/nemotron-3-ultra-550b-a55b"
 
 
-# ---- GPU public status never leaks the tunnel or keys ----------------------------------------------------------------
-class FakeD1:
-    def __init__(self, state): self.state = state
-    def get_kaggle_gpu_status(self, refresh=False): return dict(self.state)
-    def public_gpu_status(self, state):
-        import cloudflare_d1_client as real
-        return real.public_gpu_status(state)
+def test_context_budget_is_a_planning_budget_not_the_provider_ceiling(monkeypatch):
+    monkeypatch.setenv("BLACKTHORN_CONTEXT_TOKENS", "65536")
+    assert context_tokens() == 65536
+    monkeypatch.setenv("BLACKTHORN_CONTEXT_TOKENS", "12")          # nonsense is ignored, not obeyed
+    assert context_tokens() == 131072
 
 
-class Store:
-    def __init__(self, started): self.started = started
-    async def get_setting(self, key): return str(self.started) if self.started else ""
+# ---- usage hours are measured, never invented --------------------------------------------------------------------------
+class _SettingsStore:
+    def __init__(self): self.values = {}
+    async def get_setting(self, key): return self.values.get(key, "")
+    async def set_setting(self, key, value): self.values[key] = value
 
 
-async def test_gpu_status_has_no_secrets_and_reports_real_stage_and_elapsed():
+async def test_usage_ledger_counts_only_observed_running_intervals():
     import time
-    state = {"active": False, "booting": True, "status": "DOWNLOADING_MODEL", "tunnel_url": "https://secret.trycloudflare.com",
-             "api_key": "bt-" + "S" * 43, "progress_pct": 30, "progress_step": "Downloading", "model": "m", "gpu_info": "T4",
-             "cloudflare_d1": {"account_id": "acct", "database_id": "db"}, "detail": '{"bytes_done": 500, "bytes_total": 1000}',
-             "quota": {"used_hours": 1}}
-    svc = GpuService(Store(time.time() - 125), FakeD1(state))
-    out = await svc._augment(state)
-    blob = str(out)
-    assert "secret.trycloudflare" not in blob and "S" * 43 not in blob and "acct" not in blob
-    assert out["progress_stage"] == 5 and out["progress_total_stages"] == 12 and out["progress_kind"] == "bytes"
-    assert out["progress_bytes_done"] == 500 and out["progress_bytes_total"] == 1000
-    assert 120 <= out["elapsed_seconds"] <= 135 and "progress_pct" not in out
-    assert out["can_turn_on"] is False and out["can_turn_off"] is True
-
-
-async def test_gpu_ready_and_off_states_offer_the_right_actions():
-    ready = {"active": True, "booting": False, "status": "HEARTBEAT_ONLINE", "tunnel_url": "https://x", "model_loaded": True}
-    off = {"active": False, "booting": False, "status": "GPU_STOPPED_SAVING_QUOTA", "tunnel_url": ""}
-    svc = GpuService(Store(None), FakeD1(ready))
-    r = await svc._augment(ready)
-    o = await svc._augment(off)
-    assert r["online"] and r["can_turn_off"] and not r["can_turn_on"]
-    assert not o["online"] and o["can_turn_on"] and not o["can_turn_off"]
-
-
-async def test_gpu_status_carries_the_notebook_label_and_stalled_flag():
-    import time
-    state = {"active": False, "booting": True, "status": "DOWNLOADING_MODEL", "tunnel_url": "", "model": "m", "gpu_info": "T4",
-             "detail": '{"label": "Downloading the model", "bytes_done": 10, "bytes_total": 100, "stalled": true}'}
-    out = await GpuService(Store(time.time() - 5), FakeD1(state))._augment(state)
-    assert out["progress_label"] == "Downloading the model" and out["progress_stalled"] is True and out["progress_kind"] == "bytes"
+    ledger = UsageLedger(_SettingsStore())
+    await ledger.open_interval("cs-1")
+    assert (await ledger.seconds_this_month()) >= 0.0
+    await ledger.close_interval()
+    total = await ledger.seconds_this_month()
+    assert total >= 0.0
+    # an interval from another month is not counted in this one
+    store = _SettingsStore()
+    import json
+    store.values[UsageLedger.KEY] = json.dumps([{"name": "cs-1", "start": 0.0, "end": 3600.0}])
+    assert await UsageLedger(store).seconds_this_month(now=time.time()) < 1.0

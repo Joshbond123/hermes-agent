@@ -1,4 +1,4 @@
-"""Unified cybersecurity catalogue across the three upstream repositories.
+"""Unified catalogue across the upstream repositories (three security sources + superpowers).
 
 Every test builds a synthetic catalogue on disk with the *same layouts the real
 repositories use*, so the registry logic is exercised without network access:
@@ -6,6 +6,7 @@ repositories use*, so the registry logic is exercised without network access:
   * ``Anthropic-Cybersecurity-Skills`` — ``skills/<kebab>/SKILL.md`` plus ``index.json``
   * ``Claude-Red`` — ``Skills/<Category>/<skill>/SKILL.md`` plus an MIT ``LICENSE``
   * ``hackingtool-plugin`` — ``plugins/hackingtool/data/tools.json``
+  * ``superpowers`` — ``skills/<name>/SKILL.md`` (process skills)
 
 The properties that matter for the product: ids are stable and unambiguous, discovery
 is metadata-only, execution reports the truth (including "nothing to run"), and a
@@ -62,6 +63,13 @@ def catalog(tmp_path):
     ]
     _write(root / "hackingtool-plugin" / "plugins" / "hackingtool" / "data" / "tools.json",
            json.dumps({"tools": tools}))
+
+    # obra/superpowers: process skills, one folder per skill (skills/<name>/SKILL.md)
+    _write(root / "superpowers" / "LICENSE", "MIT\n")
+    for name, description in (("systematic-debugging", "Use when a test fails."),
+                              ("test-driven-development", "Use before writing code.")):
+        _write(root / "superpowers" / "skills" / name / "SKILL.md",
+               f"---\nname: {name}\ndescription: {description}\n---\n\n# {name}\n\n{description}\n")
     return root
 
 
@@ -79,14 +87,16 @@ def _json(proc):
 def test_registry_merges_every_source_with_stable_ids(catalog):
     payload = _json(_run(catalog, "registry"))
     assert payload["ok"] is True
-    assert payload["counts"]["skills"] == 3
+    assert payload["counts"]["skills"] == 5        # 2 anthropic + 1 claude-red + 2 superpowers
     assert payload["counts"]["tools"] == 2
-    assert payload["counts"]["by_source"] == {"anthropic": 2, "claude-red": 1}
+    assert payload["counts"]["by_source"] == {"anthropic": 2, "claude-red": 1, "hackingtool": 0, "superpowers": 2}
     registry = json.loads((catalog / "registry.json").read_text())
     assert {skill["id"] for skill in registry["skills"]} == {
         "anthropic:triaging-security-incident",
         "anthropic:detecting-lateral-movement",
         "claude-red:email-enumeration",
+        "superpowers:systematic-debugging",
+        "superpowers:test-driven-development",
     }
     assert {tool["id"] for tool in registry["tools"]} == {
         "tool:theharvester", "tool:MANUAL"}

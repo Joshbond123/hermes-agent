@@ -236,16 +236,13 @@ async def test_secrets_are_redacted_in_the_activity_ui(stack):
 
 
 async def test_computer_offline_tool_fails_honestly_and_run_still_completes(stack):
-    await stack.set_gpu(url="http://127.0.0.1:9")           # nothing listens there
-    stack.services.resolver.invalidate()
+    await stack.set_model()
     stack.backend.queue([sh("ls", cid="o1"), finish("tool_calls")], [*say("The computer is unreachable."), finish("stop")])
-    # the model endpoint is the same dead URL, so point only the computer at it by queueing on a healthy model route:
-    await stack.set_gpu()
     original = stack.services.computer.call
 
     async def dead(*a, **k):
         from blackthorn.tools.base import ToolError
-        raise ToolError("offline", "The remote computer is offline.", hint="Turn the GPU on.")
+        raise ToolError("offline", "The remote computer is offline.", hint="It starts automatically when a task needs it.")
 
     stack.services.computer.call = dead
     try:
@@ -258,11 +255,11 @@ async def test_computer_offline_tool_fails_honestly_and_run_still_completes(stac
 
 
 # ---------------------------------------------------------------------------------------------------- errors
-async def test_gpu_off_is_a_clear_409_and_nothing_is_persisted(stack):
-    await stack.set_gpu("GPU_STOPPED_SAVING_QUOTA", url="")
+async def test_missing_model_key_is_a_clear_409_and_nothing_is_persisted(stack):
+    await stack.set_model(key="")
     out = await stack.stream({"message": "hello"})
     assert out.status == 409
-    assert out.error_body["detail"]["code"] == "gpu_off"
+    assert out.error_body["detail"]["code"] == "model_unconfigured"
     async with httpx.AsyncClient() as c:
         listing = (await c.get(f"{stack.url}/api/chat/sessions")).json()
     assert listing["sessions"] == []
@@ -276,7 +273,7 @@ async def test_midstream_connection_drop_keeps_partial_and_continues(stack):
     assert out.end["status"] == "stop"
     assert "Part one of the answer, " in out.text and "and part two finishes it." in out.text
     notices = [n["text"] for n in out.of("notice") if not n["text"].startswith("Connected")]  # immediate feedback, not a recovery
-    assert all(("dropped mid-answer" in t) or ("Reconnected to the GPU" in t) or ("GPU connection hiccup" in t) or ("GPU" in t) for t in notices)
+    assert all(("dropped mid-answer" in t) or ("Reconnected" in t) or ("hiccup" in t) or ("model" in t.lower()) for t in notices)
     data = await session_messages(stack, out.session_id)
     last = data["messages"][-1]
     assert last["status"] == "stop" and last["content"].startswith("Part one")
@@ -308,7 +305,7 @@ async def test_repeated_drops_beyond_the_recovery_budget_end_in_honest_error(sta
     for _ in range(6):                                                                    # one per attempt: the 6th exhausts the budget (limit 6)
         stack.backend.queue([*say("partial "), {"drop": 1}])
     out = await stack.stream({"message": "hello"})
-    assert out.end["status"] == "error" and out.of("error")[0]["code"] == "gpu_dropped"
+    assert out.end["status"] == "error" and out.of("error")[0]["code"] == "model_dropped"
     data = await session_messages(stack, out.session_id)
     last = data["messages"][-1]
     assert last["status"] == "error" and last["content"].startswith("partial")
@@ -320,7 +317,7 @@ async def test_retryable_upstream_failure_recovers_once(stack):
     assert out.text == "Recovered." and out.end["status"] == "stop"
     # first blip recovers quietly (no scary notice); any notice must be about reconnecting
     notices = [n["text"] for n in out.of("notice") if not n["text"].startswith("Connected")]  # immediate feedback, not a recovery
-    assert all(("retrying" in t) or ("Reconnect" in t) or ("hiccup" in t) or ("GPU" in t) for t in notices)
+    assert all(("retrying" in t) or ("Reconnect" in t) or ("hiccup" in t) or ("model" in t.lower()) for t in notices)
 
 
 async def test_persistent_upstream_failure_ends_in_error_not_a_hang(stack):
@@ -560,7 +557,9 @@ async def test_system_prompt_is_short_and_has_no_keyword_rules(stack):
     stack.backend.queue([*say("hi"), finish("stop")])
     await stack.stream({"message": "hi"})
     system = stack.backend.requests[0]["messages"][0]["content"]
-    assert len(system) < 1400
+    # The Superpowers bootstrap is part of the prompt (no plugin loader in this app), so the ceiling
+    # allows for it while still keeping the prompt a small slice of a 131k context window.
+    assert len(system) < 2600
     for banned in ("NEVER call", "greetings:", "<tool_call>", "AUTONOMY"):
         assert banned not in system
     # a short greeting gets no tool schemas (prefill cost); a real task does
@@ -570,7 +569,7 @@ async def test_system_prompt_is_short_and_has_no_keyword_rules(stack):
     assert "minLength" not in schemas and "maximum" not in schemas       # validation-only keys stay server-side
 
 
-# ---------------------------------------------------------------------------------------------------- GPU activity bookkeeping
+# ------------------------------------------------------------------------------------- activity bookkeeping
 class _Activity:
     def __init__(self): self.events = []
     def run_started(self): self.events.append("start")
@@ -578,9 +577,9 @@ class _Activity:
     def run_finished(self): self.events.append("finish")
 
 
-async def test_every_run_marks_the_gpu_busy_and_always_releases_it(stack):
+async def test_every_run_marks_the_computer_busy_and_always_releases_it(stack):
     rec = _Activity()
-    stack.services.gpu = rec
+    stack.services.codespaces = rec
     stack.backend.queue([sh("echo hi", cid="a1"), finish("tool_calls")], [*say("done"), finish("stop")])
     out = await stack.stream({"message": "run something"})
     assert out.end["status"] == "stop" and rec.events == ["start", "touch", "finish"]
@@ -600,21 +599,17 @@ async def test_every_run_marks_the_gpu_busy_and_always_releases_it(stack):
     assert got.end["status"] == "cancelled" and rec.events == ["start", "finish"]       # released even when cancelled
 
 
-async def test_chat_activity_resets_the_real_controllers_idle_clock(stack):
-    """With auto-off enabled the controller stops the GPU after N idle minutes; real chats must keep it from firing."""
-    import cloudflare_d1_client as ctl
-    from blackthorn.gpu import GpuService
-    stack.services.gpu = GpuService(stack.services.store)                                  # the real facade over the real module
-    ctl._LAST_ACTIVITY_TS = time.time() - 3600                                              # pretend it has been idle for an hour
-    before = ctl.activity_snapshot()
-    assert before["idle_seconds"] > 3000
+async def test_chat_activity_resets_the_real_computers_idle_clock(stack):
+    """Real chats must move the codespace's idle clock, so an automatic stop cannot fire mid-task."""
+    computer = stack.codespaces
+    computer._last_activity = time.time() - 3600
+    assert computer.idle_seconds() > 3000
     stack.backend.queue([*say("hello"), finish("stop")])
     await stack.stream({"message": "hi"})
-    after = ctl.activity_snapshot()
-    assert after["idle_seconds"] < 10 and after["active_tasks"] == 0                        # clock reset, nothing left "running"
+    assert computer.idle_seconds() < 60, "a real turn must count as activity"
+    assert computer.agent_using() is False, "and the run must release the computer when it ends"
 
 
-# ---------------------------------------------------------------------------------------------------- autonomy (critical fixes)
 async def test_many_tool_calls_in_one_step_are_all_executed_none_skipped(stack):
     """A step may legitimately fan out past any per-step cap: no call is ever dropped or marked skipped."""
     calls = [sh(f"echo {i}", cid=f"p{i}", index=i) for i in range(20)]
@@ -648,7 +643,7 @@ async def test_dropped_stream_mid_answer_is_continued_not_killed(stack):
     assert "The first half of the " in out.text and "answer completes here." in out.text
     notices = [n["text"] for n in out.of("notice") if not n["text"].startswith("Connected")]  # immediate feedback, not a recovery
     # first recovery is intentionally quiet; any notices must be about reconnecting
-    assert all(("dropped" in t) or ("Reconnect" in t) or ("hiccup" in t) or ("GPU" in t) for t in notices)
+    assert all(("dropped" in t) or ("Reconnect" in t) or ("hiccup" in t) or ("model" in t.lower()) for t in notices)
     assert out.end["duration_ms"] > 0
 
 

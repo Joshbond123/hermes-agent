@@ -30,7 +30,7 @@ from .base import ToolContext, ToolResult, ToolSpec, clip
 ASSET_DIR = Path(__file__).resolve().parent.parent / "computer_assets"
 REMOTE_BIN = "/workspace/.blackthorn/bin"
 SKILL_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{2,120}$")
-SKILL_ID = re.compile(r"^(?:anthropic|claude-red):[A-Za-z0-9][A-Za-z0-9._-]{1,150}$")
+SKILL_ID = re.compile(r"^(?:anthropic|claude-red|superpowers):[A-Za-z0-9][A-Za-z0-9._-]{1,150}$")
 TOOL_ID = re.compile(r"^tool:[A-Za-z0-9][A-Za-z0-9._-]{1,150}$")
 TOOL_ARGS = re.compile(r"^[A-Za-z0-9 ./_:=@+,%^*()\[\]{}\"'$-]{0,500}$")
 QUERY = re.compile(r"^[A-Za-z0-9 ._+/-]{2,120}$")
