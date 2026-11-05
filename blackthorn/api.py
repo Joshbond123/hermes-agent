@@ -525,6 +525,7 @@ async def codespaces_usage(request: Request):
         "running": state == "ON",
         "agent_using": bool(status.get("agent_using")),
         "agent_connected": bool(status.get("agent_connected")),
+        "last_activity": status.get("last_activity") or "",   # what last touched the idle clock
         "name": status.get("name") or "",
         "machine": machine or "basicLinux32gb",
         "cores": cores,

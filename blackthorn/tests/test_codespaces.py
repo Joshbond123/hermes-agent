@@ -330,3 +330,19 @@ async def test_an_idle_machine_stops_even_while_its_agent_keeps_polling():
     out = await computer.maybe_stop()
     assert out["stopped"] is True, "an idle machine must not be kept awake by its own polling"
     assert (await computer.status())["state"] == "OFF"
+
+
+async def test_the_idle_clock_records_what_touched_it():
+    """A machine that never idles out must be explainable, not a mystery.
+
+    The reason is reported with the status so a stuck idle clock names its cause (a poll, a tool, a
+    run hook); this is how the polling regression was found and is kept fixed.
+    """
+    api = FakeCodespaceAPI(name="blackthorn-test-abc123", state="Available")
+    computer = CodespaceComputer(httpx.AsyncClient(), api, channel=CodespaceChannel(None), store=None)
+    computer._name, computer._state = "blackthorn-test-abc123", "ON"
+    computer.note_activity("tool:/computer/exec")
+    assert (await computer.status())["last_activity"] == "tool:/computer/exec"
+    computer.run_started()
+    assert (await computer.status())["last_activity"] == "run_started"
+    computer.run_finished()

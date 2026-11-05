@@ -142,6 +142,7 @@ class CodespaceComputer:
         self._inflight = 0
         self._runs = 0                       # agent runs currently executing
         self._last_activity = time.time()
+        self._last_reason = "startup"
         self._last_lookup = 0.0
         self._state = "OFF"                 # OFF | STARTING | ON | STOPPING | ERROR
         self._error = ""
@@ -162,21 +163,28 @@ class CodespaceComputer:
         """True while the agent holds the computer (a run is executing or a call is in flight)."""
         return self._busy()
 
-    def note_activity(self) -> None:
+    def note_activity(self, reason: str = "") -> None:
+        """Touch the idle clock, remembering *what* touched it.
+
+        The reason is in ``status()`` so a machine that never idles out can be explained instead of
+        guessed at (an idle codespace that keeps resetting its clock is wasted money).
+        """
         self._last_activity = time.time()
+        if reason:
+            self._last_reason = reason
 
     # Hooks the agent loop calls (``Deps.activity``): they keep the idle clock honest and make it
     # impossible to stop the codespace while a task is running.
     def run_started(self) -> None:
         self._runs += 1
-        self.note_activity()
+        self.note_activity("run_started")
 
     def run_touched(self, *_args: Any, **_kwargs: Any) -> None:
-        self.note_activity()
+        self.note_activity("run_touched")
 
     def run_finished(self) -> None:
         self._runs = max(0, self._runs - 1)
-        self.note_activity()
+        self.note_activity("run_finished")
 
     @property
     def runs_active(self) -> int:
@@ -234,7 +242,7 @@ class CodespaceComputer:
 
     async def ensure_running(self, *, timeout: float = START_TIMEOUT_S) -> Dict[str, Any]:
         """Start the codespace if needed and wait until its agent answers."""
-        self.note_activity()
+        self.note_activity("ensure_running")
         async with self._lock:
             cs = await self.find_or_create()
             state = str(cs.get("state") or "")
@@ -297,6 +305,7 @@ class CodespaceComputer:
             # instead of waiting a fresh idle window.
             evidence = _ts(cs.get("last_used_at"))
             self._last_activity = evidence or time.time()
+            self._last_reason = "adopt:GITHUB_LAST_USED" if evidence else "adopt:now"
             await self.ledger.open_interval(name)
             await self._save_state()
             log.info("adopted running codespace %s (last used %s)", name,
@@ -383,7 +392,7 @@ class CodespaceComputer:
     async def call(self, path: str, payload: Optional[Dict[str, Any]] = None, *, method: str = "POST",
                    timeout: float = 90, idempotent: bool = True) -> Dict[str, Any]:
         payload = payload or {}
-        self.note_activity()
+        self.note_activity(f"tool:{path}")
         self._inflight += 1
         try:
             if self._state != "ON" or self._session is None:
@@ -393,7 +402,7 @@ class CodespaceComputer:
             return self._post(path, payload, result)
         finally:
             self._inflight -= 1
-            self.note_activity()
+            self.note_activity(f"tool_done:{path}")
 
     def _translate(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         if path == "/computer/exec":
@@ -490,6 +499,8 @@ class CodespaceComputer:
                 "agent_connected": self.agent_connected(),
                 "idle_seconds": int(self.idle_seconds()),
                 "idle_stop_seconds": self.idle_stop_s,
+                "last_activity": self._last_reason,
+                "last_activity_age_s": int(self.idle_seconds()),
                 "workspace": LOGICAL_ROOT, "provider": "GitHub Codespaces"}
 
     async def lifecycle_snapshot(self) -> Dict[str, Any]:
@@ -506,7 +517,7 @@ class CodespaceComputer:
         """Touch the codespace so GitHub's own idle timer does not reap it mid-task."""
         if self._state != "ON":
             return {"ok": False, "reason": "off"}
-        self.note_activity()
+        self.note_activity("keepalive")
         return {"ok": True}
 
     async def handover(self, *, reason: str = "manual") -> Dict[str, Any]:
