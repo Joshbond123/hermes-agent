@@ -146,3 +146,69 @@ source is labelled rather than invented.
   migration too.
 - Codespaces hours are measured by the app, not read from GitHub billing (permission), and are
   labelled as such in the API.
+
+
+---
+
+# Round 2 — streaming UI, task resilience, rate limits, model switching (v5.6.0)
+
+Verified against the live deployment (`https://blackthorn.onrender.com`, commit `53e2489e9f`).
+
+## Execution record no longer appears in the chat
+Root cause was structural, not cosmetic: the verified tool ledger was appended to **assistant-role**
+content when a conversation was rebuilt, so the model read server bookkeeping in its own voice and
+reproduced it in answers. It now travels as one labelled machine block in the system layer (capped at
+a third of the context budget, newest facts first), and `store` scrubs any server block both when an
+answer is written and when stored messages are served.
+
+Live proof (12:33 UTC run): five tool calls, answer quoted the real file contents, and
+`GET /api/chat/sessions/…` contained no `Execution record` / `Do not redo a step` text. Pinned by
+`test_the_execution_record_never_reaches_the_chat`,
+`test_the_agent_still_receives_the_record_of_earlier_tool_calls` and
+`test_a_model_that_echoes_the_record_cannot_put_it_in_the_transcript`.
+
+## Rate limits (HTTP 429)
+`429` is now a first-class condition: `Retry-After` is honoured (header, `x-ratelimit-reset`, or the
+JSON body), otherwise exponential backoff with jitter bounded at 120 s. A per-endpoint gate allows one
+request at a time (`BLACKTHORN_MODEL_CONCURRENCY`), enforces a minimum interval and shares a cooldown
+so parallel runs stop amplifying each other. The user sees "The model provider is throttling requests.
+Waiting Ns — your task is preserved", never the raw API error. Pinned by four tests, including "a 429
+is waited out and the task continues without replaying tools".
+
+## Task lifecycle
+A transient fault no longer ends a task: `AgentRun` supervises the loop and resumes from the exact
+message state it reached (tools already run stay run, results stay in the messages) after the delay
+the provider asked for, bounded by `BLACKTHORN_RESUME_ATTEMPTS` (default 6; 0 disables). Every resume
+emits `internal.checkpoint` and a plain-language notice. The existing SSE contract already kept a run
+alive across a page refresh (`/api/chat/runs/{id}/events?after=` replays from the last sequence).
+
+*Not verified end-to-end here: a multi-hour run surviving a real Render restart* — the run registry is
+in-process, and a restart marks the turn `interrupted` with a resume note rather than losing work.
+
+## Model switching
+`GET /api/models` lists the catalogue with honest availability; `PATCH /api/chat/sessions/{id}
+{"model": …}` switches a conversation's model and returns `applies_to: "next_turn"`, plus an
+`active_run` note when a task is executing (that task keeps the model it started with). Live: switching
+to the unconfigured Qwen returned `model_unavailable` with the reason, an unknown id returned
+`model_unknown`, and a valid switch kept the same session id and transcript. The header picker shows
+the active model, unavailable models with their reason, and the mid-run note.
+
+## Qwen3.8-27B-Uncensored (item 5) — prepared, not deployed
+The model is real: `orcarouter/Qwen3.8-27B-Uncensored-GGUF` → `…-Q4_K_M.gguf`, 16.81 GB, gated
+(apache-2.0). It does **not** fit a single 16 GB T4, so it needs both GPU cards.
+
+`blackthorn/scripts/serve_qwen.py` is the serving path: it reuses weights already on disk (Kaggle keeps
+`/kaggle/working`), refuses a one-T4 host with a reason instead of an OOM, builds the llama.cpp command
+(`-ngl 99`, `--tensor-split 1,1`, `--jinja` for tool calling) and can self-test a real tool call. Its
+command construction is unit-tested.
+
+What is deliberately **not** done: standing the Kaggle GPU infrastructure back up. The previous round
+removed it end to end on explicit instruction ("nothing Kaggle GPU-related may be left behind"), its
+credentials were deleted from Render, and a Kaggle notebook is an interactive session that must be
+started and kept alive by its owner with a public tunnel. Pointing this script at a GPU host and
+setting `QWEN_BASE_URL` + `QWEN_MODEL` makes Qwen appear in the picker as a live, selectable model —
+that switch is already implemented and tested on the Blackthorn side.
+
+## Suite
+339 passed, 5 skipped. UI: `tsc` clean, `vite build` (new bundle `index-dwN43Rx7.js` /
+`index-DIcam0T9.css`), `vitest` 32/32.

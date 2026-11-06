@@ -1,9 +1,9 @@
 {
  "files": {
   "blackthorn/COMPUTER_DRIVE.md": "eb143a189c0bf88482027c6a474b799c2d7d52303f23748258cd01a2417ab5da",
-  "blackthorn/MIGRATION_ACCEPTANCE.md": "d782e416362d5acdc2c01ad88a58cdf480772089e83c2c8ea46bb693ffe363f4",
+  "blackthorn/MIGRATION_ACCEPTANCE.md": "c6a25473b8150047655c3eaf9457095d6ae27b8d8108c1a75b82b145dd182b72",
   "blackthorn/README.md": "f3e59f0dd987701577011d23ec5f1c67b630bd9e4c170ed4b628b988492afc84",
-  "blackthorn/__init__.py": "bc3ccb85f7fdf42e4c0cc683ec0398d59c3f0276104c89ba6d453177811f2a6e",
+  "blackthorn/__init__.py": "71717e57c950b3c9e5f1bb89743754350620037f613926e1c8236cbb41980df3",
   "blackthorn/agent.py": "5ab2733f478af9e6fb003994ebb2174668d05e7a211a172733a903a5cf9c366c",
   "blackthorn/api.py": "4bf985aec2598e7daab0d831d03e4ee8a88503bfdfbd905e8505daa5044098a3",
   "blackthorn/app.py": "0f84d98553ab544ee4d7fc7046e314bf5461ac5bdad676b4e8001a9ca62ea196",
@@ -27,8 +27,10 @@
   "blackthorn/recovery.py": "a48158ac504e79325ed2f2337cafabfc3bc78c6553ce3d545fb4e023c315510e",
   "blackthorn/route.py": "dc1d8e2cc8382e776b0aaf47923294446d0421b7a9c7370f223dda105f77d0d2",
   "blackthorn/runs.py": "ef2d5deb094f9b9c879f80776b104218bb8a1cd4cc0a1ae695bd564c66e650db",
+  "blackthorn/scripts/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
   "blackthorn/scripts/live_codespaces.py": "99cdb4636e32406bbc58dd022e95d652ff5a0ef0e400a353b535c6718401f7d4",
   "blackthorn/scripts/live_malware_lab.py": "ba6432bbaae6f0f264a8df142bf7c9fcda4ccd42fb6d17c92bcd4e37c7a3fb97",
+  "blackthorn/scripts/serve_qwen.py": "21833fa06aaabd2522aeee68fc1037de070758b50e249005038a2e58d750cbd3",
   "blackthorn/scripts/smoke_catalog.py": "65317cc9dd2728e3c3fca51b0b4632759c02d63d1cb1aa309037789f46f9da13",
   "blackthorn/skills/authorized-recon-basics/SKILL.md": "093784f63b0e0b3c5716c973a004c2bfe3f0b74588dd479a80d2d8481e15f56a",
   "blackthorn/skills/authorized-recon-basics/references/workflows.md": "ae84babb3722603ef8e46f52f8a76e3cf1ff852d0cfa6003ea38dbe16ba88afc",
@@ -63,5 +65,5 @@
   "blackthorn/version.py": "a3e10b7f2f39b4d9374851f0c9eb11bb878f68c35925994f623db312cf433ffe",
   "blackthorn_start.py": "847f0cc5ec83b846947b7c485abdb2592b0dd090bedf78af16022a0394d2e9f3"
  },
- "version": "5.6.0"
+ "version": "5.6.1"
 }

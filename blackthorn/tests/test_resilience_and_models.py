@@ -221,3 +221,42 @@ def test_an_unconfigured_model_is_listed_with_its_reason_instead_of_being_offere
     if not qwen.available:
         assert qwen.reason, "an unavailable model must explain itself"
         assert "endpoint" in qwen.reason or "key" in qwen.reason
+
+
+# ------------------------------------------------------- the Qwen serving path (item 5 prep)
+def test_the_qwen_serving_command_fits_a_two_t4_host_and_refuses_a_small_one(tmp_path):
+    """The model is 16.81 GB: the command must split across both T4s, and refuse one 16 GB card."""
+    from blackthorn.scripts.serve_qwen import build_command
+
+    two_t4 = [{"name": "Tesla T4", "vram_gb": 15.6}, {"name": "Tesla T4", "vram_gb": 15.6}]
+    cmd = build_command(tmp_path / "m.gguf", two_t4, port=8123, ctx=8192)
+    assert "--tensor-split" in cmd and cmd[cmd.index("--tensor-split") + 1] == "1,1"
+    assert "-ngl" in cmd and cmd[cmd.index("-ngl") + 1] == "99", "a GPU deployment puts every layer on the GPU"
+    assert "--jinja" in cmd, "tool calling needs the model's own chat template"
+    assert cmd[cmd.index("--port") + 1] == "8123"
+
+    with pytest.raises(SystemExit) as err:
+        build_command(tmp_path / "m.gguf", [{"name": "Tesla T4", "vram_gb": 15.6}])
+    assert "GPU memory" in str(err.value), "an impossible fit must say so, not crash later"
+
+
+def test_the_qwen_weights_are_reused_instead_of_downloaded_again(tmp_path, monkeypatch):
+    import blackthorn.scripts.serve_qwen as qwen
+
+    existing = tmp_path / qwen.FILE
+    with open(existing, "wb") as handle:                 # a sparse file: right size, no memory used
+        handle.truncate(1_000_000_001)
+    called = {"download": 0}
+    monkeypatch.setattr(qwen.urllib.request, "urlopen", lambda *a, **k: called.__setitem__("download", 1))
+    assert qwen.download(tmp_path) == existing
+    assert called["download"] == 0, "an existing 16.8 GB file must never be fetched again"
+
+
+def test_a_gated_model_download_without_a_token_explains_itself(tmp_path, monkeypatch):
+    import blackthorn.scripts.serve_qwen as qwen
+
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
+    with pytest.raises(SystemExit) as err:
+        qwen.download(tmp_path)
+    assert "gated" in str(err.value) and "HF_TOKEN" in str(err.value)
