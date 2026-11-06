@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import random
+import time
 from contextlib import AsyncExitStack
 from typing import Any, AsyncIterator, Dict, List, Optional
 
@@ -19,12 +22,15 @@ DEAD_TUNNEL_CODES = {404, 410, 502, 503, 504, 521, 522, 523, 524, 530}
 
 
 class LLMError(RuntimeError):
-    def __init__(self, code: str, message: str, *, retryable: bool = False, status: Optional[int] = None):
+    def __init__(self, code: str, message: str, *, retryable: bool = False, status: Optional[int] = None,
+                 retry_after: Optional[float] = None):
         super().__init__(message)
         self.code = code
         self.message = message
         self.retryable = retryable
         self.status = status
+        # Seconds the provider itself asked us to wait (``Retry-After``), when it said so.
+        self.retry_after = retry_after
 
 
 class ContextOverflow(LLMError):
@@ -129,6 +135,127 @@ def new_http_client() -> httpx.AsyncClient:
     )
 
 
+
+# ==================================================================================================
+# One model endpoint, one request at a time
+# --------------------------------------------------------------------------------------------------
+# A hosted endpoint answers 429 when it is asked for more than it will serve. The agent can start
+# several runs (two tabs, a retry, a resumed task) and each of them used to fire its own request, so
+# the service saw concurrent demand from a single account and throttled all of it. Every request now
+# passes a per-endpoint gate: at most ``BLACKTHORN_MODEL_CONCURRENCY`` in flight (default 1), a small
+# minimum gap between starts, and — after a 429 — a shared cooldown that every caller waits out, so a
+# throttle is respected once instead of being hit again by the next run.
+# ==================================================================================================
+RATE_LIMIT_MIN_WAIT = 1.0
+RATE_LIMIT_MAX_WAIT = 120.0
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.environ.get(name, "") or default))
+    except ValueError:
+        return default
+
+
+class EndpointGate:
+    """Bounded concurrency, a minimum interval and a shared cooldown for one endpoint."""
+
+    def __init__(self, concurrency: int = 1, min_interval: float = 0.0):
+        self._slots = asyncio.Semaphore(concurrency)
+        self._min_interval = max(0.0, min_interval)
+        self._next_start = 0.0
+        self._cooldown_until = 0.0
+        self._lock = asyncio.Lock()
+
+    def cooldown(self, seconds: float) -> None:
+        until = time.monotonic() + max(0.0, seconds)
+        if until > self._cooldown_until:
+            self._cooldown_until = until
+
+    def cooldown_remaining(self) -> float:
+        return max(0.0, self._cooldown_until - time.monotonic())
+
+    async def enter(self) -> None:
+        await self._slots.acquire()
+        # The cooldown is checked *inside* the slot so a caller that queued during a throttle does
+        # not slip through the moment the slot frees.
+        while True:
+            wait = self.cooldown_remaining()
+            if wait <= 0:
+                break
+            await asyncio.sleep(min(wait, 5.0))
+        async with self._lock:
+            gap = self._next_start - time.monotonic()
+            if gap > 0:
+                await asyncio.sleep(gap)
+            self._next_start = time.monotonic() + self._min_interval
+
+    def leave(self) -> None:
+        self._slots.release()
+
+
+_GATES: Dict[str, EndpointGate] = {}
+
+
+def gate_for(url: str) -> EndpointGate:
+    key = (url or "").rstrip("/")
+    gate = _GATES.get(key)
+    if gate is None:
+        gate = EndpointGate(concurrency=_int_env("BLACKTHORN_MODEL_CONCURRENCY", 1),
+                            min_interval=float(os.environ.get("BLACKTHORN_MODEL_MIN_INTERVAL_MS", "0") or 0) / 1000.0)
+        _GATES[key] = gate
+    return gate
+
+
+def retry_after_seconds(resp: httpx.Response, detail: str = "") -> Optional[float]:
+    """The provider's own instruction, from ``Retry-After`` (seconds or HTTP date) or ``X-RateLimit-Reset``."""
+    raw = (resp.headers.get("retry-after") or "").strip()
+    if raw:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            try:
+                from email.utils import parsedate_to_datetime
+                when = parsedate_to_datetime(raw)
+                return max(0.0, when.timestamp() - time.time())
+            except (TypeError, ValueError):
+                pass
+    for name in ("x-ratelimit-reset-requests", "x-ratelimit-reset"):
+        value = (resp.headers.get(name) or "").strip().rstrip("s")
+        if value:
+            try:
+                return max(0.0, float(value))
+            except ValueError:
+                pass
+    # A JSON body sometimes carries the wait ("retry_after": 20).
+    body = detail.lower()
+    for key in ('"retry_after"', '"retry-after"'):
+        at = body.find(key)
+        if at >= 0:
+            digits = ""
+            for ch in body[at + len(key):]:
+                if ch.isdigit() or ch == ".":
+                    digits += ch
+                elif digits:
+                    break
+            if digits:
+                try:
+                    return float(digits)
+                except ValueError:
+                    pass
+    return None
+
+
+def backoff_delay(attempt: int, retry_after: Optional[float] = None) -> float:
+    """Exponential backoff with jitter, never shorter than what the provider asked for."""
+    base = min(RATE_LIMIT_MAX_WAIT, 2.0 * (2 ** max(0, attempt - 1)))
+    jitter = random.uniform(0, base / 3)
+    delay = base + jitter
+    if retry_after is not None:
+        delay = max(delay, min(RATE_LIMIT_MAX_WAIT, max(RATE_LIMIT_MIN_WAIT, retry_after)))
+    return min(RATE_LIMIT_MAX_WAIT, delay)
+
+
 async def stream_chat(route: Route, messages: List[Dict[str, Any]], *, client: httpx.AsyncClient,
                       tools: Optional[List[Dict[str, Any]]] = None, idle_timeout: float = 150.0,
                       first_byte_timeout: float = 45.0,
@@ -163,6 +290,8 @@ async def stream_chat(route: Route, messages: List[Dict[str, Any]], *, client: h
     # ``first_byte_timeout`` and the connection is closed, not left to the idle timeout.
     # ``idle_timeout`` only governs gaps between later lines of an already-started answer.
     stack = AsyncExitStack()
+    gate = gate_for(route.url)
+    await gate.enter()
     try:
         cm = client.stream("POST", f"{route.url}/v1/chat/completions", json=body, timeout=timeout,
                            headers={**tunnel_headers(route.url), "Authorization": f"Bearer {route.api_key}",
@@ -185,6 +314,14 @@ async def stream_chat(route: Route, messages: List[Dict[str, Any]], *, client: h
                 # refresh the D1 route and retry this model step (never its earlier tools).
                 raise LLMError("model_auth", "The model provider did not accept this request's access key.",
                                status=resp.status_code)
+            if resp.status_code == 429:
+                wait = retry_after_seconds(resp, detail)
+                gate_for(route.url).cooldown(wait if wait is not None else 5.0)
+                # The provider is busy, not broken: this is retryable and the caller must keep the
+                # task alive across it. The wait it asked for is carried with the error.
+                raise LLMError("model_rate_limited",
+                               "The model provider is throttling requests right now.",
+                               retryable=True, status=429, retry_after=wait)
             if resp.status_code in DEAD_TUNNEL_CODES:
                 raise LLMError("model_unreachable", f"The model endpoint is unreachable (HTTP {resp.status_code}).",
                                retryable=True, status=resp.status_code)
@@ -254,3 +391,4 @@ async def stream_chat(route: Route, messages: List[Dict[str, Any]], *, client: h
         # Always close the upstream connection: a stalled or abandoned stream must not keep
         # a dead socket in the pool for the next request.
         await stack.aclose()
+        gate.leave()

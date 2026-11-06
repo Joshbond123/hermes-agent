@@ -133,7 +133,10 @@ async def test_compaction_summarises_instead_of_deleting(stack):
                       "status": "stop",
                       "ledger": [{"n": "run_command", "a": f'{{"command":"pip install pkg{i}"}}', "ok": i != 4,
                                   "s": "ok" if i != 4 else "error", "e": "" if i != 4 else "boom", "o": "done"}]})
-    messages, dropped, summary = prompts.compile_history(turns, budget_tokens=600, chars_per_token=3.2)
+    # 320 tokens: the execution record now rides in the system layer with its own share of the
+    # window, so the same 24 turns fit in 600 where they used to overflow. The budget is set to a
+    # value that genuinely exceeds the window for this data, which is what this test is about.
+    messages, dropped, summary = prompts.compile_history(turns, budget_tokens=320, chars_per_token=3.2)
     assert dropped > 0
     assert summary is not None
     assert "request number 0" in summary, "the opening request must survive inside the summary"

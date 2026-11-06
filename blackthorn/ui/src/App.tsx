@@ -8,6 +8,7 @@ import { Sidebar } from './components/Sidebar'
 import { SettingsDialog } from './components/Settings'
 import { Toasts, type Toast } from './components/Toasts'
 import { useCodespaces } from './codespaces'
+import { useModels } from './models'
 import { attachRun, startRun, type Outcome, type RunHandle } from './sse'
 import { initialState, reducer } from './state'
 import type { ServerEvent, Session, VersionInfo } from './types'
@@ -62,6 +63,18 @@ export default function App() {
     setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), kind === 'error' ? 7000 : 3500)
   }, [])
   const codespaces = useCodespaces(codespacesOpen, notify)
+  const models = useModels(state.chat.sessionId, state.chat.run !== null)
+  const [modelOpen, setModelOpen] = useState(false)
+  // The model for the very next message: the conversation's own when it has one, else the last pick.
+  const chosenModel = useRef<string>('')
+
+  const onChooseModel = useCallback((id: string) => {
+    chosenModel.current = id
+    setModelOpen(false)
+    void models.choose(id).then((ok) => {
+      if (ok) notify('info', `This chat will be answered by ${id.split('/').pop()}.`)
+    })
+  }, [models, notify])
 
   // ---------------------------------------------------------------- sessions list
   const loadSessions = useCallback(async (q = '') => {
@@ -78,10 +91,35 @@ export default function App() {
   }, [query, loadSessions])
 
   // ---------------------------------------------------------------- run plumbing
+  /**
+   * Token deltas are buffered and flushed once per animation frame.
+   *
+   * One React update per token re-renders the whole thread hundreds of times a second on a fast
+   * stream, which is exactly what made long answers flicker and the page feel unresponsive. Batching
+   * to the display's own refresh rate keeps the text smooth and the UI responsive, and it coalesces
+   * duplicate deltas that arrive in the same frame.
+   */
+  const pending = useRef<ServerEvent[]>([])
+  const frame = useRef<number | null>(null)
+  const flushEvents = useCallback(() => {
+    frame.current = null
+    const batch = pending.current
+    pending.current = []
+    for (const ev of batch) dispatch({ type: 'run/event', event: ev })
+  }, [])
   const onEvent = useCallback((ev: ServerEvent) => {
     if (ev.type === 'run.start' && !stateRef.current.chat.sessionId) window.history.replaceState(null, '', `/c/${ev.session_id}`)
+    if (ev.type === 'text.delta' || ev.type === 'tool.progress') {
+      pending.current.push(ev)
+      if (frame.current === null) frame.current = requestAnimationFrame(flushEvents)
+      return
+    }
+    // Anything structural (a tool starting or finishing, the run ending) is applied at once, after
+    // the text already received, so ordering is never lost.
+    if (pending.current.length) flushEvents()
     dispatch({ type: 'run/event', event: ev })
-  }, [])
+  }, [flushEvents])
+  useEffect(() => () => { if (frame.current !== null) cancelAnimationFrame(frame.current) }, [])
 
   const reloadCurrent = useCallback(async () => {
     const id = stateRef.current.chat.sessionId
@@ -180,7 +218,8 @@ export default function App() {
     const userId = uid('tmp-')
     const assistantId = uid('tmpa-')
     dispatch({ type: 'send/start', userId, assistantId, text, attachments: files.map((f) => ({ name: f.name, chars: f.content.length })) })
-    const handle = startRun({ session_id: stateRef.current.chat.sessionId ?? undefined, message: text, attachments: files }, onEvent)
+    const handle = startRun({ session_id: stateRef.current.chat.sessionId ?? undefined, message: text, attachments: files,
+      model: chosenModel.current || undefined }, onEvent)
     runRef.current = handle
     try {
       afterRun(await handle.done, handle)
@@ -305,7 +344,9 @@ export default function App() {
       <div className="main">
         <Header title={chat.title} sidebarOpen={sidebarOpen} onToggleSidebar={toggleSidebar} onNew={() => goNew()}
           codespaces={codespaces} csOpen={codespacesOpen} onToggleCodespaces={() => setCodespacesOpen((v) => !v)}
-          onCloseCodespaces={() => setCodespacesOpen(false)} />
+          onCloseCodespaces={() => setCodespacesOpen(false)}
+          models={models} modelOpen={modelOpen} onToggleModels={() => setModelOpen((v) => !v)}
+          onChooseModel={onChooseModel} onCloseModels={() => setModelOpen(false)} />
         <Chat chat={chat} onRegenerate={() => void regenerate()} onRetryLoad={() => chat.sessionId && void openSession(chat.sessionId, false)} />
         <Composer busy={chat.run !== null} stopping={chat.run?.stopping ?? false} onSend={send} onStop={() => void stop()}
           onError={(t) => notify('error', t)} focusKey={chat.sessionId ?? 'new'} banner={banner} />

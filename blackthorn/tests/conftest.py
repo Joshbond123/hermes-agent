@@ -12,6 +12,8 @@ import httpx
 import pytest
 import pytest_asyncio
 
+from blackthorn import agent as agent_module
+
 from blackthorn.app import build_services, create_app
 from blackthorn.config import Settings
 from blackthorn.sql import SqliteExecutor
@@ -110,6 +112,17 @@ def fake_codespace(services, *, backend_url: str = "", state: str = "ON", name: 
     """Attach a fake codespace computer to a Services instance (no network, real manager code)."""
     from .fake_codespaces import attach_fake_codespace
     return attach_fake_codespace(services, backend_url, name=name, state=state)
+
+
+@pytest.fixture(autouse=True)
+def _deterministic_run_recovery(monkeypatch):
+    """Run-level resumption is off by default in tests.
+
+    Most tests pin what happens when every retry budget is exhausted, which is a different question
+    from "does a throttle keep the task alive". Tests that exercise resumption set the value
+    themselves, so both behaviours are stated explicitly instead of one silently masking the other.
+    """
+    monkeypatch.setattr(agent_module, "RUN_RESUME_ATTEMPTS", 0)
 
 
 @pytest_asyncio.fixture

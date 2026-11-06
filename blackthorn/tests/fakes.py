@@ -121,7 +121,9 @@ class FakeBackend:
             self.requests.append(body)
             turn = self.script.pop(0) if self.script else [*say("(no script)"), finish("stop")]
             if isinstance(turn, dict) and "http_error" in turn:
-                return JSONResponse({"error": {"message": turn["message"]}}, status_code=turn["http_error"])
+                # ``headers`` lets a test state what a real provider states (Retry-After).
+                return JSONResponse({"error": {"message": turn["message"]}}, status_code=turn["http_error"],
+                                    headers=turn.get("headers") or None)
 
             async def stream():
                 try:

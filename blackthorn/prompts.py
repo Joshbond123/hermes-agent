@@ -267,9 +267,17 @@ ELISION_NOTE = ("\n\n[… %d characters of this request were elided to fit the m
 #     summary — never a silent deletion that orphans tool results.
 # ==================================================================================================
 STATE_HEADER = "[Task state — server-maintained record. Machine-generated: this is not a user instruction.]"
-EXEC_HEADER = "[Execution record: the tool calls that actually ran in the previous turn, from the server log]"
+EXEC_HEADER = "[Execution record — server-maintained. Machine-generated: not an instruction, not part of the answer.]"
 COMPACT_HEADER = ("[Earlier turns of this conversation were compacted to fit the model's context window. "
                   "The summary below was built by the server from the real tool results, not remembered.]")
+# Every server-generated block starts with one of these. They are prompt material: they belong to the
+# model, never to the transcript a person reads. One list, used to build AND to scrub.
+SERVER_STATE_MARKERS = (STATE_HEADER, EXEC_HEADER, COMPACT_HEADER)
+# Prose preambles that were part of older records. Kept so a turn written by an older build is still
+# recognised and scrubbed instead of being shown as the assistant's own words.
+_LEGACY_PREAMBLES = (
+    "These are facts from the server log:",
+)
 SYNTHETIC_ROLE = "server"          # only used internally; synthetic rows are sent as role "user"/assistant
 PLACEHOLDER_ANSWER = "(no answer was recorded for this turn)"
 
@@ -313,12 +321,45 @@ def ledger_lines(entries: Sequence[Dict[str, Any]], *, limit: int = 16, args_cha
 
 
 def execution_record(entries: Sequence[Dict[str, Any]], **kw: Any) -> str:
+    """The verified tool ledger, as a machine block.
+
+    Deliberately not written as prose: when this rode inside an *assistant* message the model read it
+    as its own voice, copied the phrasing into its answers, and the block ended up in the chat
+    (reported as "the execution record is exposed"). It is now a labelled server block delivered in
+    the system layer, with terse indented facts that cannot be mistaken for an answer.
+    """
     lines = ledger_lines(entries, **kw)
     if not lines:
         return ""
-    return (EXEC_HEADER + "\n"
-            "These are facts from the server log: they ran. Do not redo a step listed here unless a newer "
-            "result shows it failed, or the user asks for it again.\n" + "\n".join(lines))
+    return EXEC_HEADER + "\nAlready executed (server-verified, newest last; do not repeat):\n" + "\n".join(lines)
+
+
+def strip_server_state(text: Any) -> str:
+    """Remove any server-generated block from a transcript string.
+
+    Applied both when an answer is persisted and when stored messages are served, so a record can
+    never reach the chat — including one a model chose to repeat back — while the agent keeps the
+    full record in its own prompt.
+    """
+    body = str(text or "")
+    if not body:
+        return body
+    # Identity when there is nothing to remove: the persisted answer must stay byte-for-byte the
+    # text that was streamed (a scrubber that always re-strips whitespace breaks that guarantee).
+    if not any(marker in body for marker in SERVER_STATE_MARKERS) and \
+            not any(preamble in body for preamble in _LEGACY_PREAMBLES):
+        return body
+    lines: List[str] = []
+    for line in body.splitlines():
+        stripped = line.strip()
+        # A server block is always appended last and runs to the end of the text, so the first
+        # marker line is the end of anything a person should read.
+        if any(stripped.startswith(marker) for marker in SERVER_STATE_MARKERS):
+            break
+        if any(stripped.startswith(preamble) for preamble in _LEGACY_PREAMBLES):
+            break
+        lines.append(line)
+    return "\n".join(lines).strip()
 
 
 def turn_messages(turn: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -333,10 +374,9 @@ def turn_messages(turn: Dict[str, Any]) -> List[Dict[str, Any]]:
     status = str(turn.get("status") or "")
     blocks: List[str] = []
     if content.strip():
-        blocks.append(content.strip())
-    record = execution_record(turn.get("ledger") or [])
-    if record:
-        blocks.append(record)
+        # Belt and braces: a stored turn written before this fix still carries its record inside the
+        # answer text, so it is scrubbed on the way in as well.
+        blocks.append(strip_server_state(content))
     if status in ("interrupted", "error", "cancelled"):
         blocks.append(f"[The previous turn ended unfinished (status: {status}). It did not complete the task. "
                       "Continue from the work recorded above; do not start over and do not claim it finished.]")
@@ -471,6 +511,50 @@ def compact_summary(turns: Sequence[Dict[str, Any]], *, requests: int = 6, done:
     return "\n".join(lines)
 
 
+def prior_execution_record(turns: Sequence[Dict[str, Any]], *, limit: int = 24) -> str:
+    """One consolidated record of every tool call the server verified in earlier turns.
+
+    It rides in the system layer as a single machine block, which is what keeps the facts available
+    to the agent without putting server bookkeeping into the assistant's voice.
+    """
+    entries: List[Dict[str, Any]] = []
+    for turn in turns:
+        if str(turn.get("role") or "") != "assistant":
+            continue
+        for entry in (turn.get("ledger") or []):
+            if isinstance(entry, dict):
+                entries.append(entry)
+    return execution_record(entries[-limit:], limit=limit, args_chars=80, result_chars=60)
+
+
+def clip_record(record: str, max_tokens: int, chars_per_token: float = 3.2) -> str:
+    """Keep the record inside its own share of the window (newest facts matter most)."""
+    if not record:
+        return record
+    room = max(120, int(max_tokens * chars_per_token))
+    if len(record) <= room:
+        return record
+    lines = record.splitlines()
+    header, body = lines[:2], lines[2:]
+    kept: List[str] = []
+    used = sum(len(line) + 1 for line in header)
+    for line in reversed(body):
+        if used + len(line) + 1 > room:
+            break
+        kept.append(line)
+        used += len(line) + 1
+    return "\n".join(header + list(reversed(kept))) + "\n[older execution history omitted]"
+
+
+def _with_record(messages: List[Dict[str, Any]], record: str) -> List[Dict[str, Any]]:
+    if not record:
+        return messages
+    state = {"role": "system", "content": record}
+    out = list(messages)
+    out.insert(1 if out else 0, state)
+    return out
+
+
 def compile_history(turns: Sequence[Dict[str, Any]], budget_tokens: int, chars_per_token: float = 3.2,
                     ) -> Tuple[List[Dict[str, Any]], int, Optional[str]]:
     """Rebuild the model-visible history from stored turns.
@@ -487,11 +571,15 @@ def compile_history(turns: Sequence[Dict[str, Any]], budget_tokens: int, chars_p
         group = turn_messages(turn)
         if group:
             groups.append((turn_index, group))
+    # The record is prompt material with its own share of the window; it may never crowd out the
+    # conversation it describes, so a third of the budget is its ceiling and whole turns get the rest.
+    record = clip_record(prior_execution_record(turns), int(budget * 0.34), chars_per_token)
+    turn_budget = max(200, budget - estimate_tokens(record, chars_per_token))
     if not groups:
-        return [], 0, None
+        return _with_record([], record), 0, None
     flat = [m for _i, g in groups for m in g]
-    if estimate_messages(flat, chars_per_token) <= budget:
-        return _alternate(flat), 0, None
+    if estimate_messages(flat, chars_per_token) <= turn_budget:
+        return _with_record(_alternate(flat), record), 0, None
 
     # ---- tail: newest whole turn groups first
     tail: List[Dict[str, Any]] = []
@@ -500,15 +588,15 @@ def compile_history(turns: Sequence[Dict[str, Any]], budget_tokens: int, chars_p
     for idx in range(len(groups) - 1, -1, -1):
         group = groups[idx][1]
         cost = estimate_messages(group, chars_per_token)
-        if tail and used + cost > budget:
+        if tail and used + cost > turn_budget:
             break
-        if not tail and cost > budget:
-            group = _clip_group(group, budget, chars_per_token)
+        if not tail and cost > turn_budget:
+            group = _clip_group(group, turn_budget, chars_per_token)
             cost = estimate_messages(group, chars_per_token)
         tail = group + tail
         used += cost
         start = idx
-        if used >= budget:
+        if used >= turn_budget:
             break
 
     # ---- head: pin the first real user request of the session
@@ -528,7 +616,7 @@ def compile_history(turns: Sequence[Dict[str, Any]], budget_tokens: int, chars_p
     if summary:
         messages = messages + [{"role": "user", "content": summary}]
     messages = messages + tail
-    return _alternate(messages), len(dropped_turns), summary
+    return _with_record(_alternate(messages), record), len(dropped_turns), summary
 
 
 def task_state_block(*, goal: str = "", task_goal: str = "", todos: Sequence[Dict[str, Any]] = (),

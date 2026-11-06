@@ -1,3 +1,4 @@
+import type { ModelCatalogue } from './models'
 import type { CodespaceStatus, CodespaceUsage, Message, Session, VersionInfo } from './types'
 
 export class ApiError extends Error {
@@ -60,7 +61,7 @@ export const api = {
       request<{ sessions: Session[] }>(`/api/chat/sessions?archived=${archived ? 1 : 0}${q ? `&q=${encodeURIComponent(q)}` : ''}`).then((r) => r.sessions),
     get: (id: string) =>
       request<{ session: Session; messages: Message[]; live_run: { run_id: string; last_seq: number } | null }>(`/api/chat/sessions/${encodeURIComponent(id)}`),
-    patch: (id: string, body: { title?: string; pinned?: boolean; archived?: boolean }) =>
+    patch: (id: string, body: { title?: string; pinned?: boolean; archived?: boolean; model?: string }) =>
       request<{ session: Session }>(`/api/chat/sessions/${encodeURIComponent(id)}`, { method: 'PATCH', ...json(body) }).then((r) => r.session),
     remove: (id: string) => request<{ ok: boolean }>(`/api/chat/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   },
@@ -70,6 +71,14 @@ export const api = {
     start: () => request<{ ok: boolean }>('/api/codespaces/start', { method: 'POST', timeoutMs: 240000 }),
     stop: () => request<{ ok: boolean; stopped?: boolean; reason?: string; detail?: string }>('/api/codespaces/stop', { method: 'POST', timeoutMs: 180000 }),
     restart: () => request<{ ok: boolean }>('/api/codespaces/restart', { method: 'POST', timeoutMs: 420000 }),
+  },
+  models: {
+    list: (sessionId?: string | null) =>
+      request<ModelCatalogue>(`/api/models${sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ''}`),
+    /** Switch the model of an existing conversation. The conversation itself is untouched. */
+    choose: (sessionId: string, model: string) =>
+      request<{ session: Session; model: string; applies_to: string; active_run?: { id: string; model: string; note: string } }>(
+        `/api/chat/sessions/${encodeURIComponent(sessionId)}`, { method: 'PATCH', ...json({ model }) }),
   },
   prompt: {
     get: () => request<{ prompt: string }>('/api/system-prompt').then((r) => r.prompt),

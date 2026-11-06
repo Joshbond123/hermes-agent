@@ -81,6 +81,9 @@ def _session_dict(row: Dict[str, Any]) -> Dict[str, Any]:
         "created_at": row.get("started_at"),
         "updated_at": row.get("updated_at") or row.get("started_at"),
         "message_count": int(row.get("message_count") or 0),
+        # The conversation's model travels with the conversation, so the header can show it and a
+        # switch survives a reload.
+        "model": str(row.get("model") or ""),
     }
 
 
@@ -121,6 +124,34 @@ def _turn_record(row: Dict[str, Any]) -> Dict[str, Any]:
     status = str(row.get("finish_reason") or "")
     return {"role": row.get("role"), "content": row.get("content") or "", "status": status,
             "ledger": ledger_from_row(row) if row.get("role") == "assistant" else []}
+
+
+def _public_text(text: str) -> str:
+    """What a person may read: server-generated blocks are removed, everything else is untouched."""
+    try:
+        from .prompts import strip_server_state
+        return strip_server_state(text)
+    except Exception:  # noqa: BLE001 - never fail a save over a scrubber
+        return text
+
+
+def _public_part(part: Dict[str, Any]) -> Dict[str, Any]:
+    if isinstance(part, dict) and part.get("type") == "text":
+        cleaned = _public_text(str(part.get("text") or ""))
+        if cleaned != part.get("text"):
+            return {**part, "text": cleaned}
+    return part
+
+
+def _public_message(message: Dict[str, Any]) -> Dict[str, Any]:
+    """Scrub stored content on the way out as well, so rows written by an older build are clean."""
+    content = _public_text(str(message.get("content") or ""))
+    if content != (message.get("content") or ""):
+        message["content"] = content
+    parts = message.get("parts")
+    if isinstance(parts, list):
+        message["parts"] = [_public_part(p) for p in parts]
+    return message
 
 
 def message_dict(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -208,14 +239,15 @@ class ChatStore:
         res = await self.db.query(
             "SELECT id, COALESCE(NULLIF(title,''), NULLIF(display_name,''), '') AS title, COALESCE(pinned,0) AS pinned, "
             "COALESCE(archived,0) AS archived, started_at, COALESCE(last_activity_at, started_at) AS updated_at, "
-            "COALESCE(message_count,0) AS message_count FROM sessions WHERE id = ? AND source = ?",
+            "COALESCE(message_count,0) AS message_count, COALESCE(model,'') AS model "
+            "FROM sessions WHERE id = ? AND source = ?",
             [session_id, self.source])
         if not res.rows:
             raise NotFound(session_id)
         return _session_dict(res.rows[0])
 
     async def update_session(self, session_id: str, *, title: Optional[str] = None, pinned: Optional[bool] = None,
-                             archived: Optional[bool] = None) -> Dict[str, Any]:
+                             archived: Optional[bool] = None, model: Optional[str] = None) -> Dict[str, Any]:
         await self.ensure_schema()
         sets: List[str] = []
         params: List[Any] = []
@@ -228,6 +260,11 @@ class ChatStore:
         if pinned is not None:
             sets.append("pinned = ?")
             params.append(1 if pinned else 0)
+        if model is not None:
+            # The model is a property of the conversation, like a chat's in ChatGPT: switching it
+            # keeps the history, the plan and the transcript, and applies to the next turn.
+            sets += ["model = ?"]
+            params.append(str(model))
         if archived is not None:
             sets.append("archived = ?")
             params.append(1 if archived else 0)
@@ -258,7 +295,7 @@ class ChatStore:
             "SELECT m.id, m.role, m.content, m.timestamp, m.finish_reason, m.message_uid, m.display_kind, "
             "m.display_metadata FROM messages m WHERE m.session_id = ? AND m.role IN ('user','assistant') "
             "AND COALESCE(m.active,1) = 1 ORDER BY m.id ASC LIMIT ?", [session_id, int(limit)])
-        return [message_dict(r) for r in res.rows]
+        return [_public_message(message_dict(r)) for r in res.rows]
 
     async def begin_turn(self, session_id: Optional[str], user_text: str, *, model: str,
                          attachments: Optional[List[Dict[str, Any]]] = None, history_limit: int = 24,
@@ -302,7 +339,8 @@ class ChatStore:
             # 5: final session row for the client
             ("SELECT id, COALESCE(NULLIF(title,''), NULLIF(display_name,''), '') AS title, COALESCE(pinned,0) AS pinned, "
              "COALESCE(archived,0) AS archived, started_at, COALESCE(last_activity_at, started_at) AS updated_at, "
-             "COALESCE(message_count,0) AS message_count FROM sessions WHERE id = ? AND source = ?", [sid, self.source]),
+             "COALESCE(message_count,0) AS message_count, COALESCE(model,'') AS model "
+            "FROM sessions WHERE id = ? AND source = ?", [sid, self.source]),
         ]
         out = await self.db.batch(stmts)
         if out[2].changes == 0 or not out[5].rows:
@@ -353,6 +391,10 @@ class ChatStore:
     async def update_assistant(self, uid: str, *, text: str, parts: List[Dict[str, Any]], status: str,
                                meta: Optional[Dict[str, Any]] = None, tokens: Optional[int] = None,
                                ledger: Optional[List[Dict[str, Any]]] = None) -> None:
+        # Server bookkeeping belongs to the prompt, not the transcript: a model that repeats an
+        # execution record must not get it stored as its answer (that is how it appeared in chat).
+        text = _public_text(text)
+        parts = [_public_part(part) for part in parts]
         payload: Dict[str, Any] = {"v": 1, "parts": parts}
         if ledger is not None:
             # Server-side only: message_dict() does not expose it, so the client payload is unchanged.

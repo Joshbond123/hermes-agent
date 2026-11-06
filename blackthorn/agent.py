@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 
 from . import prompts, recovery
-from .llm import ContextOverflow, LLMError, server_context, stream_chat
+from .llm import ContextOverflow, LLMError, backoff_delay, server_context, stream_chat
 from .route import RouteError, RouteResolver
 from .runs import Run
 from .tools import ToolContext, ToolRegistry, ToolResult, loads_args, redact
@@ -73,6 +73,14 @@ GATE_STEPS = 6                      # extra steps a run may spend on the complet
 # failures never produce a strike (they are retried), so this can be higher than the old value of 3
 # without letting a real loop run longer.
 MAX_STRIKES = int(__import__("os").environ.get("BLACKTHORN_MAX_STRIKES", "3") or 3)
+# How many times one model step may wait out a provider throttle before the run-level supervisor
+# takes over (which persists and resumes instead of failing the task).
+RATE_LIMIT_ATTEMPTS = int(__import__("os").environ.get("BLACKTHORN_RATE_LIMIT_ATTEMPTS", "6") or 6)
+# How many times a *run* may be resumed after a transient fault (throttle, dropped stream, provider
+# blip) instead of ending the task. Each resume continues from the exact message state.
+# 0 disables run-level resumption (the in-step retries remain); the default keeps a task alive
+# across provider throttles and dropped connections.
+RUN_RESUME_ATTEMPTS = int(__import__("os").environ.get("BLACKTHORN_RESUME_ATTEMPTS", "6") or 6)
 MAX_RECOVERY_ROUNDS = int(__import__("os").environ.get("BLACKTHORN_MAX_RECOVERY_ROUNDS", "3") or 3)
 # How many times a stalled loop may be answered with "change your approach" before the run
 # falls back to a final answer. Two rounds fixed the observed failure (the agent gave up on a
@@ -165,6 +173,9 @@ class AgentRun:
         self.previous_attempt = previous_attempt            # ledger of a discarded regenerate attempt
         self.resume_hint = resume_hint
         self.model = model
+        # The model this conversation asked for. It is fixed for the life of the run: switching the
+        # session's model mid-run must never silently swap the model executing the task.
+        self.requested_model = model
         self.parts: List[Dict[str, Any]] = []
         self.ledger: List[Dict[str, Any]] = []              # what ran in THIS turn, in completion order
         self._epoch = 0                                     # bumped by a successful write
@@ -184,6 +195,8 @@ class AgentRun:
         self._ctx_retries = 0            # bounded retries when a request will not fit the window
         self._server_ctx = 0             # context window the runtime actually reports, not what we assume
         self._ctx_probed = False
+        self._resume_messages: Optional[List[Dict[str, Any]]] = None
+        self._elapsed_before_resume = 0.0
         self._state_cache = ""
         self._messages: List[Dict[str, Any]] = []
         self.tool_calls_total = 0
@@ -669,6 +682,69 @@ class AgentRun:
                 except Exception as exc:
                     log.warning("active computer keepalive failed: %s", type(exc).__name__)
 
+    # ---------------------------------------------------------------- run supervision
+    def _resumable(self, exc: BaseException) -> bool:
+        """Is this failure something a resumed run can survive without the user restarting?"""
+        code = str(getattr(exc, "code", "") or "")
+        if code in ("model_rate_limited", "model_unreachable", "model_dropped", "model_stalled",
+                    "model_http", "tool_transient", "storage_unavailable"):
+            return True
+        return bool(getattr(exc, "retryable", False))
+
+    async def _run_with_recovery(self) -> None:
+        """Keep the task alive across provider throttles and dropped connections.
+
+        The loop is the task; a model request is only one step of it. When a step fails for a reason
+        that is not the task's fault — HTTP 429, a dropped stream, an edge blip — the run is *resumed*
+        from the exact message state it had reached (so no tool is replayed and no result is lost)
+        after the delay the provider asked for. It stops only when the task is done, the user cancels,
+        or the failure is genuinely unrecoverable (a rejected credential, an unparseable request).
+        """
+        attempts = 0
+        started = time.monotonic()
+        while True:
+            try:
+                await self._loop()
+                return
+            except asyncio.CancelledError:
+                raise
+            except (LLMError, RunFailure, RouteError) as exc:
+                if not self._resumable(exc) or RUN_RESUME_ATTEMPTS <= 0 or attempts >= RUN_RESUME_ATTEMPTS:
+                    raise
+                if self._messages is None:
+                    raise
+                elapsed = time.monotonic() - started + self._elapsed_before_resume
+                if elapsed >= self.deps.settings.run_timeout_s:
+                    raise
+                attempts += 1
+                self._elapsed_before_resume = elapsed
+                code = str(getattr(exc, "code", "") or "transient")
+                delay = backoff_delay(attempts, getattr(exc, "retry_after", None))
+                # The checkpoint is the conversation itself: it is preserved in memory and in D1, so a
+                # restart of this process can resume the task as well (see ``recover_interrupted``).
+                self._resume_messages = self._messages
+                self.run.emit("internal.checkpoint", attempts=attempts, code=code,
+                              messages=len(self._messages), delay_s=round(delay, 1))
+                self.run.emit("notice", level="info", text=(
+                    "The task is paused, not lost: " +
+                    ("the provider is throttling requests" if code == "model_rate_limited"
+                     else "the model connection dropped") +
+                    f". Resuming automatically in {delay:.0f}s (attempt {attempts} of {RUN_RESUME_ATTEMPTS})."
+                ))
+                try:
+                    await self.deps.store.set_setting("bt_resume:" + self.run.session_id, json.dumps({
+                        "run_id": self.run.id, "assistant_id": self.run.assistant_id,
+                        "attempts": attempts, "code": code, "at": time.time(),
+                        "expires": time.time() + 3600,
+                        "model": self.model,
+                    }))
+                except Exception:  # noqa: BLE001 - a bookkeeping write must not end the task
+                    pass
+                await asyncio.sleep(delay)
+                if attempts == 1:
+                    self.deps.resolver.invalidate()
+                self._check()
+
     async def execute(self) -> None:
         status, error = "stop", None
         self._activity("run_started")
@@ -683,7 +759,7 @@ class AgentRun:
             await self.deps.store.set_setting("bt_run:" + self.run.id, json.dumps({
                 "session_id": self.run.session_id, "expires": time.time() + 120}))
             self.timings_ms["lease"] += int((time.monotonic() - lease_started) * 1000)
-            await self._loop()
+            await self._run_with_recovery()
             status = "length" if self.finish_reason == "length" else "stop"
         except asyncio.CancelledError:
             status = "cancelled" if self.run.cancel_event.is_set() else "interrupted"
@@ -760,6 +836,24 @@ class AgentRun:
     async def _loop(self) -> None:
         s = self.deps.settings
         cpt = s.chars_per_token
+        resume_from = self._resume_messages
+        self._resume_messages = None
+        if resume_from:
+            # A transient fault interrupted this run; continue the very same conversation: the tool
+            # results already collected stay in place, so nothing is re-executed and nothing is lost.
+            messages = resume_from
+            self._state_cache = str((messages[0] or {}).get("content") or "")
+            self._history_len = self._history_len or len(messages)
+            if self._state_cache:
+                self._sync_state()
+            self.run.emit("notice", level="info", text="Resuming the task from its last checkpoint.")
+            self._messages = messages
+        else:
+            messages = self._build_messages(cpt)
+        self._messages = messages
+        return await self._step_loop(messages)
+
+    def _build_messages(self, cpt: float) -> List[Dict[str, Any]]:
         messages: List[Dict[str, Any]] = [{"role": "system", "content": self._system_content()}]
         self._state_cache = messages[0]["content"]
         used = prompts.estimate_tokens(messages[0]["content"], cpt) + prompts.estimate_tokens(self.user_message, cpt) + 24
@@ -772,7 +866,11 @@ class AgentRun:
             self.run.emit("internal.compaction", count=dropped, stage="history")
         messages.append({"role": "user", "content": self.user_message})
         self._messages = messages
+        return messages
 
+    async def _step_loop(self, messages: List[Dict[str, Any]]) -> None:
+        s = self.deps.settings
+        cpt = s.chars_per_token
         force_final = False
         empty_retries = 0
         length_continues = 0
@@ -906,7 +1004,7 @@ class AgentRun:
             return
         self._ctx_probed = True
         try:
-            route = await self.deps.resolver.get()
+            route = await self.deps.resolver.get(model=self.requested_model)
         except Exception:  # noqa: BLE001 - the next step will surface a real route error
             return
         try:
@@ -958,7 +1056,7 @@ class AgentRun:
                 ):
                     messages.append({"role": "user", "content": RESUME_NOTE})
             route_started = time.monotonic()
-            route = await self.deps.resolver.get()
+            route = await self.deps.resolver.get(model=self.requested_model)
             self.timings_ms["route"] += int((time.monotonic() - route_started) * 1000)
             self.model = route.model
             self._produced = False
@@ -1011,16 +1109,31 @@ class AgentRun:
                 # Transport faults (edge timeout 524, dropped tunnel, stalled stream) are not
                 # the model failing: recover instead of killing a long run mid-task. A dead endpoint
                 # still fails fast (retryable=False on auth/protocol errors).
-                transient = (exc.retryable or
+                rate_limited = exc.code == "model_rate_limited"
+                transient = (exc.retryable or rate_limited or
                              exc.code in ("model_unreachable", "model_dropped", "model_stalled") or
                              (exc.status is not None and exc.status in (502, 503, 521, 522, 523, 524)))
-                # More patience on edge/proxy blips; auth/protocol still fail fast (retryable=False).
-                # Bounded and visible (attempt N of limit); the first-byte watchdog already
-                # fails over half-open sockets quickly, so each attempt is cheap.
-                limit = 6 if (exc.status in (502, 503, 521, 522, 523, 524) or
-                              exc.code in ("model_unreachable", "model_dropped", "model_stalled")) else 3
+                # More patience on edge/proxy blips and throttles; auth/protocol still fail fast
+                # (retryable=False). Bounded and visible (attempt N of limit); the first-byte
+                # watchdog already fails over half-open sockets quickly, so each attempt is cheap.
+                if rate_limited:
+                    limit = RATE_LIMIT_ATTEMPTS
+                else:
+                    limit = 6 if (exc.status in (502, 503, 521, 522, 523, 524) or
+                                  exc.code in ("model_unreachable", "model_dropped", "model_stalled")) else 3
                 if not transient or attempt >= limit:
                     raise
+                if rate_limited:
+                    # Wait exactly as long as the provider asked (or a jittered exponential backoff
+                    # when it did not say), and tell the user in plain words. The task is untouched:
+                    # no tool is replayed and no message is dropped.
+                    delay = backoff_delay(attempt, exc.retry_after)
+                    self.run.emit("notice", level="info", text=(
+                        f"The model provider is throttling requests. Waiting {delay:.0f}s and continuing "
+                        f"(attempt {attempt} of {limit}) — your task is preserved."))
+                    self.run.emit("internal.throttle", seconds=round(delay, 1), attempt=attempt, limit=limit)
+                    await asyncio.sleep(delay)
+                    continue
                 self.deps.resolver.invalidate()
                 partial = "".join(part["text"] for part in self.parts if part["type"] == "text")[before:]
                 # Every recovery is visible with a bounded attempt count: a silent wait of minutes

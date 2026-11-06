@@ -62,6 +62,8 @@ export interface Session {
   created_at?: number
   updated_at?: number
   message_count: number
+  /** the model this conversation is answered by (empty means the server default) */
+  model?: string
 }
 
 export type CodespaceState = 'ON' | 'OFF' | 'STARTING' | 'STOPPING' | 'ERROR'

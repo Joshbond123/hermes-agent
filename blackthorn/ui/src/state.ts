@@ -136,7 +136,9 @@ function reduceEvent(state: AppState, ev: ServerEvent): AppState {
     const run = chat.run
     // swap the temporary client ids for the server's ids (user message then assistant message)
     const messages = chat.messages.map((m, i) => {
-      if (run && m.id === run.assistantId) return { ...m, id: ev.assistant_id }
+      // The model that answers is part of the message's own record, so a turn that was answered by a
+      // different model after a switch is stated in the transcript instead of being ambiguous.
+      if (run && m.id === run.assistantId) return { ...m, id: ev.assistant_id, meta: { ...(m.meta ?? {}), model: ev.model } }
       if (ev.user_id && m.role === 'user' && i === chat.messages.length - 2 && m.id.startsWith('tmp-')) {
         ids.set(m.id, ev.user_id)
         return { ...m, id: ev.user_id }

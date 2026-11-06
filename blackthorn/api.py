@@ -175,6 +175,21 @@ class SessionPatch(BaseModel):
     title: Optional[str] = Field(default=None, max_length=200)
     pinned: Optional[bool] = None
     archived: Optional[bool] = None
+    model: Optional[str] = Field(default=None, max_length=200)
+
+
+@router.get("/api/models")
+async def list_models(request: Request):
+    """The models this conversation can switch between, and which one it is using."""
+    s = svc(request)
+    active = ""
+    session_id = request.query_params.get("session_id") or ""
+    if session_id:
+        try:
+            active = str((await s.store.get_session(session_id)).get("model") or "")
+        except Exception:  # noqa: BLE001 - an unknown session just means "the default model"
+            active = ""
+    return s.resolver.describe_all(active=active)
 
 
 @router.get("/api/chat/sessions")
@@ -213,13 +228,32 @@ async def get_session(session_id: str, request: Request):
 @router.patch("/api/chat/sessions/{session_id}")
 async def patch_session(session_id: str, patch: SessionPatch, request: Request):
     s = svc(request)
+    if patch.model is not None:
+        option = s.resolver.find(patch.model)
+        if option is None:
+            raise _err(422, "model_unknown", f"The model “{patch.model}” is not configured on this server.")
+        if not option.available:
+            raise _err(409, "model_unavailable", f"{option.label} is not available: {option.reason}.")
     try:
-        session = await s.store.update_session(session_id, title=patch.title, pinned=patch.pinned, archived=patch.archived)
+        session = await s.store.update_session(session_id, title=patch.title, pinned=patch.pinned,
+                                              archived=patch.archived, model=patch.model)
     except NotFound:
         raise _err(404, "not_found", "That conversation no longer exists.")
     except ValueError as exc:
         raise _err(422, "invalid", str(exc))
-    return {"session": session}
+    out: Dict[str, Any] = {"session": session}
+    if patch.model is not None:
+        live = s.runs.live_for_session(session_id)
+        # A task that is already executing keeps the model that started it: saying so is the honest
+        # behaviour, and it is what makes the switch explicit instead of a silent swap mid-task.
+        out["model"] = patch.model
+        out["applies_to"] = "next_turn"
+        if live is not None:
+            running_model = getattr(getattr(live, "agent", None), "requested_model", "") or ""
+            out["active_run"] = {"id": live.id, "model": running_model,
+                                 "note": ("The task that is running keeps the model it started with; the "
+                                          "switch applies to your next message.")}
+    return out
 
 
 @router.delete("/api/chat/sessions/{session_id}")
@@ -247,6 +281,9 @@ class StreamRequest(BaseModel):
     message: Optional[str] = None
     regenerate: bool = False
     attachments: List[AttachmentIn] = Field(default_factory=list)
+    # Optional per-message override. Normally the conversation's own model is used, so switching in
+    # the header changes the model for the chat without creating a new one.
+    model: Optional[str] = Field(default=None, max_length=200)
 
 
 def _sse_bytes(event: Dict[str, Any]) -> bytes:
@@ -308,9 +345,18 @@ async def chat_stream(body: StreamRequest, request: Request):
         raise _err(429, "busy", "The assistant is handling several requests right now. Try again in a moment.")
     if body.session_id and s.runs.live_for_session(body.session_id):
         raise _err(409, "run_in_progress", "This conversation is still generating a response.")
+    # Which model answers this message: an explicit override, else the one this conversation already
+    # uses (that is what makes switching in the header feel like switching inside ChatGPT).
+    requested = (body.model or "").strip()
+    if not requested and body.session_id:
+        try:
+            requested = str((await s.store.get_session(body.session_id)).get("model") or "")
+        except Exception:  # noqa: BLE001 - a missing session is reported by begin_turn below
+            requested = ""
     # Parallelize route + prompt + memories so simple messages are not stuck on serial D1 reads.
     try:
-        route, user_prompt, memories = await asyncio.gather(s.resolver.get(), s.user_prompt(), s.memories())
+        route, user_prompt, memories = await asyncio.gather(
+            s.resolver.get(model=requested), s.user_prompt(), s.memories())
     except RouteError as exc:
         raise _err(409, exc.code, exc.message)
     system = prompts.system_prompt(user_prompt, memories)
@@ -360,6 +406,7 @@ async def chat_stream(body: StreamRequest, request: Request):
     agent = AgentRun(run, s.deps(), system=system, history=begin["history"], user_message=model_text, model=route.model,
                      turns=begin.get("turns"), board=board, previous_attempt=begin.get("previous_attempt"),
                      resume_hint=resume_hint)
+    run.agent = agent          # lets the status endpoint report the model a live task is using
     run.task = asyncio.create_task(agent.execute(), name=f"blackthorn-{run.id}")
     return StreamingResponse(_sse(run, 0, cfg.heartbeat_s), media_type="text/event-stream", headers=SSE_HEADERS)
 
