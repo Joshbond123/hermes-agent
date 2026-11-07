@@ -502,7 +502,8 @@ class KaggleGPU:
                 "running": phase in (READY, LOADING, STARTING),
                 "serving": phase == READY and bool(state.get("base_url")) and self._fresh(state),
                 "base_url": state.get("base_url", "") if phase == READY else "",
-                "phase": state.get("phase", ""),
+                # a stage only means something while a session exists; OFF must not show the last one
+                "phase": state.get("phase", "") if phase in (READY, STARTING, LOADING, STOPPING) else "",
                 "loaded_seconds": state.get("loaded_seconds"),
                 "weights_source": state.get("weights_source", ""),
                 "reconnected": bool(state.get("reconnected")),
