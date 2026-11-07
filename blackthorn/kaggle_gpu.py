@@ -329,7 +329,9 @@ class KaggleGPU:
                                f"({self.api.owner or 'unknown'}; installer: {kstate or 'never run'}). "
                                "Run the installer once (POST /api/gpu/install) — it downloads the "
                                "weights one time into persistent Kaggle storage.")
-            if state.get("state") in (STARTING, LOADING, READY) and self._fresh(state):
+            if state.get("state") in (STARTING, LOADING, READY):
+                # A session that is booting or serving is the session we want; pushing another kernel
+                # would start a second GPU (and a second quota charge) in parallel.
                 return await self.status()
             # The weights live in the installer kernel's output, which Kaggle keeps permanently and
             # mounts read-only. Mounting it is what makes a switch-on fast and download-free.

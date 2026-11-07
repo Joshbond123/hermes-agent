@@ -140,6 +140,34 @@ def find_weights():
     return hits[0]
 
 
+def stage_locally(gguf):
+    """Copy the weights onto the session's own disk before llama.cpp touches them.
+
+    The persistent cache is a read-only network mount, and llama.cpp memory-maps its model: over that
+    mount every page-in is a network round trip, which turned a model load into tens of minutes of
+    silence. A local copy costs one sequential read and then loads at disk speed.
+    """
+    local = "/kaggle/working/model.gguf"
+    size = os.path.getsize(gguf)
+    if os.path.exists(local) and os.path.getsize(local) == size:
+        _log("weights already staged locally")
+        return local
+    free = shutil.disk_usage("/kaggle/working").free
+    if free < size + 2 * 10**9:
+        _log(f"not enough local disk for a copy ({free/1e9:.1f} GB free); loading from the mount")
+        return gguf
+    report("copying the weights onto local disk")
+    started = time.time()
+    with open(gguf, "rb") as src, open(local, "wb") as dst:
+        while True:
+            chunk = src.read(64 << 20)
+            if not chunk:
+                break
+            dst.write(chunk)
+    _log(f"staged {size/1e9:.2f} GB locally in {time.time()-started:.0f}s")
+    return local
+
+
 def gpu_report():
     out = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
                          capture_output=True, text=True).stdout.strip()
@@ -336,6 +364,7 @@ def main():
     n_gpu = gpu_report()
     started = time.time()
     bin_path = fetch_llama_cpp()
+    gguf = stage_locally(gguf)
     report("loading the model onto the GPU")
     start_server(gguf, bin_path, n_gpu)
     load_seconds = time.time() - started
