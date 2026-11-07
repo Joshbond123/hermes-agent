@@ -3,11 +3,11 @@
   "blackthorn/COMPUTER_DRIVE.md": "eb143a189c0bf88482027c6a474b799c2d7d52303f23748258cd01a2417ab5da",
   "blackthorn/MIGRATION_ACCEPTANCE.md": "c6a25473b8150047655c3eaf9457095d6ae27b8d8108c1a75b82b145dd182b72",
   "blackthorn/README.md": "f3e59f0dd987701577011d23ec5f1c67b630bd9e4c170ed4b628b988492afc84",
-  "blackthorn/__init__.py": "f64fc0859dd6026ee9561b5425915736aa5c12a22331016dfb461a381001159d",
+  "blackthorn/__init__.py": "f9126851556ee86b755550343dc305cc44f84a519e12d01c3ed446a933429996",
   "blackthorn/agent.py": "5ab2733f478af9e6fb003994ebb2174668d05e7a211a172733a903a5cf9c366c",
   "blackthorn/api.py": "8a849b1f99446ac927de7487774b28ffc37d1c2a9936449dae73ce8d93de451d",
   "blackthorn/app.py": "050a7fe108dac69a36d58c8dc532670012b0aab095ce8310a919ac4e40eb9ec1",
-  "blackthorn/auth.py": "dec463fd2d52248f78279eee4bb8f3c2344a1dc7f4ffbe3c7eb190b2da4b1d39",
+  "blackthorn/auth.py": "4d19788babbca56194e49c3d6ee6786936dadf879d460972c56dd0fcfcb08693",
   "blackthorn/capabilities.py": "1d103d54bddbf5a10c0900308cba3c2fe5edd63ec9ed3e3baca50788ca879583",
   "blackthorn/codespace_channel.py": "fd5df45584ed35daa93f6b0e7b9502ae3269ac92c1cc5550f17ce7d534e10f25",
   "blackthorn/codespace_computer.py": "c1f1e2683788f6212d9f34bcd42f082b4116b6b4482519b68c779c8f87ee2262",
@@ -67,5 +67,5 @@
   "blackthorn/version.py": "a3e10b7f2f39b4d9374851f0c9eb11bb878f68c35925994f623db312cf433ffe",
   "blackthorn_start.py": "847f0cc5ec83b846947b7c485abdb2592b0dd090bedf78af16022a0394d2e9f3"
  },
- "version": "5.7.4"
+ "version": "5.7.5"
 }

@@ -400,3 +400,17 @@ async def test_kernel_status_is_asked_for_with_the_lower_case_owner():
     out = await api.kernel_status("blackthorn-qwen-install")
     assert out["status"] == "running"
     assert "userName=joshbond123" in seen["url"]
+
+
+def test_the_kernel_endpoints_are_reachable_without_the_owner_cookie(monkeypatch):
+    """The kernel lives on Kaggle; it can never hold the owner's session cookie.
+
+    If the auth gate blocks it, registering silently fails and the GPU looks like it never started,
+    so these two paths must be exempt — and they authenticate with the GPU token instead.
+    """
+    import asyncio
+
+    from blackthorn import auth
+
+    src = open(auth.__file__).read()
+    assert '"/api/gpu/register"' in src and '"/api/gpu/heartbeat"' in src

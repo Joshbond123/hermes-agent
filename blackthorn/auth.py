@@ -241,6 +241,11 @@ class AuthMiddleware:
             or path.startswith("/api/codespaces/register")
             or path.startswith("/api/codespaces/pull")
             or path.startswith("/api/codespaces/result/")
+            # The Kaggle GPU kernel reaches these two from outside, and cannot hold the owner's
+            # cookie. They authenticate themselves with the GPU token instead; a caller without it is
+            # refused inside the handler.
+            or path.startswith("/api/gpu/register")
+            or path.startswith("/api/gpu/heartbeat")
         ):
             await self.app(scope, receive, send)
             return
