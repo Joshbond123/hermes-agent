@@ -1,9 +1,9 @@
 {
  "files": {
   "blackthorn/COMPUTER_DRIVE.md": "eb143a189c0bf88482027c6a474b799c2d7d52303f23748258cd01a2417ab5da",
-  "blackthorn/MIGRATION_ACCEPTANCE.md": "c6a25473b8150047655c3eaf9457095d6ae27b8d8108c1a75b82b145dd182b72",
+  "blackthorn/MIGRATION_ACCEPTANCE.md": "41112e95f1cade4f0521b4ec55176361624f731919e25cf31ef20fc53ce07615",
   "blackthorn/README.md": "f3e59f0dd987701577011d23ec5f1c67b630bd9e4c170ed4b628b988492afc84",
-  "blackthorn/__init__.py": "9ed8c90eb85f88fb567e215bcb0b38e6aea74f9e41564a8434c9d2ae22d8abe7",
+  "blackthorn/__init__.py": "f363f2789f26d12db2b3ef912046c2d28b60c8da85ec4553cb8fe51748276433",
   "blackthorn/agent.py": "5ab2733f478af9e6fb003994ebb2174668d05e7a211a172733a903a5cf9c366c",
   "blackthorn/api.py": "e9192d5ddc1dc329bf93cdfd9cf791e0a46c98e703aa2f7167b01a825a20a760",
   "blackthorn/app.py": "3fdd2ead280c9b5e06571f63fe2b6a64a5133bc662deeb336b9a83f321c32c31",
@@ -67,5 +67,5 @@
   "blackthorn/version.py": "a3e10b7f2f39b4d9374851f0c9eb11bb878f68c35925994f623db312cf433ffe",
   "blackthorn_start.py": "847f0cc5ec83b846947b7c485abdb2592b0dd090bedf78af16022a0394d2e9f3"
  },
- "version": "5.8.2"
+ "version": "5.8.3"
 }

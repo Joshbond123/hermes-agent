@@ -212,3 +212,76 @@ that switch is already implemented and tested on the Blackthorn side.
 ## Suite
 339 passed, 5 skipped. UI: `tsc` clean, `vite build` (new bundle `index-dwN43Rx7.js` /
 `index-DIcam0T9.css`), `vitest` 32/32.
+
+---
+
+# Round 3 — Qwen on a real Kaggle GPU (v5.8.2)
+
+## What is proven, with evidence
+
+**Installed once, permanently.** `POST /api/gpu/install` pushed a private Kaggle kernel that
+downloaded `orcarouter_Qwen3.8-27B-Uncensored-Q4_K_M.gguf` — **17.77 GB in 297 s** — into the
+kernel's output, and the run completed. Kaggle keeps that output permanently and mounts it read-only
+into later sessions. Verified twice, on two different accounts
+(`joshbond123/blackthorn-qwen-install` and `happink/blackthorn-qwen-install`), by reading the kernel's
+own log and file listing through the API.
+
+The gated `orcarouter` repository returns **403** to this Hugging Face token (the account has not
+accepted its terms), so the installer fell back automatically to `bartowski`'s requantisation of the
+same model — same Q4_K_M, ungated. The token is used when it works; the fallback is explicit in the
+log, not hidden.
+
+**No re-download on restart — observed, not assumed.** Two GPU sessions logged:
+
+```
+weights from the persistent cache:
+/kaggle/input/notebooks/joshbond123/blackthorn-qwen-install/qwen/orcarouter_Qwen3.8-27B-Uncensored-Q4_K_M.gguf (17.77 GB)
+GPU: Tesla T4, 15360 MiB | Tesla T4, 15360 MiB
+```
+
+The serve kernel contains no code path that can reach Hugging Face — a test asserts `huggingface.co`
+does not appear in it — so "reused the existing files" is structural, not a behaviour that might drift.
+
+**Controls, timers and accounting are live.** `/api/gpu/status`, `/api/gpu/usage`, `/api/gpu/start`,
+`/api/gpu/stop`, `/api/gpu/settings` answer on the deployed service. The usage panel reports
+`hours_total` 30.0 (labelled as Kaggle's published minimum, Saturday 00:00 UTC reset, correctable),
+measured `hours_used`, `hours_remaining`, `percent_used` and the live session duration. Kaggle exposes
+no usage API, so no figure is taken from it or invented in its place.
+
+## What is not proven yet, and why
+
+The model has not yet answered a request through Blackthorn. Each live attempt advanced further and
+exposed a real defect, all of them now fixed and tested:
+
+1. Kaggle answers a bad push with **HTTP 200 and `{"hasError": true}`** — the installer reported
+   success while creating nothing.
+2. Kernel slugs must be **owner-qualified**, and Kaggle's identity is **case-sensitive**
+   (`userName=Joshbond123` → "Permission 'kernels.get' was denied").
+3. llama.cpp Linux CUDA builds are **`.tar.gz` under `b*` tags**; `/releases/latest` is a decoy.
+4. The binary must run **where its `.so` files are** (`LD_LIBRARY_PATH`), not copied elsewhere.
+5. `/api/gpu/register` and `/api/gpu/heartbeat` sat behind the owner-cookie gate, so a kernel on
+   Kaggle could never register.
+6. The idle timer counted **boot time as idleness** and killed a session mid-load.
+7. The mount was named after the **primary account** before the fallback key had switched accounts.
+8. A revoked key left the panel blaming "quota"; a spare account is now used automatically.
+9. A long model load produced **no heartbeat**, so the panel declared a healthy session dead.
+10. llama.cpp **memory-maps** its model, and the persistent cache is a network mount, so loading took
+    tens of minutes of silence. The kernel now stages the file on local disk first.
+
+## Blocking issue for the next round
+
+**The Kaggle API keys in the Blackthorn document are no longer valid.** Mid-session the primary key
+(`Joshbond123`) went from working to `HTTP 401`, and later `happink`'s key did too — both are refused
+now, for every endpoint, including reads that had worked minutes earlier. Nothing in the code can
+work around a rejected credential.
+
+To finish the last mile, a current Kaggle API key is needed in the Blackthorn doc (`KAGGLE_USERNAME`
+/ `KAGGLE_KEY` on Render). Then: `POST /api/gpu/install` (once, ~10 min CPU, no GPU quota) and
+`POST /api/gpu/start`. The remaining unverified steps are the tunnel registration, the tool-call self
+test and a chat answered by Qwen — all guarded by tests, none yet observed succeeding on Kaggle.
+
+## Tests
+
+Backend suite green (including 31 tests for this feature: power semantics, persistence, idle policy,
+quota-week maths, reconnect, Kaggle failure semantics, credential fallback, account resolution).
+UI: `tsc` clean, 38/38 vitest, bundle rebuilt.
