@@ -143,6 +143,9 @@ class KaggleAPI:
         return data
 
     async def _send(self, method: str, path: str, body: Any):
+        # ``{owner}`` is resolved per attempt: when a revoked key switches accounts mid-request, the
+        # retry must ask about the new account, not the one whose key was just refused.
+        path = path.replace("{owner}", self.owner)
         return await self.http.request(method, f"{KAGGLE_API}{path}", json=body, timeout=60.0,
                                        headers={"Authorization": f"Bearer {self.key}",
                                                 "Content-Type": "application/json",
@@ -161,10 +164,10 @@ class KaggleAPI:
 
     async def kernel_status(self, slug: str) -> Dict[str, Any]:
         """RUNNING / QUEUED / COMPLETE / ERROR, as Kaggle reports it."""
-        return await self._request("GET", f"/kernels/status?userName={self.owner}&kernelSlug={slug}")
+        return await self._request("GET", "/kernels/status?userName={owner}&kernelSlug=" + slug)
 
     async def datasets_for(self, owner: str, slug: str) -> Dict[str, Any]:
-        return await self._request("GET", f"/datasets/list?user={owner or self.owner}&search={slug}&pageSize=10")
+        return await self._request("GET", "/datasets/list?user=" + (owner or "{owner}") + "&search=" + slug + "&pageSize=10")
 
 
 class KaggleGPU:

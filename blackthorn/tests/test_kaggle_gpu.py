@@ -463,10 +463,13 @@ async def test_a_revoked_primary_key_falls_back_to_the_spare_account():
         def json(self):
             return payload_holder[0]
 
+    seen_urls = {"last": ""}
+
     class Http:
         async def request(self, method, url, **kwargs):
             auth = kwargs["headers"]["Authorization"]
             calls.append(auth)
+            seen_urls["last"] = url
             if auth.endswith("dead"):
                 payload_holder[0] = {"code": 401, "message": "Unauthenticated"}
                 return Resp(401, payload_holder[0])
@@ -478,5 +481,7 @@ async def test_a_revoked_primary_key_falls_back_to_the_spare_account():
     out = await api.kernel_status("blackthorn-qwen-install")
     assert out["status"] == "running"
     assert calls == ["Bearer dead", "Bearer alive"]
+    # the retry must ask about the account whose key is being used
+    assert "userName=happink" in seen_urls["last"]
     assert api.username == "happink" and api.owner == "happink"
     assert api.used_fallback == "happink"
