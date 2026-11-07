@@ -126,10 +126,20 @@ async def test_switching_the_gpu_on_pushes_a_gpu_kernel_that_mounts_the_installe
 
 async def test_the_gpu_cannot_be_switched_on_before_the_model_is_installed():
     gpu = make_gpu(installed=False)
+    gpu.api.statuses["blackthorn-qwen-install"] = "error"      # Kaggle says the installer never finished
     with pytest.raises(GPUError) as err:
         await gpu.start()
     assert err.value.code == "model_not_installed"
     assert gpu.api.pushed == []
+
+
+async def test_a_lost_local_flag_is_recovered_from_kaggles_own_record():
+    """The installer's output is the source of truth, not a setting that a redeploy might drop."""
+    gpu = make_gpu(installed=False)
+    gpu.api.statuses["blackthorn-qwen-install"] = "complete"
+    out = await gpu.start()
+    assert out["state"] == STARTING
+    assert (await gpu.status())["installed"] is True
 
 
 async def test_the_gpu_is_never_switched_off_while_a_task_is_running():

@@ -282,11 +282,23 @@ class KaggleGPU:
             if not self.api.configured:
                 raise GPUError("kaggle_unconfigured",
                                "Kaggle is not configured: set KAGGLE_USERNAME and KAGGLE_KEY on the server.")
-            if not self._installed(await self._state()):
-                raise GPUError("model_not_installed",
-                               "Qwen is not installed on Kaggle yet. Run the installer once (POST /api/gpu/install) — "
-                               "it downloads the weights one time into persistent Kaggle storage.")
             state = await self._state()
+            if not self._installed(state):
+                # A local flag can be lost; Kaggle's own record of the installer cannot. If the install
+                # kernel is complete, the weights are in persistent storage and the GPU can mount them.
+                try:
+                    kstate = (await self.api.kernel_status(self.install_slug)).get("status") or ""
+                except GPUError:
+                    kstate = ""
+                if kstate.lower() == "complete":
+                    state["installed_at"] = time.time()
+                    await self._save(state)
+                else:
+                    raise GPUError("model_not_installed",
+                                   "Qwen is not installed on Kaggle yet (installer: "
+                                   f"{kstate or 'never run'}). Run the installer once "
+                                   "(POST /api/gpu/install) — it downloads the weights one time into "
+                                   "persistent Kaggle storage.")
             if state.get("state") in (STARTING, LOADING, READY) and self._fresh(state):
                 return await self.status()
             # The weights live in the installer kernel's output, which Kaggle keeps permanently and
@@ -309,9 +321,12 @@ class KaggleGPU:
                                    "left this week, or the API key lacks permission.", status=exc.status) from exc
                 raise
             now = time.time()
+            # Carry the installation facts across: this dict replaces the stored state wholesale.
             await self._save({"state": STARTING, "started_at": now, "last_activity": now,
                               "last_activity_reason": "gpu_on", "base_url": "", "session": "",
-                              "stop_requested": False, "error": "", "phase": "pushing kernel to Kaggle"})
+                              "stop_requested": False, "error": "", "phase": "pushing kernel to Kaggle",
+                              "installed_at": state.get("installed_at"),
+                              "install_kernel": state.get("install_kernel")})
             await self._open_interval()
             return await self.status()
 
@@ -445,6 +460,7 @@ class KaggleGPU:
                 "stop_requested": bool(state.get("stop_requested")),
                 "error": state.get("error", ""),
                 "dataset": self.dataset,
+                "installed": bool(state.get("installed_at")) or bool(self.dataset),
                 "kaggle_user": self.username,
                 "busy": self.busy_reason(),
                 "settings": settings_out,
