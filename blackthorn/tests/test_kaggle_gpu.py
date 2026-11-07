@@ -91,6 +91,8 @@ def test_the_serve_kernel_loads_from_the_cache_and_can_never_silently_download()
     assert "if answer.get(\"stop\")" in src, "the kernel must honour a stop order"
     # llama.cpp ships Linux CUDA builds as .tar.gz under b* tags; /releases/latest is a decoy.
     assert "releases?per_page=" in src and "cuda-12.8-x64" in src and "tarfile" in src
+    # loading 17.8 GB produces no log output for minutes; silence there must not look like death
+    assert "keepalive()" in src and "threading.Thread" in src
 
 
 def test_no_secret_is_written_into_the_repository_sources():
@@ -485,3 +487,14 @@ async def test_a_revoked_primary_key_falls_back_to_the_spare_account():
     assert "userName=happink" in seen_urls["last"]
     assert api.username == "happink" and api.owner == "happink"
     assert api.used_fallback == "happink"
+
+
+async def test_a_gpu_that_stopped_heartbeating_while_loading_is_not_declared_dead():
+    """The boot timeout governs loading; only a serving GPU can be judged by heartbeat staleness."""
+    gpu = make_gpu()
+    await gpu.start()
+    state = json.loads(gpu.store.settings[gpumod.STATE_KEY])
+    state["last_heartbeat"] = time.time() - 600        # ten minutes of load
+    state["phase"] = "loading the model onto the GPU"
+    gpu.store.settings[gpumod.STATE_KEY] = json.dumps(state)
+    assert (await gpu.status())["state"] == STARTING

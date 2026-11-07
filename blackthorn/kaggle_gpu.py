@@ -483,7 +483,9 @@ class KaggleGPU:
                 phase = OFF
                 state["stop_requested"] = False
                 await self._save(state)
-        if phase in (READY, STARTING, LOADING) and state.get("last_heartbeat") and not self._fresh(state):
+        # While booting, silence is measured against the boot timeout: loading the weights legitimately
+        # produces no output for minutes. Once serving, a late heartbeat means the session is gone.
+        if phase == READY and state.get("last_heartbeat") and not self._fresh(state):
             phase = ERROR
             state["error"] = "The GPU session stopped sending heartbeats; it probably ended on Kaggle's side."
         # Whatever the reason the GPU stopped serving, it must not be offered to the router.

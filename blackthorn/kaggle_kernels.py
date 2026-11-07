@@ -35,7 +35,7 @@ def _log(msg):
 
 def _header(cfg: Dict[str, Any], doc: str) -> str:
     return (f'"""Blackthorn Kaggle kernel — generated at push time; do not edit by hand.\n\n{doc}\n"""\n'
-            "import json, os, shutil, subprocess, sys, time, urllib.request, urllib.error, zipfile, glob\n\n"
+            "import json, os, shutil, subprocess, sys, time, threading, urllib.request, urllib.error, glob\n\n"
             f"CFG = json.loads({json.dumps(json.dumps(cfg))})\n" + FOOTER)
 
 
@@ -255,13 +255,34 @@ def start_tunnel():
     raise SystemExit("the tunnel did not come up")
 
 
+PHASE = ["starting up"]
+
+
 def report(phase):
     """Tell the backend where we are; it is the only live view while Kaggle's own API is unavailable."""
+    PHASE[0] = phase
     try:
         post("/api/gpu/heartbeat", {"phase": phase, "busy": True})
         _log(f"phase: {phase}")
     except Exception as exc:
         _log(f"phase report failed ({type(exc).__name__})")
+
+
+def keepalive():
+    """Heartbeat for the whole session, including the minutes spent loading the model.
+
+    Loading 17.8 GB is not idleness and not death; without this the panel would see silence and
+    conclude the session had failed.
+    """
+    def loop():
+        while True:
+            try:
+                post("/api/gpu/heartbeat", {"busy": True, "phase": PHASE[0]})
+            except Exception:
+                pass
+            time.sleep(30)
+
+    threading.Thread(target=loop, daemon=True).start()
 
 
 def post(path, payload):
@@ -308,6 +329,7 @@ def busy():
 def main():
     global SERVER
     boot = time.time()
+    keepalive()
     gguf = find_weights()
     _log(f"weights from the persistent cache: {gguf} ({os.path.getsize(gguf)/1e9:.2f} GB)")
     report("weights found in the persistent cache")
