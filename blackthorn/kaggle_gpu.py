@@ -378,14 +378,19 @@ class KaggleGPU:
         log.info("kaggle gpu registered: %s (%s)", base_url, weights_source)
         return {"ok": True, "state": READY}
 
-    async def heartbeat(self, *, busy: bool = False, base_url: str = "") -> Dict[str, Any]:
-        """The kernel asks whether it should stop. Busy inference overrides any pending order."""
+    async def heartbeat(self, *, busy: bool = False, base_url: str = "", phase: str = "") -> Dict[str, Any]:
+        """The kernel asks whether it should stop, and says what it is doing.
+
+        A heartbeat is presence, not readiness: the GPU is only READY once it has registered a
+        tunnel, so the state is not raised here.
+        """
         state = await self._state()
         state["last_heartbeat"] = time.time()
         if base_url:
             state["base_url"] = base_url.rstrip("/")
-        if state.get("state") in (STARTING, LOADING):
-            state["state"] = READY
+        if phase:
+            state["phase"] = phase
+            state["phase_at"] = time.time()
         await self._save(state)
         stop = bool(state.get("stop_requested")) and not busy and not self.busy_reason()
         if busy:
@@ -396,7 +401,11 @@ class KaggleGPU:
     async def check_idle(self) -> Dict[str, Any]:
         """Called periodically by the app: order a stop when the GPU has been idle too long."""
         state = await self._state()
-        if state.get("state") not in (READY, LOADING, STARTING):
+        # Booting is not idling: loading 17.8 GB onto two T4s takes minutes, and switching the GPU
+        # off mid-load would waste the quota already spent and lose the session.
+        if state.get("state") in (STARTING, LOADING):
+            return await self.status()
+        if state.get("state") not in (READY,):
             return await self.status()
         settings = await self.settings()
         idle_limit = settings["idle_minutes"] * 60

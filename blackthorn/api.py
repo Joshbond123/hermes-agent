@@ -840,4 +840,5 @@ async def gpu_heartbeat(request: Request):
         raise _err(401, "gpu_bad_token", "This kernel is not authorised to heartbeat.")
     body = await request.json()
     body = body if isinstance(body, dict) else {}
-    return await gpu.heartbeat(busy=bool(body.get("busy")), base_url=str(body.get("base_url") or ""))
+    return await gpu.heartbeat(busy=bool(body.get("busy")), base_url=str(body.get("base_url") or ""),
+                               phase=str(body.get("phase") or ""))

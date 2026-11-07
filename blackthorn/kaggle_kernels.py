@@ -255,6 +255,15 @@ def start_tunnel():
     raise SystemExit("the tunnel did not come up")
 
 
+def report(phase):
+    """Tell the backend where we are; it is the only live view while Kaggle's own API is unavailable."""
+    try:
+        post("/api/gpu/heartbeat", {"phase": phase, "busy": True})
+        _log(f"phase: {phase}")
+    except Exception as exc:
+        _log(f"phase report failed ({type(exc).__name__})")
+
+
 def post(path, payload):
     req = urllib.request.Request(f"{CFG['backend']}{path}", data=json.dumps(payload).encode(),
                                  headers={"Content-Type": "application/json",
@@ -301,12 +310,16 @@ def main():
     boot = time.time()
     gguf = find_weights()
     _log(f"weights from the persistent cache: {gguf} ({os.path.getsize(gguf)/1e9:.2f} GB)")
+    report("weights found in the persistent cache")
     n_gpu = gpu_report()
     started = time.time()
     bin_path = fetch_llama_cpp()
+    report("loading the model onto the GPU")
     start_server(gguf, bin_path, n_gpu)
     load_seconds = time.time() - started
+    report("running the tool-call self test")
     tool_ok = selftest()
+    report("opening the public tunnel")
     url = start_tunnel()
     _log(f"public url: {url}")
     post("/api/gpu/register", {"base_url": url, "session": os.environ.get("KAGGLE_KERNEL_RUN_TYPE", ""),

@@ -414,3 +414,24 @@ def test_the_kernel_endpoints_are_reachable_without_the_owner_cookie(monkeypatch
 
     src = open(auth.__file__).read()
     assert '"/api/gpu/register"' in src and '"/api/gpu/heartbeat"' in src
+
+
+async def test_a_gpu_that_is_still_booting_is_never_switched_off_for_idling():
+    """Loading 17.8 GB takes minutes; killing the session mid-load wastes the quota already spent."""
+    gpu = make_gpu()
+    await gpu.start()                                   # STARTING
+    await gpu.update_settings(idle_minutes=5)
+    state = json.loads(gpu.store.settings[gpumod.STATE_KEY])
+    state["last_activity"] = time.time() - 30 * 60       # looks idle, but it is still booting
+    gpu.store.settings[gpumod.STATE_KEY] = json.dumps(state)
+    out = await gpu.check_idle()
+    assert out["stop_requested"] is False
+
+
+async def test_the_kernel_can_report_which_stage_it_is_at():
+    gpu = make_gpu()
+    await gpu.start()
+    await gpu.heartbeat(phase="loading the model onto the GPU")
+    status = await gpu.status()
+    assert status["phase"] == "loading the model onto the GPU"
+    assert status["state"] == STARTING, "a heartbeat is presence, not readiness"
