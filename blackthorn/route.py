@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Optional
 
 log = logging.getLogger("blackthorn.route")
@@ -138,13 +138,18 @@ def model_options(default_model: str = DEFAULT_MODEL) -> List[ModelOption]:
 class RouteResolver:
     """The NVIDIA route, or an honest error that says exactly what is missing."""
 
-    def __init__(self, store: object = None, *, ttl: float = 8.0, default_model: str = DEFAULT_MODEL):
+    def __init__(self, store: object = None, *, ttl: float = 8.0, default_model: str = DEFAULT_MODEL,
+                 live: object = None):
         # ``store`` is accepted for backwards compatibility with the D1-backed resolver; the
         # NVIDIA route needs no database row.
         self._store = store
         self._ttl = ttl
         self._default_model = default_model
         self._cached: Optional[tuple[float, Route]] = None
+        # ``live`` is the Kaggle GPU. While its kernel is serving, the model it hosts has a real
+        # endpoint even though no environment variable could have known it, so the catalogue is
+        # resolved against that live address instead of the static configuration.
+        self._live = live
 
     # -- provider facts -------------------------------------------------------
     @property
@@ -169,7 +174,18 @@ class RouteResolver:
                 "configured": bool(self.api_key()), "context_tokens": context_tokens()}
 
     def options(self) -> List[ModelOption]:
-        return model_options(self._default_model)
+        options = model_options(self._default_model)
+        live = dict(getattr(self._live, "live_endpoints", {}) or {})
+        if not live:
+            return options
+        out: List[ModelOption] = []
+        for option in options:
+            url = live.get(option.key) or live.get(option.model)
+            if url and not option.base_url:
+                option = replace(option, base_url=url, api_key=option.api_key or "sk-local",
+                                 detail=(option.detail + " · served by the Kaggle GPU").strip(" ·"))
+            out.append(option)
+        return out
 
     def find(self, key: str = "") -> Optional[ModelOption]:
         """The catalogue entry for ``key`` (falls back to the configured default model)."""

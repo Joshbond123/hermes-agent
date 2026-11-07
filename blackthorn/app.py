@@ -100,10 +100,34 @@ def build_services(settings: Settings, *, executor: Any = None, http: Any = None
         except Exception as exc:  # noqa: BLE001 - a bad lab config must not stop the app
             log.error("malware lab unavailable: %s", type(exc).__name__)
             lab = None
+    # ---------------------------------------------------------------- the Kaggle GPU
+    # A second, on-demand accelerator that serves a local model. It costs a limited free quota, so it
+    # is off unless asked for, and its endpoint is handed to the router so Qwen becomes selectable the
+    # moment its kernel registers.
+    gpu = None
+    try:
+        from .kaggle_gpu import KaggleGPU
+        gpu = KaggleGPU(
+            store, http, runs=runs,
+            username=(os.environ.get("KAGGLE_USERNAME") or "").strip(),
+            key=(os.environ.get("KAGGLE_KEY") or "").strip(),
+            dataset=(os.environ.get("KAGGLE_MODEL_DATASET") or "").strip(),
+            serve_slug=(os.environ.get("KAGGLE_SERVE_SLUG") or "blackthorn-qwen-serve").strip(),
+            install_slug=(os.environ.get("KAGGLE_INSTALL_SLUG") or "blackthorn-qwen-install").strip(),
+            public_url=(os.environ.get("BLACKTHORN_PUBLIC_URL") or "").strip(),
+            kernel_token=(os.environ.get("BLACKTHORN_GPU_TOKEN") or "").strip(),
+            hf_token=(os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_API_KEY") or "").strip())
+        log.info("gpu: Kaggle GPU provider (%s)", gpu.username or "unconfigured")
+    except Exception as exc:  # noqa: BLE001 - the app runs without a GPU
+        log.error("gpu unavailable: %s", type(exc).__name__)
+        gpu = None
+    if gpu is not None:
+        # The catalogue resolves the hosted model against the GPU's live endpoint while it serves.
+        resolver._live = gpu
     return Services(settings=settings, store=store, resolver=resolver, registry=default_registry(), http=http,
                     tavily=TavilyKeys(store), computer=computer, runs=runs,
                     codespaces=codespaces, static_dir=static_dir or STATIC_DIR, channel=channel,
-                    lab=lab, capabilities=capabilities)
+                    lab=lab, capabilities=capabilities, gpu=gpu)
 
 
 
@@ -154,6 +178,28 @@ def create_app(settings: Optional[Settings] = None, *, services: Optional[Servic
         from .version import overlay_status
         if overlay_status().get("active"):
             log.error("INTEGRITY: a code overlay was extracted over the checkout at build time; running code may differ from Git")
+        gpu_task = None
+        if bt.gpu is not None:
+            import asyncio
+
+            async def _gpu_power_loop() -> None:
+                """Adopt a GPU that is still serving, and switch it off when it is genuinely idle.
+
+                This runs on the server, so closing the browser or losing the connection cannot keep
+                a GPU (and its quota) alive; and a stop is never ordered while a task is running.
+                """
+                try:
+                    await bt.gpu.rehydrate()
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("gpu state not restored: %s", type(exc).__name__)
+                while True:
+                    await asyncio.sleep(60)
+                    try:
+                        await bt.gpu.check_idle()
+                    except Exception as exc:  # noqa: BLE001 - the loop must survive anything
+                        log.warning("gpu idle check failed: %s", type(exc).__name__)
+
+            gpu_task = asyncio.create_task(_gpu_power_loop())
         power_task = None
         if bt.codespaces is not None:
             import asyncio
@@ -192,10 +238,12 @@ def create_app(settings: Optional[Settings] = None, *, services: Optional[Servic
         try:
             yield
         finally:
-            if power_task is not None:
-                power_task.cancel()
+            for task in (power_task, gpu_task):
+                if task is None:
+                    continue
+                task.cancel()
                 try:
-                    await power_task
+                    await task
                 except __import__("asyncio").CancelledError:
                     pass
         await bt.runs.shutdown()

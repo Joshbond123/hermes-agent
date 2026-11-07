@@ -80,6 +80,16 @@ export const api = {
       request<{ session: Session; model: string; applies_to: string; active_run?: { id: string; model: string; note: string } }>(
         `/api/chat/sessions/${encodeURIComponent(sessionId)}`, { method: 'PATCH', ...json({ model }) }),
   },
+  gpu: {
+    status: () => request<import('./gpu').GpuStatus>('/api/gpu/status'),
+    usage: () => request<import('./gpu').GpuUsage>('/api/gpu/usage'),
+    start: () => request<{ state: string }>('/api/gpu/start', { method: 'POST', ...json({}) }),
+    /** The server may refuse a stop while work is running — that refusal is the guarantee. */
+    stop: (force = false) => request<{ state: string }>(`/api/gpu/stop?force=${force ? 'true' : 'false'}`, { method: 'POST', ...json({}) }),
+    install: () => request<{ ok: boolean; kernel: string }>('/api/gpu/install', { method: 'POST', ...json({}) }),
+    setSettings: (body: { idle_minutes?: number; weekly_hours?: number }) =>
+      request<{ settings: unknown }>('/api/gpu/settings', { method: 'PATCH', ...json(body) }),
+  },
   prompt: {
     get: () => request<{ prompt: string }>('/api/system-prompt').then((r) => r.prompt),
     put: (prompt: string) => request<{ ok: boolean }>('/api/system-prompt', { method: 'PUT', ...json({ prompt }) }),

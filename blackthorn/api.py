@@ -45,6 +45,7 @@ class Services:
     channel: Any = None         # command channel to the in-codespace agent
     lab: Any = None             # dedicated malware/ransomware execution lab (own provider account)
     capabilities: Any = None    # drive-hosted skills/tools restored onto every machine
+    gpu: Any = None             # the Kaggle GPU that serves the local Qwen model
     _prompt_cache: tuple = field(default=(0.0, ""))
     _memory_cache: tuple = field(default=(0.0, ()))
 
@@ -345,6 +346,12 @@ async def chat_stream(body: StreamRequest, request: Request):
         raise _err(429, "busy", "The assistant is handling several requests right now. Try again in a moment.")
     if body.session_id and s.runs.live_for_session(body.session_id):
         raise _err(409, "run_in_progress", "This conversation is still generating a response.")
+    # Real work keeps the GPU awake; the idle timer measures this clock, not page loads.
+    if getattr(s, "gpu", None) is not None:
+        try:
+            await s.gpu.note_activity("chat")
+        except Exception as exc:  # noqa: BLE001 - accounting must never block a message
+            log.debug("gpu activity note failed: %s", exc)
     # Which model answers this message: an explicit override, else the one this conversation already
     # uses (that is what makes switching in the header feel like switching inside ChatGPT).
     requested = (body.model or "").strip()
@@ -719,3 +726,118 @@ async def computer_checkpoint(request: Request):
     if not result.get("ok"):
         raise _err(502, "checkpoint_failed", str(result.get("error") or "Checkpoint not published")[:160])
     return result
+
+
+# ------------------------------------------------------------------- Kaggle GPU
+# The GPU is the only part of Blackthorn that spends a limited, unmeterable resource, so every
+# endpoint here answers with the real state rather than an optimistic one.
+class GPUSettingsBody(BaseModel):
+    idle_minutes: Optional[int] = None
+    weekly_hours: Optional[float] = None
+
+
+def _gpu(request: Request) -> Any:
+    s = svc(request)
+    if getattr(s, "gpu", None) is None:
+        raise _err(503, "gpu_unconfigured", "No Kaggle GPU is configured on this server.")
+    return s.gpu
+
+
+def _kernel_token_ok(request: Request, gpu: Any) -> bool:
+    header = request.headers.get("authorization") or ""
+    token = header[7:].strip() if header.lower().startswith("bearer ") else ""
+    return bool(gpu.kernel_token) and token == gpu.kernel_token
+
+
+@router.get("/api/gpu/status")
+async def gpu_status(request: Request):
+    """Power state, live endpoint, idle clock and what Kaggle says about our kernels."""
+    gpu = _gpu(request)
+    out = await gpu.status()
+    try:
+        out["kernels"] = await gpu.kernel_state()
+    except Exception as exc:  # noqa: BLE001 - the panel still works without Kaggle
+        out["kernels"] = {"error": type(exc).__name__}
+    return out
+
+
+@router.post("/api/gpu/start")
+async def gpu_start(request: Request):
+    gpu = _gpu(request)
+    try:
+        return await gpu.start()
+    except Exception as exc:
+        code = getattr(exc, "code", "gpu_start_failed")
+        raise _err(502, code, getattr(exc, "message", f"{type(exc).__name__}: {exc}")) from exc
+
+
+@router.post("/api/gpu/stop")
+async def gpu_stop(request: Request, force: bool = False):
+    gpu = _gpu(request)
+    try:
+        return await gpu.stop(reason="manual", force=force)
+    except Exception as exc:
+        raise _err(409, getattr(exc, "code", "gpu_stop_failed"),
+                   getattr(exc, "message", f"{type(exc).__name__}: {exc}")) from exc
+
+
+@router.post("/api/gpu/install")
+async def gpu_install(request: Request):
+    """Download the weights once, into persistent Kaggle storage (CPU session, no GPU quota)."""
+    gpu = _gpu(request)
+    try:
+        return await gpu.install()
+    except Exception as exc:
+        raise _err(502, getattr(exc, "code", "gpu_install_failed"),
+                   getattr(exc, "message", f"{type(exc).__name__}: {exc}")) from exc
+
+
+@router.post("/api/gpu/installed")
+async def gpu_installed(request: Request):
+    gpu = _gpu(request)
+    return await gpu.mark_installed()
+
+
+@router.get("/api/gpu/usage")
+async def gpu_usage(request: Request):
+    """Weekly GPU hours: measured consumption, labelled allowance, live session length."""
+    gpu = _gpu(request)
+    return await gpu.usage()
+
+
+@router.patch("/api/gpu/settings")
+async def gpu_update_settings(request: Request, body: GPUSettingsBody):
+    gpu = _gpu(request)
+    try:
+        settings = await gpu.update_settings(idle_minutes=body.idle_minutes, weekly_hours=body.weekly_hours)
+    except Exception as exc:
+        raise _err(422, getattr(exc, "code", "gpu_bad_settings"),
+                   getattr(exc, "message", f"{type(exc).__name__}: {exc}")) from exc
+    return {"settings": settings, "status": await gpu.status()}
+
+
+@router.post("/api/gpu/register")
+async def gpu_register(request: Request):
+    """A kernel that is serving Qwen announces its tunnel (authenticated with the GPU token)."""
+    gpu = _gpu(request)
+    if not _kernel_token_ok(request, gpu):
+        raise _err(401, "gpu_bad_token", "This kernel is not authorised to register.")
+    body = await request.json()
+    body = body if isinstance(body, dict) else {}
+    if not str(body.get("base_url") or "").startswith("http"):
+        raise _err(400, "gpu_bad_url", "The kernel must report the public URL it is serving on.")
+    return await gpu.register(base_url=str(body["base_url"]), session=str(body.get("session") or ""),
+                              version=str(body.get("version") or ""),
+                              loaded_seconds=float(body.get("loaded_seconds") or 0),
+                              weights_source=str(body.get("weights_source") or ""))
+
+
+@router.post("/api/gpu/heartbeat")
+async def gpu_heartbeat(request: Request):
+    """The kernel asks whether to stop. A busy kernel is never told to stop."""
+    gpu = _gpu(request)
+    if not _kernel_token_ok(request, gpu):
+        raise _err(401, "gpu_bad_token", "This kernel is not authorised to heartbeat.")
+    body = await request.json()
+    body = body if isinstance(body, dict) else {}
+    return await gpu.heartbeat(busy=bool(body.get("busy")), base_url=str(body.get("base_url") or ""))

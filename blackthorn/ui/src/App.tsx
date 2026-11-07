@@ -9,6 +9,7 @@ import { SettingsDialog } from './components/Settings'
 import { Toasts, type Toast } from './components/Toasts'
 import { useCodespaces } from './codespaces'
 import { useModels } from './models'
+import { useGpu } from './gpu'
 import { attachRun, startRun, type Outcome, type RunHandle } from './sse'
 import { initialState, reducer } from './state'
 import type { ServerEvent, Session, VersionInfo } from './types'
@@ -65,6 +66,8 @@ export default function App() {
   const codespaces = useCodespaces(codespacesOpen, notify)
   const models = useModels(state.chat.sessionId, state.chat.run !== null)
   const [modelOpen, setModelOpen] = useState(false)
+  const gpu = useGpu()
+  const [gpuOpen, setGpuOpen] = useState(false)
   // The model for the very next message: the conversation's own when it has one, else the last pick.
   const chosenModel = useRef<string>('')
 
@@ -346,7 +349,9 @@ export default function App() {
           codespaces={codespaces} csOpen={codespacesOpen} onToggleCodespaces={() => setCodespacesOpen((v) => !v)}
           onCloseCodespaces={() => setCodespacesOpen(false)}
           models={models} modelOpen={modelOpen} onToggleModels={() => setModelOpen((v) => !v)}
-          onChooseModel={onChooseModel} onCloseModels={() => setModelOpen(false)} />
+          onChooseModel={onChooseModel} onCloseModels={() => setModelOpen(false)}
+          gpu={gpu} gpuOpen={gpuOpen} onToggleGpu={() => setGpuOpen((v) => !v)}
+          onCloseGpu={() => setGpuOpen(false)} />
         <Chat chat={chat} onRegenerate={() => void regenerate()} onRetryLoad={() => chat.sessionId && void openSession(chat.sessionId, false)} />
         <Composer busy={chat.run !== null} stopping={chat.run?.stopping ?? false} onSend={send} onStop={() => void stop()}
           onError={(t) => notify('error', t)} focusKey={chat.sessionId ?? 'new'} banner={banner} />
