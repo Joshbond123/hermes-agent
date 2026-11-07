@@ -83,6 +83,10 @@ class KaggleAPI:
     def __init__(self, http: httpx.AsyncClient, username: str, key: str):
         self.http = http
         self.username = username
+        # Kaggle's API is case-sensitive about identity: ``userName=Joshbond123`` answers
+        # "Permission 'kernels.get' was denied" while the lower-case handle works. Every owner-qualified
+        # call therefore uses the handle exactly as Kaggle stores it.
+        self.owner = (username or "").lower()
         self.key = key
 
     @property
@@ -110,13 +114,24 @@ class KaggleAPI:
         if not resp.content:
             return {}
         try:
-            return resp.json()
+            data = resp.json()
         except ValueError:
             return {}
+        # Kaggle reports failures inside a 200 body (``{"error": "...", "hasError": true}``). Treating
+        # that as success is how a push "succeeds" while nothing is ever created, so it is an error.
+        if isinstance(data, dict) and (data.get("hasError") or data.get("error")):
+            message = str(data.get("error") or "unknown error")
+            code = "kaggle_rejected"
+            if "slug" in message.lower():
+                code = "kaggle_bad_slug"
+            raise GPUError(code, f"Kaggle rejected the request: {message}", status=400)
+        return data
 
     async def push_kernel(self, *, slug: str, title: str, source: str, dataset_sources: List[str],
                           enable_gpu: bool, kernel_sources: Optional[List[str]] = None) -> Dict[str, Any]:
-        body = {"slug": slug, "newTitle": title, "text": source, "language": "python",
+        owner = self.owner or (self.username or "").lower()
+        body = {"slug": f"{owner}/{slug}" if owner and not slug.startswith(f"{owner}/") else slug,
+                "newTitle": title, "text": source, "language": "python",
                 "kernelType": "script", "isPrivate": True, "enableGpu": bool(enable_gpu),
                 "enableInternet": True, "enableTpu": False,
                 "datasetDataSources": dataset_sources, "competitionDataSources": [],
@@ -125,10 +140,10 @@ class KaggleAPI:
 
     async def kernel_status(self, slug: str) -> Dict[str, Any]:
         """RUNNING / QUEUED / COMPLETE / ERROR, as Kaggle reports it."""
-        return await self._request("GET", f"/kernels/status?userName={self.username}&kernelSlug={slug}")
+        return await self._request("GET", f"/kernels/status?userName={self.owner}&kernelSlug={slug}")
 
     async def datasets_for(self, owner: str, slug: str) -> Dict[str, Any]:
-        return await self._request("GET", f"/datasets/list?user={owner}&search={slug}&pageSize=10")
+        return await self._request("GET", f"/datasets/list?user={owner or self.owner}&search={slug}&pageSize=10")
 
 
 class KaggleGPU:
@@ -276,7 +291,7 @@ class KaggleGPU:
                 return await self.status()
             # The weights live in the installer kernel's output, which Kaggle keeps permanently and
             # mounts read-only. Mounting it is what makes a switch-on fast and download-free.
-            cache = self.dataset or f"{self.username}/{self.install_slug}"
+            cache = self.dataset or f"{self.api.owner}/{self.install_slug}"
             source = serve_source({"backend": self.public_url, "token": self.kernel_token,
                                    "model_id": "orcarouter/Qwen3.8-27B-Uncensored",
                                    "ctx": int(_env("QWEN_CTX", "16384"))},
@@ -484,10 +499,10 @@ class KaggleGPU:
         await self.api.push_kernel(slug=self.install_slug, title="Blackthorn Qwen install",
                                    source=source, dataset_sources=[], enable_gpu=False)
         state = await self._state()
-        state.update({"install_started_at": time.time(), "install_kernel": f"{self.username}/{self.install_slug}"})
+        state.update({"install_started_at": time.time(), "install_kernel": f"{self.api.owner}/{self.install_slug}"})
         await self._save(state)
-        return {"ok": True, "kernel": f"{self.username}/{self.install_slug}",
-                "store": f"kernel output of {self.username}/{self.install_slug}",
+        return {"ok": True, "kernel": f"{self.api.owner}/{self.install_slug}",
+                "store": f"kernel output of {self.api.owner}/{self.install_slug}",
                 "gpu_quota": "none — CPU session",
                 "note": "One download into persistent Kaggle storage. Every later GPU session mounts it "
                         "and downloads nothing."}

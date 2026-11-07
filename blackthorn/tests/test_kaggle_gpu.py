@@ -319,3 +319,72 @@ async def test_a_kaggle_account_with_no_quota_reports_why_it_could_not_start():
         await gpu.start()
     assert err.value.code == "kaggle_forbidden"
     assert "quota" in err.value.message
+
+
+# ------------------------------------------------------------------ Kaggle's failure semantics
+async def test_a_200_containing_an_error_is_not_treated_as_success():
+    """Kaggle answers bad pushes with HTTP 200 and ``{"hasError": true}``.
+
+    Believing that envelope is how "installed" gets reported while nothing exists on Kaggle, so it
+    must raise.
+    """
+    class Resp:
+        status_code = 200
+        content = b'{"error": "Invalid slug", "hasError": true, "ref": ""}'
+
+        def json(self):
+            return {"error": "Invalid slug: blackthorn-probe", "hasError": True, "ref": ""}
+
+    class Http:
+        async def request(self, method, url, **kwargs):
+            return Resp()
+
+    api = KaggleAPI(Http(), "Joshbond123", "KGAT_x")
+    with pytest.raises(GPUError) as err:
+        await api.push_kernel(slug="blackthorn-probe", title="t", source="print(1)",
+                              dataset_sources=[], enable_gpu=False)
+    assert err.value.code == "kaggle_bad_slug"
+
+
+async def test_the_kernel_slug_is_owner_qualified_and_lower_case():
+    """``Joshbond123`` is denied; ``joshbond123`` is the identity Kaggle accepts."""
+    seen = {}
+
+    class Resp:
+        status_code = 200
+        content = b'{"hasError": false, "ref": "/code/joshbond123/x", "versionNumber": 1}'
+
+        def json(self):
+            return {"hasError": False, "ref": "/code/joshbond123/x", "versionNumber": 1}
+
+    class Http:
+        async def request(self, method, url, **kwargs):
+            seen["body"] = kwargs.get("json")
+            return Resp()
+
+    api = KaggleAPI(Http(), "Joshbond123", "KGAT_x")
+    await api.push_kernel(slug="blackthorn-qwen-install", title="t", source="print(1)",
+                          dataset_sources=[], enable_gpu=False)
+    assert seen["body"]["slug"] == "joshbond123/blackthorn-qwen-install"
+
+
+
+async def test_kernel_status_is_asked_for_with_the_lower_case_owner():
+    seen = {}
+
+    class Resp:
+        status_code = 200
+        content = b'{"status": "running"}'
+
+        def json(self):
+            return {"status": "running"}
+
+    class Http:
+        async def request(self, method, url, **kwargs):
+            seen["url"] = url
+            return Resp()
+
+    api = KaggleAPI(Http(), "Joshbond123", "KGAT_x")
+    out = await api.kernel_status("blackthorn-qwen-install")
+    assert out["status"] == "running"
+    assert "userName=joshbond123" in seen["url"]
