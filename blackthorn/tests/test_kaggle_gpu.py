@@ -140,6 +140,8 @@ async def test_a_lost_local_flag_is_recovered_from_kaggles_own_record():
     out = await gpu.start()
     assert out["state"] == STARTING
     assert (await gpu.status())["installed"] is True
+    # the mount must name the account that will actually answer
+    assert gpu.api.pushed[0]["kernel_sources"] == [f"{gpu.api.owner}/blackthorn-qwen-install"]
 
 
 async def test_the_gpu_is_never_switched_off_while_a_task_is_running():

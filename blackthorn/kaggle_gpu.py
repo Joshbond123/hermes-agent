@@ -305,22 +305,27 @@ class KaggleGPU:
                 raise GPUError("kaggle_unconfigured",
                                "Kaggle is not configured: set KAGGLE_USERNAME and KAGGLE_KEY on the server.")
             state = await self._state()
-            if not self._installed(state):
-                # A local flag can be lost; Kaggle's own record of the installer cannot. If the install
-                # kernel is complete, the weights are in persistent storage and the GPU can mount them.
-                try:
-                    kstate = (await self.api.kernel_status(self.install_slug)).get("status") or ""
-                except GPUError:
-                    kstate = ""
-                if kstate.lower() == "complete":
-                    state["installed_at"] = time.time()
-                    await self._save(state)
-                else:
-                    raise GPUError("model_not_installed",
-                                   "Qwen is not installed on Kaggle yet (installer: "
-                                   f"{kstate or 'never run'}). Run the installer once "
-                                   "(POST /api/gpu/install) — it downloads the weights one time into "
-                                   "persistent Kaggle storage.")
+            # Which account is actually answering has to be settled *before* the mount is described:
+            # a revoked primary key switches accounts during the probe below, and a kernel source
+            # named after the wrong account mounts nothing at all.
+            kstate = ""
+            try:
+                kstate = (await self.api.kernel_status(self.install_slug)).get("status") or ""
+            except GPUError as exc:
+                if exc.code not in ("kaggle_unauthorized", "kaggle_error"):
+                    raise
+            installed = (self._installed(state) and state.get("installed_owner") == self.api.owner)
+            if kstate.lower() == "complete" and not installed:
+                state["installed_at"] = time.time()
+                state["installed_owner"] = self.api.owner
+                await self._save(state)
+                installed = True
+            if not installed:
+                raise GPUError("model_not_installed",
+                               f"Qwen is not installed on the Kaggle account that answers "
+                               f"({self.api.owner or 'unknown'}; installer: {kstate or 'never run'}). "
+                               "Run the installer once (POST /api/gpu/install) — it downloads the "
+                               "weights one time into persistent Kaggle storage.")
             if state.get("state") in (STARTING, LOADING, READY) and self._fresh(state):
                 return await self.status()
             # The weights live in the installer kernel's output, which Kaggle keeps permanently and
@@ -348,6 +353,7 @@ class KaggleGPU:
                               "last_activity_reason": "gpu_on", "base_url": "", "session": "",
                               "stop_requested": False, "error": "", "phase": "pushing kernel to Kaggle",
                               "installed_at": state.get("installed_at"),
+                              "installed_owner": state.get("installed_owner"),
                               "install_kernel": state.get("install_kernel")})
             await self._open_interval()
             return await self.status()
@@ -568,6 +574,7 @@ class KaggleGPU:
         """Record that the installer finished, so the GPU can be switched on."""
         state = await self._state()
         state["installed_at"] = time.time()
+        state["installed_owner"] = self.api.owner
         await self._save(state)
         return await self.status()
 
