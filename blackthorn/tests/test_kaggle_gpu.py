@@ -447,3 +447,34 @@ async def test_a_stop_order_nobody_collected_does_not_leave_the_panel_stuck():
     state["last_heartbeat"] = 0
     gpu.store.settings[gpumod.STATE_KEY] = json.dumps(state)
     assert (await gpu.status())["state"] == OFF
+
+
+async def test_a_revoked_primary_key_falls_back_to_the_spare_account():
+    """Kaggle keys get rotated; the GPU should keep working on the account that still answers."""
+    calls = []
+
+    class Resp:
+        def __init__(self, code, payload):
+            self.status_code = code
+            self.content = json.dumps(payload).encode()
+
+        def json(self):
+            return payload_holder[0]
+
+    class Http:
+        async def request(self, method, url, **kwargs):
+            auth = kwargs["headers"]["Authorization"]
+            calls.append(auth)
+            if auth.endswith("dead"):
+                payload_holder[0] = {"code": 401, "message": "Unauthenticated"}
+                return Resp(401, payload_holder[0])
+            payload_holder[0] = {"status": "running"}
+            return Resp(200, payload_holder[0])
+
+    payload_holder = [{}]
+    api = KaggleAPI(Http(), "Joshbond123", "dead", fallbacks=[("happink", "alive")])
+    out = await api.kernel_status("blackthorn-qwen-install")
+    assert out["status"] == "running"
+    assert calls == ["Bearer dead", "Bearer alive"]
+    assert api.username == "happink" and api.owner == "happink"
+    assert api.used_fallback == "happink"

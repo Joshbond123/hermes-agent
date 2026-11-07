@@ -36,6 +36,18 @@ CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
        "font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'")
 
 
+def _kaggle_fallbacks(env: Any) -> list:
+    """A spare Kaggle account, used only when the primary key is refused (keys get rotated)."""
+    out = []
+    for suffix in ("", "_2", "_BACKUP"):
+        user = (env.get(f"KAGGLE_USERNAME{suffix}") or "").strip()
+        key = (env.get(f"KAGGLE_KEY{suffix}") or "").strip()
+        primary = (env.get("KAGGLE_USERNAME") or "").strip()
+        if user and key and user != primary:
+            out.append((user, key))
+    return out
+
+
 def build_services(settings: Settings, *, executor: Any = None, http: Any = None, static_dir: Optional[Path] = None) -> Services:
     backend = settings.resolved_store()
     if executor is None:
@@ -116,7 +128,8 @@ def build_services(settings: Settings, *, executor: Any = None, http: Any = None
             install_slug=(os.environ.get("KAGGLE_INSTALL_SLUG") or "blackthorn-qwen-install").strip(),
             public_url=(os.environ.get("BLACKTHORN_PUBLIC_URL") or "").strip(),
             kernel_token=(os.environ.get("BLACKTHORN_GPU_TOKEN") or "").strip(),
-            hf_token=(os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_API_KEY") or "").strip())
+            hf_token=(os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_API_KEY") or "").strip(),
+            kaggle_fallbacks=_kaggle_fallbacks(os.environ))
         log.info("gpu: Kaggle GPU provider (%s)", gpu.username or "unconfigured")
     except Exception as exc:  # noqa: BLE001 - the app runs without a GPU
         log.error("gpu unavailable: %s", type(exc).__name__)

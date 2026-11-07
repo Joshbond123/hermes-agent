@@ -80,7 +80,8 @@ class KaggleAPI:
     what is sent. Every failure is raised as :class:`GPUError` with Kaggle's own message.
     """
 
-    def __init__(self, http: httpx.AsyncClient, username: str, key: str):
+    def __init__(self, http: httpx.AsyncClient, username: str, key: str,
+                 fallbacks: Optional[List[tuple]] = None):
         self.http = http
         self.username = username
         # Kaggle's API is case-sensitive about identity: ``userName=Joshbond123`` answers
@@ -88,6 +89,10 @@ class KaggleAPI:
         # call therefore uses the handle exactly as Kaggle stores it.
         self.owner = (username or "").lower()
         self.key = key
+        # Kaggle lets a key be revoked at any moment. A second account that already exists for this
+        # work is used instead of failing the whole feature, and which one answered is reported.
+        self.fallbacks = [(u, k) for u, k in (fallbacks or []) if u and k]
+        self.used_fallback = ""
 
     @property
     def configured(self) -> bool:
@@ -97,12 +102,22 @@ class KaggleAPI:
         if not self.configured:
             raise GPUError("kaggle_unconfigured",
                            "No Kaggle credentials are configured on this server (KAGGLE_USERNAME/KAGGLE_KEY).")
-        resp = await self.http.request(method, f"{KAGGLE_API}{path}", json=body, timeout=60.0,
-                                       headers={"Authorization": f"Bearer {self.key}",
-                                                "Content-Type": "application/json",
-                                                "User-Agent": "Blackthorn-KaggleGPU"})
+        resp = await self._send(method, path, body)
+        if resp.status_code in (401, 403) and self.fallbacks:
+            # One retry on the spare account; the primary is reported as unusable rather than looped.
+            user, key = self.fallbacks.pop(0)
+            log.warning("kaggle credentials for %s were refused (HTTP %s); using %s", self.username,
+                        resp.status_code, user)
+            self.username, self.owner, self.key = user, user.lower(), key
+            self.used_fallback = user
+            resp = await self._send(method, path, body)
         if resp.status_code == 429:
             raise GPUError("kaggle_rate_limited", "Kaggle is rate limiting requests; try again shortly.", status=429)
+        if resp.status_code >= 401 and resp.status_code <= 403:
+            raise GPUError("kaggle_unauthorized",
+                           "Kaggle rejected the API key (HTTP %s). It may have been revoked or rotated; "
+                           "put a current key in the server's KAGGLE_KEY." % resp.status_code,
+                           status=resp.status_code)
         if resp.status_code >= 400:
             detail = ""
             try:
@@ -126,6 +141,12 @@ class KaggleAPI:
                 code = "kaggle_bad_slug"
             raise GPUError(code, f"Kaggle rejected the request: {message}", status=400)
         return data
+
+    async def _send(self, method: str, path: str, body: Any):
+        return await self.http.request(method, f"{KAGGLE_API}{path}", json=body, timeout=60.0,
+                                       headers={"Authorization": f"Bearer {self.key}",
+                                                "Content-Type": "application/json",
+                                                "User-Agent": "Blackthorn-KaggleGPU"})
 
     async def push_kernel(self, *, slug: str, title: str, source: str, dataset_sources: List[str],
                           enable_gpu: bool, kernel_sources: Optional[List[str]] = None) -> Dict[str, Any]:
@@ -153,11 +174,12 @@ class KaggleGPU:
                  username: str = "", key: str = "", dataset: str = "", serve_slug: str = "blackthorn-qwen-serve",
                  install_slug: str = "blackthorn-qwen-install", public_url: str = "",
                  kernel_token: str = "", hf_token: str = "",
-                 model_key: str = "orcarouter/Qwen3.8-27B-Uncensored"):
+                 model_key: str = "orcarouter/Qwen3.8-27B-Uncensored",
+                 kaggle_fallbacks: Optional[List[tuple]] = None):
         self.store = store
         self.http = http
         self.runs = runs
-        self.api = KaggleAPI(http, username, key)
+        self.api = KaggleAPI(http, username, key, fallbacks=kaggle_fallbacks)
         self.username = username
         self.dataset = dataset                     # e.g. "joshbond123/blackthorn-qwen-27b-q4km"
         self.serve_slug = serve_slug
@@ -479,7 +501,8 @@ class KaggleGPU:
                 "error": state.get("error", ""),
                 "dataset": self.dataset,
                 "installed": bool(state.get("installed_at")) or bool(self.dataset),
-                "kaggle_user": self.username,
+                "kaggle_user": self.api.username,
+                "kaggle_fallback_in_use": self.api.used_fallback,
                 "busy": self.busy_reason(),
                 "settings": settings_out,
                 "updated_at": int(time.time())}
