@@ -179,14 +179,30 @@ def fetch_llama_cpp():
                 os.remove(tmp)
             found = glob.glob(os.path.join(bin_dir, "**", "llama-server"), recursive=True)
             if found:
-                final = os.path.join(bin_dir, "llama-server")
-                if found[0] != final:
-                    shutil.copy2(found[0], final)
-                os.chmod(final, 0o755)
+                # The build is a binary plus a pile of .so files beside it; copying the binary out of
+                # its directory makes the loader fail, so it is run where it was unpacked.
+                binary = found[0]
+                os.chmod(binary, 0o755)
                 _log(f"llama.cpp ready ({rel.get('tag_name')}, {flavour})")
-                return final
+                return binary
             _log(f"{rel.get('tag_name')} {flavour} produced no llama-server; trying another build")
     raise SystemExit("no usable prebuilt llama.cpp CUDA build found")
+
+
+def lib_path_for(server_bin):
+    """Every directory that holds a .so the server needs (the build plus its cudart siblings)."""
+    dirs = []
+    for root in ("/kaggle/working/llama",):
+        for path, _sub, files in os.walk(root):
+            if any(f.endswith(".so") or ".so." in f for f in files):
+                dirs.append(path)
+    dirs.append(os.path.dirname(server_bin))
+    seen, out = set(), []
+    for d in dirs:
+        if d not in seen:
+            seen.add(d)
+            out.append(d)
+    return ":".join(out)
 
 
 def start_server(gguf, server_bin, n_gpu):
@@ -197,9 +213,11 @@ def start_server(gguf, server_bin, n_gpu):
            "--alias", CFG["model_id"]]
     if n_gpu > 1:                       # 17 GB of weights do not fit one 16 GB T4
         cmd += ["--tensor-split", ",".join("1" for _ in range(n_gpu)), "--split-mode", "layer"]
+    env = dict(os.environ)
+    env["LD_LIBRARY_PATH"] = lib_path_for(server_bin) + (":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
     _log("starting: " + " ".join(cmd))
     log_file = open("/kaggle/working/llama-server.log", "w")
-    SERVER = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
+    SERVER = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT, env=env)
     deadline = time.time() + 900
     while time.time() < deadline:
         if SERVER.poll() is not None:
