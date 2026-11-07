@@ -435,3 +435,15 @@ async def test_the_kernel_can_report_which_stage_it_is_at():
     status = await gpu.status()
     assert status["phase"] == "loading the model onto the GPU"
     assert status["state"] == STARTING, "a heartbeat is presence, not readiness"
+
+
+async def test_a_stop_order_nobody_collected_does_not_leave_the_panel_stuck():
+    """The GPU is already gone, so the order is meaningless: report OFF rather than 'stopping'."""
+    gpu = make_gpu()
+    await gpu.start()
+    await gpu.stop(force=True)
+    state = json.loads(gpu.store.settings[gpumod.STATE_KEY])
+    state["stop_requested_at"] = time.time() - 10 * 60
+    state["last_heartbeat"] = 0
+    gpu.store.settings[gpumod.STATE_KEY] = json.dumps(state)
+    assert (await gpu.status())["state"] == OFF

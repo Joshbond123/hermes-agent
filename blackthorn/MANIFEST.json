@@ -3,7 +3,7 @@
   "blackthorn/COMPUTER_DRIVE.md": "eb143a189c0bf88482027c6a474b799c2d7d52303f23748258cd01a2417ab5da",
   "blackthorn/MIGRATION_ACCEPTANCE.md": "c6a25473b8150047655c3eaf9457095d6ae27b8d8108c1a75b82b145dd182b72",
   "blackthorn/README.md": "f3e59f0dd987701577011d23ec5f1c67b630bd9e4c170ed4b628b988492afc84",
-  "blackthorn/__init__.py": "f3f51b80cc59b844b63b45067de184269ae50a22511d54bc2d2b861766962ef2",
+  "blackthorn/__init__.py": "e83966254e2c108971d14c878b11cca334d53684a2d58a9b08715cd2a85e156b",
   "blackthorn/agent.py": "5ab2733f478af9e6fb003994ebb2174668d05e7a211a172733a903a5cf9c366c",
   "blackthorn/api.py": "e9192d5ddc1dc329bf93cdfd9cf791e0a46c98e703aa2f7167b01a825a20a760",
   "blackthorn/app.py": "050a7fe108dac69a36d58c8dc532670012b0aab095ce8310a919ac4e40eb9ec1",
@@ -19,7 +19,7 @@
   "blackthorn/computer_assets/skillctl.py": "68dbd87b99576fce77405d1dbe2ff8ae1c81fe43ab2ca4fef7b28b8326068bbb",
   "blackthorn/computer_drive.py": "c320b488954076948df9fcf8a69f9cc6817a1b67a7b0843d218babb6436aaa2e",
   "blackthorn/config.py": "a3aac58b7c8ed4bbf66674417cd0a7c4079d6505d225c9e2fb77834c4f605276",
-  "blackthorn/kaggle_gpu.py": "d82b55dd954aefb538fd352da8cb47cab09abc77054d66096c2ea026eb80e038",
+  "blackthorn/kaggle_gpu.py": "34f5da593baba13c6763f9b994cbb14f383eb0d6df2a12d2916644e0d6464c0c",
   "blackthorn/kaggle_kernels.py": "552230d68a28cbe53058a2cfa3275dc737fb5e2f5c030273ebd37149a2914db2",
   "blackthorn/keys_role.py": "7430664e81780088e6f5a5e254c55f5a7ea1056f71ff5bae47dd2c97e300b256",
   "blackthorn/llm.py": "b84726ebf51b251dddff88658f621c6cd2715a69032ab648838516a71ecf687a",
@@ -67,5 +67,5 @@
   "blackthorn/version.py": "a3e10b7f2f39b4d9374851f0c9eb11bb878f68c35925994f623db312cf433ffe",
   "blackthorn_start.py": "847f0cc5ec83b846947b7c485abdb2592b0dd090bedf78af16022a0394d2e9f3"
  },
- "version": "5.7.6"
+ "version": "5.7.7"
 }

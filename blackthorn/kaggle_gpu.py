@@ -342,6 +342,7 @@ class KaggleGPU:
                     raise GPUError("gpu_busy", f"The GPU is still working ({busy}); it will stop when that finishes.")
             state["stop_requested"] = True
             state["stop_reason"] = reason
+            state["stop_requested_at"] = time.time()
             state["state"] = STOPPING
             await self._save(state)
             return await self.status()
@@ -443,6 +444,14 @@ class KaggleGPU:
             phase = ERROR
             state["error"] = ("Kaggle did not bring the GPU up in time. It may be queued behind other "
                               "notebooks, or the weekly GPU quota may be exhausted.")
+        # A stop order that no kernel ever collected (the session had already ended, or Kaggle never
+        # started it) must not leave the panel stuck on "stopping" for ever.
+        if phase == STOPPING:
+            ordered = float(state.get("stop_requested_at") or 0)
+            if not self._fresh(state) and (time.time() - ordered) > HEARTBEAT_GRACE_SECONDS:
+                phase = OFF
+                state["stop_requested"] = False
+                await self._save(state)
         if phase in (READY, STARTING, LOADING) and state.get("last_heartbeat") and not self._fresh(state):
             phase = ERROR
             state["error"] = "The GPU session stopped sending heartbeats; it probably ended on Kaggle's side."
