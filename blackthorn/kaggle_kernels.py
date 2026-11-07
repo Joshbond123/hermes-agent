@@ -148,36 +148,45 @@ def gpu_report():
 
 
 def fetch_llama_cpp():
-    """A prebuilt CUDA build: minutes saved on every GPU switch-on."""
+    """The prebuilt CUDA build from the newest ``b*`` release: minutes saved on every switch-on.
+
+    Two details that a naive fetch gets wrong: ``/releases/latest`` is a decoy tag with a single
+    asset, so the release list is read instead; and the Linux builds ship as ``.tar.gz`` (a
+    ``llama-…-cuda-12.8-x64`` binary archive plus its matching ``cudart-…`` runtime archive).
+    """
     bin_dir = "/kaggle/working/llama"
     server = os.path.join(bin_dir, "llama-server")
     if os.path.exists(server):
         return server
     os.makedirs(bin_dir, exist_ok=True)
-    api = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
-    rel = json.loads(urllib.request.urlopen(api, timeout=60).read())
-    wanted = []
-    for asset in rel.get("assets", []):
-        name = asset.get("name", "")
-        if name.endswith("bin-ubuntu-x64.zip") or ("cudart" in name and "cuda-12" in name and name.endswith(".zip")):
-            wanted.append(asset)
-    if not wanted:
-        raise SystemExit("no prebuilt llama.cpp asset found in the latest release")
-    for asset in wanted:
-        tmp = os.path.join(bin_dir, asset["name"])
-        urllib.request.urlretrieve(asset["browser_download_url"], tmp)
-        with zipfile.ZipFile(tmp) as zf:
-            zf.extractall(bin_dir)
-        os.remove(tmp)
-    found = glob.glob(os.path.join(bin_dir, "**", "llama-server"), recursive=True)
-    if not found:
-        raise SystemExit("llama-server missing from the downloaded build")
-    final = os.path.join(bin_dir, "llama-server")
-    if found[0] != final:
-        shutil.copy2(found[0], final)
-    os.chmod(final, 0o755)
-    _log(f"llama.cpp ready ({rel.get('tag_name')})")
-    return final
+    releases = json.loads(urllib.request.urlopen(
+        "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=8", timeout=60).read())
+    import tarfile
+    for rel in releases:
+        names = [a["name"] for a in rel.get("assets", [])]
+        for flavour in ("cuda-12.8-x64", "cuda-13.5-x64"):
+            wanted = [n for n in names
+                      if f"-bin-ubuntu-{flavour}.tar.gz" in n and (n.startswith("llama-") or n.startswith("cudart-"))]
+            if not any(n.startswith("llama-") for n in wanted):
+                continue
+            for name in wanted:
+                url = next(a["browser_download_url"] for a in rel["assets"] if a["name"] == name)
+                tmp = os.path.join(bin_dir, name)
+                _log(f"fetching {name} ({round(next(a['size'] for a in rel['assets'] if a['name'] == name)/1e6)} MB)")
+                urllib.request.urlretrieve(url, tmp)
+                with tarfile.open(tmp) as tf:
+                    tf.extractall(bin_dir)
+                os.remove(tmp)
+            found = glob.glob(os.path.join(bin_dir, "**", "llama-server"), recursive=True)
+            if found:
+                final = os.path.join(bin_dir, "llama-server")
+                if found[0] != final:
+                    shutil.copy2(found[0], final)
+                os.chmod(final, 0o755)
+                _log(f"llama.cpp ready ({rel.get('tag_name')}, {flavour})")
+                return final
+            _log(f"{rel.get('tag_name')} {flavour} produced no llama-server; trying another build")
+    raise SystemExit("no usable prebuilt llama.cpp CUDA build found")
 
 
 def start_server(gguf, server_bin, n_gpu):

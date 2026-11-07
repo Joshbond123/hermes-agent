@@ -521,5 +521,11 @@ class KaggleGPU:
             try:
                 out[name] = (await self.api.kernel_status(slug)).get("status") or "unknown"
             except GPUError as exc:
-                out[name] = f"error: {exc.message[:80]}"
+                # Kaggle answers "Permission 'kernels.get' was denied" for a slug that does not exist
+                # yet, which reads like an auth problem. It is not: the kernel is created the first
+                # time it is pushed.
+                if "denied" in exc.message and "get" in exc.message:
+                    out[name] = "not created yet"
+                else:
+                    out[name] = f"error: {exc.message[:80]}"
         return out

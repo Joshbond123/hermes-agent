@@ -89,6 +89,8 @@ def test_the_serve_kernel_loads_from_the_cache_and_can_never_silently_download()
     assert "--jinja" in src, "tool calling needs the model's own chat template"
     assert '"/api/gpu/heartbeat"' in src and '"/api/gpu/register"' in src
     assert "if answer.get(\"stop\")" in src, "the kernel must honour a stop order"
+    # llama.cpp ships Linux CUDA builds as .tar.gz under b* tags; /releases/latest is a decoy.
+    assert "releases?per_page=" in src and "cuda-12.8-x64" in src and "tarfile" in src
 
 
 def test_no_secret_is_written_into_the_repository_sources():

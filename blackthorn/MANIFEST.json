@@ -3,7 +3,7 @@
   "blackthorn/COMPUTER_DRIVE.md": "eb143a189c0bf88482027c6a474b799c2d7d52303f23748258cd01a2417ab5da",
   "blackthorn/MIGRATION_ACCEPTANCE.md": "c6a25473b8150047655c3eaf9457095d6ae27b8d8108c1a75b82b145dd182b72",
   "blackthorn/README.md": "f3e59f0dd987701577011d23ec5f1c67b630bd9e4c170ed4b628b988492afc84",
-  "blackthorn/__init__.py": "7fc4deccae13b931575ec0381ba7020e039b61b8505fe5c8b2d378b5627b64ed",
+  "blackthorn/__init__.py": "4e7d2527f86f1dc9e20a4d3400bb92af3a44c2c41ac95fb59e2353356540a48f",
   "blackthorn/agent.py": "5ab2733f478af9e6fb003994ebb2174668d05e7a211a172733a903a5cf9c366c",
   "blackthorn/api.py": "8a849b1f99446ac927de7487774b28ffc37d1c2a9936449dae73ce8d93de451d",
   "blackthorn/app.py": "050a7fe108dac69a36d58c8dc532670012b0aab095ce8310a919ac4e40eb9ec1",
@@ -19,8 +19,8 @@
   "blackthorn/computer_assets/skillctl.py": "68dbd87b99576fce77405d1dbe2ff8ae1c81fe43ab2ca4fef7b28b8326068bbb",
   "blackthorn/computer_drive.py": "c320b488954076948df9fcf8a69f9cc6817a1b67a7b0843d218babb6436aaa2e",
   "blackthorn/config.py": "a3aac58b7c8ed4bbf66674417cd0a7c4079d6505d225c9e2fb77834c4f605276",
-  "blackthorn/kaggle_gpu.py": "a3d6fda6815abe4c073b123ecb1a3ae7b6e6c675b684273cbb39bbb9f577a3c8",
-  "blackthorn/kaggle_kernels.py": "ac8387a281fb0db171f522eedfee51c5460b2046a3657cf3c54ba8ab2834a89c",
+  "blackthorn/kaggle_gpu.py": "753514a56694e9cd472c5a02d7b1db050ffe8fe6091b7fca3e362484aa1f23bf",
+  "blackthorn/kaggle_kernels.py": "1bccb6ca29b9756907236d9588128f5b1e81c97fc294985baeea2ee4bb5d48c9",
   "blackthorn/keys_role.py": "7430664e81780088e6f5a5e254c55f5a7ea1056f71ff5bae47dd2c97e300b256",
   "blackthorn/llm.py": "b84726ebf51b251dddff88658f621c6cd2715a69032ab648838516a71ecf687a",
   "blackthorn/malware_analyzer.py": "83187436a3a5fa9a6537120bc4e8c35213367e7b4245d909b38d04161c7e3fb4",
@@ -67,5 +67,5 @@
   "blackthorn/version.py": "a3e10b7f2f39b4d9374851f0c9eb11bb878f68c35925994f623db312cf433ffe",
   "blackthorn_start.py": "847f0cc5ec83b846947b7c485abdb2592b0dd090bedf78af16022a0394d2e9f3"
  },
- "version": "5.7.1"
+ "version": "5.7.2"
 }
